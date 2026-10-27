@@ -1,71 +1,67 @@
 'use strict';
-// usb_worker.js - WebUSB transport and CAN processing, running in a dedicated Worker.
+// usb_worker.js - WebUSB transport and CAN processing for several adapters, running in a dedicated Worker.
 //
 // The page (Emscripten/wasm + ImGui) talks to this worker only through postMessage; there is no
 // SharedArrayBuffer/Atomics. Ownership of every ArrayBuffer is handed over with the transfer list,
 // so two contexts never touch the same bytes.
 //
-// Received transfers are copied straight into the staging buffer of a second wasm module
-// (can_core.js/.wasm, built from can_core.cpp) which parses the frames, keeps the "Table by ID"
-// aggregates and the trace queue, and publishes compact snapshots of what changed. The page only
-// applies snapshots; it never sees individual frames of a busy bus.
+// Every adapter is a Device context addressed by its device number `dev` (0..MAX_DEVICES-1, chosen by
+// the page). A context owns its USBDevice, receive slots, control/TX queues, watchdog and statistics, so a
+// hung or unplugged adapter never delays the others.
 //
-// Main -> worker messages
-//   init     {timeOrigin}                     performance.timeOrigin of the page (clock alignment)
-//   open     {epoch, vid, pid, serial}        open the (already permitted) device, start RX slots
-//   close    {}
-//   ctrl_out {request, value, index, data}    vendor control OUT, executed strictly in order
-//   ctrl_in  {request, value, index, length}  vendor control IN, executed strictly in order
-//   tx       {ep, data}                       bulk OUT frame (bounded queue, limited in-flight)
-//   rx       {enable, ep, size}               gate processing of received frames (+ endpoint config)
-//   core     {op, arg}                        op 1 = clear ID table, 2 = clear trace, 3 = trace on/off
-//   ret      {buf}                            snapshot buffer handed back = one flow-control credit
+// Received transfers of all adapters are copied straight into the staging buffer of one shared wasm
+// module (can_core.js/.wasm, built from can_core.cpp) which parses the frames (tagged with the device
+// number), keeps the "Table by ID" aggregates and the trace queue, and publishes compact snapshots of
+// what changed. The page only applies snapshots; it never sees individual frames of a busy bus.
 //
-// Worker -> main messages (`epoch` = session the message belongs to; snapshots are valid in any
-// session because the table and trace live across connections)
-//   opened   {vid, pid, mfg, prod}
-//   closed   {reason}
-//   snapshot {buf, used}                      SnapshotHeader + records, see can_wire.h
-//   ctrl_in  {request, data}
-//   ctrl_ack {request, ok}                    completion of a control OUT
-//   stats    {rxPerSec, txDropped, recoveries, rxErrors, txErrors}
+// Main -> worker messages ("dev" selects the adapter)
+//   init     {timeOrigin}                          performance.timeOrigin of the page (clock alignment)
+//   open     {dev, epoch, vid, pid, serial}        open the (already permitted) device, start RX slots
+//   close    {dev}
+//   ctrl_out {dev, request, value, index, data}    vendor control OUT, executed strictly in order per device
+//   ctrl_in  {dev, request, value, index, length}  vendor control IN, executed strictly in order per device
+//   tx       {dev, ep, data}                       bulk OUT frame (bounded queue, limited in-flight); ep 0 = detected
+//   rx       {dev, enable, ep, size}               gate processing of received frames (+ endpoint config)
+//   core     {op, arg}                             op 1 = clear ID table, 2 = clear trace, 3 = trace on/off (all devices)
+//   ret      {buf}                                 snapshot buffer handed back = one flow-control credit
+//
+// Worker -> main messages (`dev` + `epoch` = connection the message belongs to; snapshots are global and
+// valid in any session because the table and trace live across connections)
+//   opened   {dev, epoch, eps, rxEp, txEp}
+//   closed   {dev, epoch, reason}
+//   snapshot {buf, used}                           SnapshotHeader + records, see can_wire.h
+//   ctrl_in  {dev, epoch, request, data}
+//   ctrl_ack {dev, epoch, request, ok}             completion of a control OUT
+//   stats    {dev, epoch, rxPerSec, txDropped, recoveries, rxErrors, txErrors}
 
+const MAX_DEVICES = 8;              // must match kMaxDevices in can_protocol.h
 const IFACE = 0;
-const DEFAULT_EP_IN = 1;            // endpoint number without direction bit
+const DEFAULT_EP_IN = 1;            // endpoint numbers without direction bit, used if no descriptor is available
+const DEFAULT_EP_OUT = 2;
 const DEFAULT_RX_SIZE = 512;
-const RX_SLOTS = 6;                 // concurrent transferIn requests kept pending on the IN endpoint
-const TX_INFLIGHT = 4;              // concurrent transferOut; set to 1 for strictly serialized TX
+const RX_SLOTS = 6;                 // concurrent transferIn requests kept pending per adapter
+const TX_INFLIGHT = 4;              // concurrent transferOut per adapter; set to 1 for strictly serialized TX
 const TX_QUEUE_MAX = 4096;
 const BATCH_CREDITS = 4;            // snapshots that may be unacknowledged by the page
 const PUBLISH_MS = 16;              // snapshot period (about one display frame)
-const STAGE_REC_HEADER = 12;        // u16 len | u16 ep_address | f64 host_time_ms
+const STAGE_REC_HEADER = 12;        // u16 len | u8 dev | u8 ep_address | f64 host_time_ms
 const CTRL_TIMEOUT_MS = 2000;
 const WATCHDOG_MS = 1000;
-const IDLE_PING_MS = 2000;          // RX silence after which the device is probed with a control IN
+const IDLE_PING_MS = 2000;          // RX silence after which an adapter is probed with a control IN
 const PING_TIMEOUT_MS = 1500;
 const PING_FAILS_MAX = 2;
 const RX_ERRORS_BEFORE_RECOVER = 5;
 const GS_USB_BREQ_BT_CONST = 4;     // harmless read used as liveness probe
 
-let dev = null;
-let epoch = 0;
 let mainOrigin = 0;
-let cmdChain = Promise.resolve();   // serializes open/close/control commands
+const devices = new Array(MAX_DEVICES).fill(null);
+let openLock = Promise.resolve();   // device matching in getDevices() must not run concurrently
 
-// RX state. rxGen is the generation token: every slot chain carries the generation it was started
-// with and silently dies when it no longer matches (teardown/recover). A pending transferIn cannot
-// be cancelled in WebUSB, so stale completions are simply ignored.
-let rxGen = 0;
-let rxEnabled = false;
-let rxEp = DEFAULT_EP_IN;
-let rxSize = DEFAULT_RX_SIZE;
-const slotErr = new Array(RX_SLOTS).fill(0);
-let recovering = false;
-
-// CAN core (second wasm module) and snapshot flow control
+// CAN core (shared wasm module) and snapshot flow control
 let core = null;
 let stagePtr = 0, stageCap = 0, stageOff = 0, outPtr = 0, snapCap = 0;
 let pubTimer = null;
+let wdTimer = null;
 let credits = BATCH_CREDITS;
 let pool = [];
 const stageHdr = new DataView(new ArrayBuffer(STAGE_REC_HEADER));
@@ -86,29 +82,8 @@ const coreReady = (async () => {
 })();
 coreReady.catch(err => console.error('[usb_worker] cannot load can_core.js/.wasm:', err));
 
-// TX state
-let txQueue = [];
-let txHead = 0;
-let txInflight = 0;
-
-// Watchdog
-let wdTimer = null;
-let lastRxDone = 0;
-let lastPingOk = 0;
-let pingBusy = false;
-let pingFails = 0;
-
-const st = { rx: 0, rxPrev: 0, rxErrors: 0, txDropped: 0, txErrors: 0, recoveries: 0 };
-
 function now() {
     return performance.now() + performance.timeOrigin - mainOrigin;
-}
-
-function post(type, fields, transfer) {
-    const msg = fields || {};
-    msg.type = type;
-    msg.epoch = epoch;
-    self.postMessage(msg, transfer || []);
 }
 
 function withTimeout(promise, ms, what) {
@@ -132,272 +107,421 @@ function sameDevice(a, b) {
                        a.serialNumber === b.serialNumber);
 }
 
-// ---------------------------------------------------------------------------------------------
-// Command dispatch
-// ---------------------------------------------------------------------------------------------
-
-function enqueue(fn) {
-    cmdChain = cmdChain.then(fn).catch(err => console.error('[usb_worker] command failed:', err));
-}
-
-self.onmessage = (ev) => {
-    const m = ev.data;
-    switch (m.type) {
-        case 'init':     mainOrigin = m.timeOrigin; break;
-        case 'open':     enqueue(() => doOpen(m)); break;
-        case 'close':    enqueue(() => doClose('closed by host', false)); break;
-        case 'ctrl_out':
-        case 'ctrl_in':  enqueue(() => doControl(m)); break;
-        case 'tx':       enqueueTx(m.data, m.ep); break;
-        case 'rx':       setRx(m); break;
-        case 'core':     coreCommand(m); break;
-        case 'ret':      returnBuffer(m.buf); break;
-    }
-};
-
-if (typeof navigator !== 'undefined' && navigator.usb) {
-    navigator.usb.addEventListener('disconnect', (ev) => {
-        if (dev && sameDevice(ev.device, dev)) deviceLost('device disconnected');
-    });
-}
-
-// ---------------------------------------------------------------------------------------------
-// Open / close / loss
-// ---------------------------------------------------------------------------------------------
-
-async function doOpen(m) {
-    if (dev) await doClose(null, true);
-    epoch = m.epoch;
-
+// Bulk endpoints of the data interface, from the descriptor if the browser exposes it
+function inspectEndpoints(usb) {
+    const info = { rxEp: DEFAULT_EP_IN, txEp: DEFAULT_EP_OUT, rxSize: DEFAULT_RX_SIZE, text: '' };
     try {
-        await coreReady;
-    } catch (err) {
-        post('closed', { reason: 'CAN core module failed to load: ' + errText(err) });
-        return;
-    }
-
-    let d = null;
-    try {
-        // requestDevice() is window-only; the page already obtained the permission for this origin.
-        const list = await navigator.usb.getDevices();
-        const cand = list.filter(x => x.vendorId === m.vid && x.productId === m.pid &&
-                                      (m.serial == null || x.serialNumber === m.serial));
-        d = cand.find(x => !x.opened) || cand[0];
-        if (!d) throw new Error('device is not among the permitted devices');
-        await d.open();
-        if (d.configuration === null) await d.selectConfiguration(1);
-        await d.claimInterface(IFACE);
-    } catch (err) {
-        console.error('[usb_worker] open failed:', err);
-        if (d && d.opened) d.close().catch(() => {});
-        post('closed', { reason: 'open failed: ' + errText(err) });
-        return;
-    }
-
-    dev = d;
-    rxEp = DEFAULT_EP_IN;
-    rxSize = DEFAULT_RX_SIZE;
-    startRx();
-    startWatchdog();
-    if (pubTimer === null) pubTimer = setInterval(publishTick, PUBLISH_MS);
-    post('opened', {
-        vid: d.vendorId, pid: d.productId,
-        mfg: d.manufacturerName || '', prod: d.productName || ''
-    });
-}
-
-async function doClose(reason, silent) {
-    const d = dev;
-    if (!d) {
-        if (!silent) post('closed', { reason: reason || '' });
-        return;
-    }
-    teardown();
-    try { await d.close(); } catch (e) { /* already gone */ }
-    if (!silent) post('closed', { reason: reason || '' });
-}
-
-function deviceLost(reason) {
-    const d = dev;
-    if (!d) return;
-    console.warn('[usb_worker] device lost:', reason);
-    teardown();
-    d.close().catch(() => {});
-    post('closed', { reason });
-}
-
-// Invalidates every chain of the current session. `dev` is cleared first so that the rejections
-// produced by close()/releaseInterface() find a mismatching generation and are ignored.
-function teardown() {
-    publishTick();                      // hand over the last aggregates of this session
-    dev = null;
-    rxGen++;
-    rxEnabled = false;
-    stopWatchdog();
-    if (pubTimer !== null) { clearInterval(pubTimer); pubTimer = null; }
-    txQueue = [];
-    txHead = 0;
-}
-
-// ---------------------------------------------------------------------------------------------
-// Control transfers (strictly ordered, each with its own timeout)
-// ---------------------------------------------------------------------------------------------
-
-async function doControl(m) {
-    const d = dev;
-    const isOut = m.type === 'ctrl_out';
-    if (!d) {
-        if (isOut) post('ctrl_ack', { request: m.request, ok: false });
-        return;
-    }
-    const setup = {
-        requestType: 'vendor', recipient: 'interface',
-        request: m.request, value: m.value, index: m.index
-    };
-    try {
-        if (isOut) {
-            const r = await withTimeout(d.controlTransferOut(setup, m.data), CTRL_TIMEOUT_MS,
-                                        'control OUT timeout (request ' + m.request + ')');
-            post('ctrl_ack', { request: m.request, ok: r.status === 'ok' });
-        } else {
-            const r = await withTimeout(d.controlTransferIn(setup, m.length), CTRL_TIMEOUT_MS,
-                                        'control IN timeout (request ' + m.request + ')');
-            if (r.status === 'ok' && r.data && r.data.byteLength > 0) {
-                const ab = r.data.buffer.slice(r.data.byteOffset, r.data.byteOffset + r.data.byteLength);
-                post('ctrl_in', { request: m.request, data: ab }, [ab]);
+        const iface = usb.configuration && usb.configuration.interfaces.find(i => i.interfaceNumber === IFACE);
+        const alt = iface && iface.alternate;
+        if (!alt) return info;
+        const parts = [];
+        let haveIn = false, haveOut = false;
+        for (const e of alt.endpoints) {
+            parts.push(e.direction.toUpperCase() + ' ' + e.endpointNumber + ' ' + e.type + ' ' + e.packetSize + 'B');
+            if (e.type !== 'bulk') continue;
+            if (e.direction === 'in' && !haveIn) {
+                haveIn = true;
+                info.rxEp = e.endpointNumber;
+                info.rxSize = Math.max(DEFAULT_RX_SIZE, e.packetSize | 0);
+            } else if (e.direction === 'out' && !haveOut) {
+                haveOut = true;
+                info.txEp = e.endpointNumber;
             }
         }
-    } catch (err) {
-        console.error('[usb_worker] control transfer failed:', err);
-        if (isOut) post('ctrl_ack', { request: m.request, ok: false });
-        if (dev === d && isGone(err)) deviceLost(errText(err));
+        info.text = parts.join(', ');
+    } catch (e) { /* keep defaults */ }
+    return info;
+}
+
+// ---------------------------------------------------------------------------------------------
+// One adapter
+// ---------------------------------------------------------------------------------------------
+
+class Device {
+    constructor(dev) {
+        this.dev = dev;
+        this.usb = null;                // USBDevice while open
+        this.epoch = 0;
+        this.chain = Promise.resolve(); // serializes open/close/control commands of this adapter
+
+        // RX state. rxGen is the generation token: every slot chain carries the generation it was started
+        // with and silently dies when it no longer matches (teardown/recover). A pending transferIn cannot
+        // be cancelled in WebUSB, so stale completions are simply ignored.
+        this.rxGen = 0;
+        this.rxEnabled = false;
+        this.rxEp = DEFAULT_EP_IN;
+        this.txEp = DEFAULT_EP_OUT;
+        this.rxSize = DEFAULT_RX_SIZE;
+        this.slotErr = new Array(RX_SLOTS).fill(0);
+        this.recovering = false;
+
+        // TX state
+        this.txQueue = [];
+        this.txHead = 0;
+        this.txInflight = 0;
+
+        // Watchdog
+        this.lastRxDone = 0;
+        this.lastPingOk = 0;
+        this.pingBusy = false;
+        this.pingFails = 0;
+
+        this.st = { rx: 0, rxPrev: 0, rxErrors: 0, txDropped: 0, txErrors: 0, recoveries: 0 };
+    }
+
+    post(type, fields, transfer) {
+        const msg = fields || {};
+        msg.type = type;
+        msg.dev = this.dev;
+        msg.epoch = this.epoch;
+        self.postMessage(msg, transfer || []);
+    }
+
+    enqueue(fn) {
+        this.chain = this.chain.then(fn).catch(err => console.error('[usb_worker] dev ' + this.dev + ' command failed:', err));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Open / close / loss
+    // -----------------------------------------------------------------------------------------
+
+    async open(m) {
+        if (this.usb) await this.close(null, true);
+        this.epoch = m.epoch;
+
+        try {
+            await coreReady;
+        } catch (err) {
+            this.post('closed', { reason: 'CAN core module failed to load: ' + errText(err) });
+            return;
+        }
+
+        // The matching of permitted devices must not interleave between adapters (identical adapters
+        // without serial number are told apart only by "not yet opened / not taken by another context")
+        const run = openLock.then(() => this.openUsb(m));
+        openLock = run.catch(() => {});
+        return run;
+    }
+
+    async openUsb(m) {
+        let d = null;
+        try {
+            // requestDevice() is window-only; the page already obtained the permission for this origin.
+            const list = await navigator.usb.getDevices();
+            const taken = new Set(devices.filter(x => x && x.usb).map(x => x.usb));
+            const cand = list.filter(x => x.vendorId === m.vid && x.productId === m.pid &&
+                                          (m.serial == null || x.serialNumber === m.serial) && !taken.has(x));
+            d = cand.find(x => !x.opened) || cand[0];
+            if (!d) throw new Error('device is not among the permitted devices');
+            await d.open();
+            if (d.configuration === null) await d.selectConfiguration(1);
+            await d.claimInterface(IFACE);
+        } catch (err) {
+            console.error('[usb_worker] dev ' + this.dev + ' open failed:', err);
+            if (d && d.opened) d.close().catch(() => {});
+            this.post('closed', { reason: 'open failed: ' + errText(err) });
+            return;
+        }
+
+        const ep = inspectEndpoints(d);
+        this.usb = d;
+        this.rxEp = ep.rxEp;
+        this.txEp = ep.txEp;
+        this.rxSize = ep.rxSize;
+        this.txQueue = [];
+        this.txHead = 0;
+        this.startRx();
+        this.lastPingOk = performance.now();
+        this.pingFails = 0;
+        this.pingBusy = false;
+        this.st.rxPrev = this.st.rx;
+        updateTimers();
+        this.post('opened', { eps: ep.text, rxEp: ep.rxEp, txEp: ep.txEp });
+    }
+
+    async close(reason, silent) {
+        const d = this.usb;
+        if (!d) {
+            if (!silent) this.post('closed', { reason: reason || '' });
+            return;
+        }
+        this.teardown();
+        try { await d.close(); } catch (e) { /* already gone */ }
+        if (!silent) this.post('closed', { reason: reason || '' });
+    }
+
+    lost(reason) {
+        const d = this.usb;
+        if (!d) return;
+        console.warn('[usb_worker] dev ' + this.dev + ' lost:', reason);
+        this.teardown();
+        d.close().catch(() => {});
+        this.post('closed', { reason: reason });
+    }
+
+    // Invalidates every chain of the current session. `usb` is cleared first so that the rejections
+    // produced by close()/releaseInterface() find a mismatching generation and are ignored.
+    teardown() {
+        publishTick();                  // hand over the last aggregates (of all adapters)
+        this.usb = null;
+        this.rxGen++;
+        this.rxEnabled = false;
+        this.txQueue = [];
+        this.txHead = 0;
+        updateTimers();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Control transfers (strictly ordered per adapter, each with its own timeout)
+    // -----------------------------------------------------------------------------------------
+
+    async control(m) {
+        const d = this.usb;
+        const isOut = m.type === 'ctrl_out';
+        if (!d) {
+            if (isOut) this.post('ctrl_ack', { request: m.request, ok: false });
+            return;
+        }
+        const setup = {
+            requestType: 'vendor', recipient: 'interface',
+            request: m.request, value: m.value, index: m.index
+        };
+        try {
+            if (isOut) {
+                const r = await withTimeout(d.controlTransferOut(setup, m.data), CTRL_TIMEOUT_MS,
+                                            'control OUT timeout (request ' + m.request + ')');
+                this.post('ctrl_ack', { request: m.request, ok: r.status === 'ok' });
+            } else {
+                const r = await withTimeout(d.controlTransferIn(setup, m.length), CTRL_TIMEOUT_MS,
+                                            'control IN timeout (request ' + m.request + ')');
+                if (r.status === 'ok' && r.data && r.data.byteLength > 0) {
+                    const ab = r.data.buffer.slice(r.data.byteOffset, r.data.byteOffset + r.data.byteLength);
+                    this.post('ctrl_in', { request: m.request, data: ab }, [ab]);
+                }
+            }
+        } catch (err) {
+            console.error('[usb_worker] dev ' + this.dev + ' control transfer failed:', err);
+            if (isOut) this.post('ctrl_ack', { request: m.request, ok: false });
+            if (this.usb === d && isGone(err)) this.lost(errText(err));
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // RX: N concurrent transferIn slots, each re-armed from its own completion handler
+    // -----------------------------------------------------------------------------------------
+
+    startRx() {
+        const gen = ++this.rxGen;
+        this.slotErr.fill(0);
+        this.lastRxDone = performance.now();
+        for (let i = 0; i < RX_SLOTS; i++) this.submitRx(i, gen);
+    }
+
+    submitRx(slot, gen) {
+        const d = this.usb;
+        if (gen !== this.rxGen || !d) return;
+        let p;
+        try {
+            p = d.transferIn(this.rxEp, this.rxSize);
+        } catch (err) {
+            this.onRxError(slot, gen, err);
+            return;
+        }
+        p.then(r => this.onRxDone(slot, gen, r), err => this.onRxError(slot, gen, err));
+    }
+
+    onRxDone(slot, gen, r) {
+        if (gen !== this.rxGen) return;     // completion of a cancelled/replaced session: ignore
+        this.slotErr[slot] = 0;
+        this.lastRxDone = performance.now();
+
+        if (r.status === 'stall') {
+            this.st.rxErrors++;
+            this.usb.clearHalt('in', this.rxEp).then(() => this.submitRx(slot, gen), err => this.onRxError(slot, gen, err));
+            return;
+        }
+
+        // Re-arm the slot first, within the same microtask checkpoint as the completion, so no other
+        // task (onmessage, timers) can run between completion and resubmission.
+        this.submitRx(slot, gen);
+
+        if (r.status === 'ok') {
+            if (r.data && r.data.byteLength > 0) this.onPacket(r.data);
+        } else {
+            this.st.rxErrors++;             // babble: partial data, drop it
+        }
+    }
+
+    onRxError(slot, gen, err) {
+        if (gen !== this.rxGen) return;
+        if (isGone(err)) { this.lost(errText(err)); return; }
+        this.st.rxErrors++;
+        const n = ++this.slotErr[slot];
+        if (n >= RX_ERRORS_BEFORE_RECOVER) {
+            this.slotErr[slot] = 0;
+            this.recover('RX errors: ' + errText(err));
+            return;
+        }
+        setTimeout(() => this.submitRx(slot, gen), Math.min(20 * n * n, 500));
+    }
+
+    // The only way to abort pending transfers is to release the interface (or close the device).
+    // A new generation makes the aborted chains harmless; then the slots are rebuilt.
+    async recover(reason) {
+        const d = this.usb;
+        if (this.recovering || !d) return;
+        this.recovering = true;
+        this.st.recoveries++;
+        console.warn('[usb_worker] dev ' + this.dev + ' recovering:', reason);
+        const gen = ++this.rxGen;
+        try {
+            await d.releaseInterface(IFACE);
+            await d.claimInterface(IFACE);
+            if (this.usb !== d) return;
+            this.slotErr.fill(0);
+            this.pingFails = 0;
+            this.lastRxDone = performance.now();
+            for (let i = 0; i < RX_SLOTS; i++) this.submitRx(i, gen);
+        } catch (err) {
+            if (this.usb === d) this.lost('recovery failed: ' + errText(err));
+        } finally {
+            this.recovering = false;
+        }
+    }
+
+    setRx(m) {
+        const enable = !!m.enable;
+        if (!enable) {
+            processStage();                 // everything received before the stop still counts
+            this.rxEnabled = false;
+            return;
+        }
+        if (!this.rxEnabled && core) core._core_reset_clock(this.dev);   // new channel start: adapter clock may restart
+        this.rxEnabled = true;
+        if (!this.usb) return;
+        const ep = m.ep ? (m.ep & 0x7F) : this.rxEp;
+        const size = Math.max(64, Math.min(m.size | 0 || this.rxSize, 16384));
+        if (ep !== this.rxEp || size !== this.rxSize) {
+            this.rxEp = ep;
+            this.rxSize = size;
+            this.recover('RX endpoint/size changed');
+        }
+    }
+
+    // Copy one completed transfer into the core's staging buffer as [u16 len][u8 dev][u8 ep][f64 time][bytes]
+    onPacket(dv) {
+        this.st.rx++;
+        if (!this.rxEnabled || !core) return;
+        const len = dv.byteLength;
+        if (len > 0xFFFF) return;
+        if (stageOff + STAGE_REC_HEADER + len > stageCap) processStage();
+
+        stageHdr.setUint16(0, len, true);
+        stageHdr.setUint8(2, this.dev);
+        stageHdr.setUint8(3, 0x80 | this.rxEp);
+        stageHdr.setFloat64(4, now(), true);
+
+        const heap = core.HEAPU8;           // re-read on every use: the heap may be replaced on growth
+        heap.set(stageHdrBytes, stagePtr + stageOff);
+        heap.set(new Uint8Array(dv.buffer, dv.byteOffset, len), stagePtr + stageOff + STAGE_REC_HEADER);
+        stageOff += STAGE_REC_HEADER + len;
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // TX: bounded queue, limited number of transfers in flight
+    // -----------------------------------------------------------------------------------------
+
+    enqueueTx(data, ep) {
+        if (!this.usb || this.txQueue.length - this.txHead >= TX_QUEUE_MAX) { this.st.txDropped++; return; }
+        this.txQueue.push({ data: data, ep: ep ? (ep & 0x7F) : this.txEp });
+        this.pumpTx();
+    }
+
+    pumpTx() {
+        if (this.txHead === this.txQueue.length) { this.txQueue.length = 0; this.txHead = 0; }
+        const d = this.usb;
+        while (d && this.txInflight < TX_INFLIGHT && this.txHead < this.txQueue.length) {
+            const item = this.txQueue[this.txHead++];
+            this.txInflight++;
+            let p;
+            try { p = d.transferOut(item.ep, item.data); } catch (e) { p = Promise.reject(e); }
+            p.then(r => {
+                if (r.status === 'stall') {
+                    this.st.txErrors++;
+                    return d.clearHalt('out', item.ep);
+                }
+                if (r.status !== 'ok') this.st.txErrors++;
+            }).catch(err => {
+                this.st.txErrors++;
+                if (this.usb === d && isGone(err)) this.lost(errText(err));
+            }).finally(() => {
+                this.txInflight--;
+                this.pumpTx();
+            });
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Watchdog: stats + liveness probe (a silent bus is not a failure, a dead control pipe is)
+    // -----------------------------------------------------------------------------------------
+
+    tick() {
+        if (!this.usb) return;
+        this.post('stats', {
+            rxPerSec: this.st.rx - this.st.rxPrev, txDropped: this.st.txDropped,
+            recoveries: this.st.recoveries, rxErrors: this.st.rxErrors, txErrors: this.st.txErrors
+        });
+        this.st.rxPrev = this.st.rx;
+        const t = performance.now();
+        if (!this.recovering && !this.pingBusy && t - Math.max(this.lastRxDone, this.lastPingOk) > IDLE_PING_MS) this.ping();
+    }
+
+    async ping() {
+        const d = this.usb;
+        this.pingBusy = true;
+        try {
+            const r = await withTimeout(d.controlTransferIn({
+                requestType: 'vendor', recipient: 'interface',
+                request: GS_USB_BREQ_BT_CONST, value: 0, index: IFACE
+            }, 40), PING_TIMEOUT_MS, 'liveness probe timeout');
+            if (r.status !== 'ok') throw new Error('liveness probe status ' + r.status);
+            this.pingFails = 0;
+            this.lastPingOk = performance.now();
+        } catch (err) {
+            if (this.usb !== d) return;
+            if (isGone(err)) { this.lost(errText(err)); return; }
+            if (++this.pingFails >= PING_FAILS_MAX) {
+                this.pingFails = 0;
+                await this.recover('watchdog: ' + errText(err));
+            }
+        } finally {
+            this.pingBusy = false;
+        }
     }
 }
 
 // ---------------------------------------------------------------------------------------------
-// RX: N concurrent transferIn slots, each re-armed from its own completion handler
+// Shared timers: snapshot publishing and watchdog run while at least one adapter is open
 // ---------------------------------------------------------------------------------------------
 
-function startRx() {
-    const gen = ++rxGen;
-    slotErr.fill(0);
-    lastRxDone = performance.now();
-    for (let i = 0; i < RX_SLOTS; i++) submitRx(i, gen);
-}
-
-function submitRx(slot, gen) {
-    const d = dev;
-    if (gen !== rxGen || !d) return;
-    let p;
-    try {
-        p = d.transferIn(rxEp, rxSize);
-    } catch (err) {
-        onRxError(slot, gen, err);
-        return;
-    }
-    p.then(r => onRxDone(slot, gen, r), err => onRxError(slot, gen, err));
-}
-
-function onRxDone(slot, gen, r) {
-    if (gen !== rxGen) return;          // completion of a cancelled/replaced session: ignore
-    slotErr[slot] = 0;
-    lastRxDone = performance.now();
-
-    if (r.status === 'stall') {
-        st.rxErrors++;
-        const d = dev;
-        d.clearHalt('in', rxEp).then(() => submitRx(slot, gen), err => onRxError(slot, gen, err));
-        return;
-    }
-
-    // Re-arm the slot first, within the same microtask checkpoint as the completion, so no other
-    // task (onmessage, timers) can run between completion and resubmission.
-    submitRx(slot, gen);
-
-    if (r.status === 'ok') {
-        if (r.data && r.data.byteLength > 0) onPacket(r.data);
+function updateTimers() {
+    const open = devices.some(x => x && x.usb);
+    if (open) {
+        if (pubTimer === null) pubTimer = setInterval(publishTick, PUBLISH_MS);
+        if (wdTimer === null) wdTimer = setInterval(watchdogTick, WATCHDOG_MS);
     } else {
-        st.rxErrors++;                  // babble: partial data, drop it
+        if (pubTimer !== null) { clearInterval(pubTimer); pubTimer = null; }
+        if (wdTimer !== null) { clearInterval(wdTimer); wdTimer = null; }
     }
 }
 
-function onRxError(slot, gen, err) {
-    if (gen !== rxGen) return;
-    if (isGone(err)) { deviceLost(errText(err)); return; }
-    st.rxErrors++;
-    const n = ++slotErr[slot];
-    if (n >= RX_ERRORS_BEFORE_RECOVER) {
-        slotErr[slot] = 0;
-        recover('RX errors: ' + errText(err));
-        return;
-    }
-    setTimeout(() => submitRx(slot, gen), Math.min(20 * n * n, 500));
-}
-
-// The only way to abort pending transfers is to release the interface (or close the device).
-// A new generation makes the aborted chains harmless; then the slots are rebuilt.
-async function recover(reason) {
-    const d = dev;
-    if (recovering || !d) return;
-    recovering = true;
-    st.recoveries++;
-    console.warn('[usb_worker] recovering:', reason);
-    const gen = ++rxGen;
-    try {
-        await d.releaseInterface(IFACE);
-        await d.claimInterface(IFACE);
-        if (dev !== d) return;
-        slotErr.fill(0);
-        pingFails = 0;
-        lastRxDone = performance.now();
-        for (let i = 0; i < RX_SLOTS; i++) submitRx(i, gen);
-    } catch (err) {
-        if (dev === d) deviceLost('recovery failed: ' + errText(err));
-    } finally {
-        recovering = false;
-    }
-}
-
-function setRx(m) {
-    const enable = !!m.enable;
-    if (!enable) {
-        processStage();                 // everything received before the stop still counts
-        rxEnabled = false;
-        return;
-    }
-    if (!rxEnabled && core) core._core_reset_clock();   // new channel start: adapter clock may restart
-    rxEnabled = true;
-    if (!dev) return;
-    const ep = (m.ep == null ? rxEp : m.ep) & 0x7F;
-    const size = Math.max(64, Math.min(m.size | 0 || rxSize, 16384));
-    if (ep !== rxEp || size !== rxSize) {
-        rxEp = ep;
-        rxSize = size;
-        recover('RX endpoint/size changed');
-    }
+function watchdogTick() {
+    for (const d of devices) if (d) d.tick();
 }
 
 // ---------------------------------------------------------------------------------------------
 // CAN core: staging, periodic snapshots with credit-based flow control
 // ---------------------------------------------------------------------------------------------
-
-// Copy one completed transfer into the core's staging buffer as [u16 len][u16 ep][f64 time][bytes]
-function onPacket(dv) {
-    st.rx++;
-    if (!rxEnabled || !core) return;
-    const len = dv.byteLength;
-    if (len > 0xFFFF) return;
-    if (stageOff + STAGE_REC_HEADER + len > stageCap) processStage();
-
-    stageHdr.setUint16(0, len, true);
-    stageHdr.setUint16(2, 0x80 | rxEp, true);
-    stageHdr.setFloat64(4, now(), true);
-
-    const heap = core.HEAPU8;           // re-read on every use: the heap may be replaced on growth
-    heap.set(stageHdrBytes, stagePtr + stageOff);
-    heap.set(new Uint8Array(dv.buffer, dv.byteOffset, len), stagePtr + stageOff + STAGE_REC_HEADER);
-    stageOff += STAGE_REC_HEADER + len;
-}
 
 function processStage() {
     if (stageOff > 0 && core) {
@@ -418,7 +542,7 @@ function publishTick() {
     const buf = pool.pop() || new ArrayBuffer(snapCap);
     new Uint8Array(buf, 0, n).set(core.HEAPU8.subarray(outPtr, outPtr + n));
     credits--;
-    post('snapshot', { buf: buf, used: n }, [buf]);
+    self.postMessage({ type: 'snapshot', buf: buf, used: n }, [buf]);
 }
 
 function returnBuffer(buf) {
@@ -440,86 +564,46 @@ function coreCommand(m) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// TX: bounded queue, limited number of transfers in flight
+// Command dispatch
 // ---------------------------------------------------------------------------------------------
 
-function enqueueTx(data, ep) {
-    if (!dev || txQueue.length - txHead >= TX_QUEUE_MAX) { st.txDropped++; return; }
-    txQueue.push({ data: data, ep: ep & 0x7F });
-    pumpTx();
-}
-
-function pumpTx() {
-    if (txHead === txQueue.length) { txQueue.length = 0; txHead = 0; }
-    const d = dev;
-    while (d && txInflight < TX_INFLIGHT && txHead < txQueue.length) {
-        const item = txQueue[txHead++];
-        txInflight++;
-        let p;
-        try { p = d.transferOut(item.ep, item.data); } catch (e) { p = Promise.reject(e); }
-        p.then(r => {
-            if (r.status === 'stall') {
-                st.txErrors++;
-                return d.clearHalt('out', item.ep);
-            }
-            if (r.status !== 'ok') st.txErrors++;
-        }).catch(err => {
-            st.txErrors++;
-            if (dev === d && isGone(err)) deviceLost(errText(err));
-        }).finally(() => {
-            txInflight--;
-            pumpTx();
-        });
+self.onmessage = (ev) => {
+    const m = ev.data;
+    switch (m.type) {
+        case 'init': mainOrigin = m.timeOrigin; return;
+        case 'ret':  returnBuffer(m.buf); return;
+        case 'core': coreCommand(m); return;
     }
-}
 
-// ---------------------------------------------------------------------------------------------
-// Watchdog: stats + liveness probe (a silent bus is not a failure, a dead control pipe is)
-// ---------------------------------------------------------------------------------------------
+    const n = m.dev;
+    if (!Number.isInteger(n) || n < 0 || n >= MAX_DEVICES) return;
+    let d = devices[n];
 
-function startWatchdog() {
-    stopWatchdog();
-    pingFails = 0;
-    pingBusy = false;
-    lastPingOk = performance.now();
-    st.rxPrev = st.rx;
-    wdTimer = setInterval(watchdogTick, WATCHDOG_MS);
-}
+    if (m.type === 'open') {
+        if (!d) d = devices[n] = new Device(n);
+        d.enqueue(() => d.open(m));
+        return;
+    }
+    if (!d) return;                         // command for a device that was never opened
 
-function stopWatchdog() {
-    if (wdTimer !== null) { clearInterval(wdTimer); wdTimer = null; }
-}
+    switch (m.type) {
+        case 'close':    d.enqueue(() => d.close('closed by host', false)); break;
+        case 'ctrl_out':
+        case 'ctrl_in':  d.enqueue(() => d.control(m)); break;
+        case 'tx':       d.enqueueTx(m.data, m.ep); break;
+        case 'rx':       d.setRx(m); break;
+    }
+};
 
-function watchdogTick() {
-    if (!dev) return;
-    post('stats', {
-        rxPerSec: st.rx - st.rxPrev, txDropped: st.txDropped,
-        recoveries: st.recoveries, rxErrors: st.rxErrors, txErrors: st.txErrors
-    });
-    st.rxPrev = st.rx;
-    const t = performance.now();
-    if (!recovering && !pingBusy && t - Math.max(lastRxDone, lastPingOk) > IDLE_PING_MS) ping();
-}
-
-async function ping() {
-    const d = dev;
-    pingBusy = true;
-    try {
-        const r = await withTimeout(d.controlTransferIn({
-            requestType: 'vendor', recipient: 'interface',
-            request: GS_USB_BREQ_BT_CONST, value: 0, index: IFACE
-        }, 40), PING_TIMEOUT_MS, 'liveness probe timeout');
-        if (r.status !== 'ok') throw new Error('liveness probe status ' + r.status);
-        pingFails = 0;
-        lastPingOk = performance.now();
-    } catch (err) {
-        if (dev !== d) return;
-        if (isGone(err)) { deviceLost(errText(err)); return; }
-        if (++pingFails >= PING_FAILS_MAX) {
-            pingFails = 0;
-            await recover('watchdog: ' + errText(err));
+if (typeof navigator !== 'undefined' && navigator.usb) {
+    navigator.usb.addEventListener('disconnect', (ev) => {
+        // Prefer object identity: identical adapters without serial number look the same otherwise
+        const open = devices.filter(x => x && x.usb);
+        let hit = open.find(x => x.usb === ev.device);
+        if (!hit) {
+            const same = open.filter(x => sameDevice(ev.device, x.usb));
+            if (same.length === 1) hit = same[0];
         }
-    } finally {
-        pingBusy = false;
-    }
+        if (hit) hit.lost('device disconnected');
+    });
 }

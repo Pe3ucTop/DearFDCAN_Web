@@ -3,10 +3,15 @@
 // Both are wasm32 builds of the same headers, so the plain-data records below are exchanged by memcpy.
 #include "can_protocol.h"
 
-// Unique 64-bit lookup key for the ID table (combines the 29-bit/11-bit ID and the EXT flag)
-inline uint64_t MakeCanIdKey(uint32_t id, bool is_extended) {
-    return (static_cast<uint64_t>(is_extended ? 1 : 0) << 32) | static_cast<uint64_t>(id);
+// Unique 64-bit lookup key for the ID table: device number, EXT flag and the 29-bit/11-bit ID.
+// The same CAN ID received by two adapters is two separate rows.
+inline uint64_t MakeCanIdKey(uint8_t dev, uint32_t id, bool is_extended) {
+    return (static_cast<uint64_t>(dev) << 33) | (static_cast<uint64_t>(is_extended ? 1 : 0) << 32) |
+           static_cast<uint64_t>(id);
 }
+
+// Device number a table key belongs to
+inline uint8_t CanIdKeyDevice(uint64_t key) { return static_cast<uint8_t>(key >> 33); }
 
 // One changed ID table row
 struct WireTableRecord {
@@ -33,6 +38,7 @@ struct SnapshotHeader {
     uint32_t frames_total;         // frames parsed so far
     uint32_t table_overflow_total; // frames of new IDs ignored because the table is full
     uint32_t reserved;
+    uint32_t dev_frames[kMaxDevices]; // frames parsed per device number
 };
 
 static_assert(sizeof(SnapshotHeader) % 8 == 0, "snapshot records must start 8-byte aligned");

@@ -5,6 +5,9 @@
 #include <type_traits>
 #include <vector>
 
+// Maximum number of adapters handled at once. A device number (slot) is 0..kMaxDevices-1; the UI shows it 1-based.
+constexpr int kMaxDevices = 8;
+
 // gs_usb control request codes (bRequest)
 enum GsUsbBreq : uint8_t {
     GS_USB_BREQ_HOST_FORMAT    = 0,
@@ -22,7 +25,12 @@ enum GsUsbBreq : uint8_t {
 enum GsCanFeature : uint32_t {
     GS_CAN_FEATURE_LISTEN_ONLY  = (1 << 0),
     GS_CAN_FEATURE_LOOP_BACK    = (1 << 1),
+    GS_CAN_FEATURE_TRIPLE_SAMPLE = (1 << 2),
+    GS_CAN_FEATURE_ONE_SHOT     = (1 << 3),
     GS_CAN_FEATURE_HW_TIMESTAMP = (1 << 4),
+    GS_CAN_FEATURE_IDENTIFY     = (1 << 5),
+    GS_CAN_FEATURE_USER_ID      = (1 << 6),
+    GS_CAN_FEATURE_PAD_PKTS     = (1 << 7),
     GS_CAN_FEATURE_FD           = (1 << 8)
 };
 
@@ -44,6 +52,16 @@ struct GsDeviceBtConst {
     uint32_t brp_min;
     uint32_t brp_max;
     uint32_t brp_inc;
+};
+
+// Adapter description returned by GS_USB_BREQ_DEVICE_CONFIG
+struct GsDeviceConfig {
+    uint8_t  reserved1;
+    uint8_t  reserved2;
+    uint8_t  reserved3;
+    uint8_t  icount;      // number of CAN interfaces minus one
+    uint32_t sw_version;  // firmware version
+    uint32_t hw_version;  // hardware version
 };
 
 // Bit-timing parameters sent via GS_USB_BREQ_BITTIMING / GS_USB_BREQ_DATA_BITTIMING
@@ -136,6 +154,7 @@ struct CanMessage {
     bool is_tx_echo = false;
     bool has_hw_timestamp = false;
     uint8_t dlc = 0;
+    uint8_t dev = 0;                // device number (slot) the frame was received from / is meant for
     CanPayload payload;
 };
 

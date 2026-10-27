@@ -143,20 +143,28 @@ int main(int, char**) {
     // 4. Connect WebUSB transport callbacks to UI and CAN protocol handlers
     auto& webusb = WebUsbBridge::GetInstance();
 
-    webusb.SetOnConnected([](const UsbDeviceInfo& info) {
-        g_AppUI.OnDeviceConnected(info.manufacturer + " " + info.product);
+    webusb.SetOnDeviceAdded([](int dev, const UsbDeviceInfo& info) {
+        g_AppUI.OnDeviceAdded(dev, info);
     });
 
-    webusb.SetOnDisconnected([]() {
-        g_AppUI.OnDeviceDisconnected();
+    webusb.SetOnDeviceOpened([](int dev, const std::string& endpoints) {
+        g_AppUI.OnDeviceOpened(dev, endpoints);
     });
 
-    webusb.SetOnControlIn([](uint8_t request, const uint8_t* data, int length) {
-        g_AppUI.OnControlDataReceived(request, data, length);
+    webusb.SetOnDeviceClosed([](int dev, const std::string& reason) {
+        g_AppUI.OnDeviceClosed(dev, reason);
     });
 
-    webusb.SetOnControlOutDone([](uint8_t request, bool ok) {
-        g_AppUI.OnControlOutDone(request, ok);
+    webusb.SetOnMessage([](const std::string& text) {
+        g_AppUI.OnNotice(text);
+    });
+
+    webusb.SetOnControlIn([](int dev, uint8_t request, const uint8_t* data, int length) {
+        g_AppUI.OnControlDataReceived(dev, request, data, length);
+    });
+
+    webusb.SetOnControlOutDone([](int dev, uint8_t request, bool ok) {
+        g_AppUI.OnControlOutDone(dev, request, ok);
     });
 
     webusb.SetOnSnapshot([](const SnapshotView& snapshot) {

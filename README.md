@@ -8,9 +8,16 @@ driver or native application needed.
 ## Features
 
 - Classic CAN and CAN FD (BRS, ESI), standard and extended IDs, remote frames.
-- **Receive Table by ID**: one row per ID with count, cycle time (min/max kept internally), changed bytes highlighted, sortable columns.
-- **Receive Trace**: chronological list with filter by ID, pause, auto-scroll.
-- **Transmit**: composer, burst, periodic jobs with optional auto-increment byte, history of sent frames.
+- **Several adapters at once** (up to 8). Every adapter gets a device number (1..8) and its own bit timing, mode and statistics;
+  frames of all adapters are received simultaneously.
+- **Devices window**: add / connect / disconnect / remove adapters, state of each one (Connecting, Connected, BUS ON, Disconnected),
+  start and stop the CAN channel per adapter or for all, and an information pane with adapter name, manufacturer, serial number,
+  VID:PID, USB and device revision, firmware / hardware version, CAN channel count, CAN clock, feature flags, endpoints and USB counters.
+- **Receive Table by ID**: one row per device and ID with count, cycle time (min/max kept internally), changed bytes highlighted,
+  sortable columns, `Dev` column and a device filter.
+- **Receive Trace**: chronological list with `Dev` column, filter by ID and by device, pause, auto-scroll.
+- **Transmit**: composer, burst, periodic jobs with optional auto-increment byte, history of sent frames; the target is one
+  adapter or all adapters that are BUS ON, and jobs and history entries remember it.
 - Bit timing: automatic BRP/segment calculation from the adapter clock for a target bit rate and sample point (nominal and data phase), manual override.
 - Cycle times and trace timestamps use the adapter's hardware timestamps when the firmware supports them.
 - Initial bit rate / sample point can be passed in the URL (see below).
@@ -21,14 +28,16 @@ driver or native application needed.
 ```
  page (index.html)                         dedicated Worker (usb_worker.js)
  ┌──────────────────────────┐   postMessage   ┌──────────────────────────────────────────┐
- │ Dear ImGui UI (wasm)     │ ──commands────▶ │ owns the USBDevice                       │
- │ app_ui / main            │                 │  • 6 concurrent transferIn slots         │
- │ webusb_bridge (EM_JS)    │ ◀──snapshots─── │  • ordered control queue, bounded TX     │
- │ id table / trace views   │   (transfer,    │  • watchdog, recovery, unplug handling   │
- └──────────────────────────┘    no copy)     │ can_core (second wasm module)            │
-                                              │  • parses gs_usb frames                  │
-                                              │  • ID table, trace queue, cycle times    │
-                                              │  • adapter→page clock mapping            │
+ │ Dear ImGui UI (wasm)     │ ──commands────▶ │ one Device context per adapter (dev 0-7):│
+ │ app_ui / main            │   (dev, epoch)  │  • owns its USBDevice                    │
+ │ webusb_bridge (EM_JS)    │ ◀──snapshots─── │  • 6 concurrent transferIn slots         │
+ │ device slots, id table,  │   (transfer,    │  • ordered control queue, bounded TX    │
+ │ trace views              │    no copy)     │  • watchdog, recovery, unplug handling   │
+ └──────────────────────────┘                 │ can_core (one shared wasm module)        │
+                                              │  • parses gs_usb frames of all adapters  │
+                                              │  • ID table keyed by (device, ID)        │
+                                              │  • trace queue, cycle times              │
+                                              │  • clock mapping per adapter             │
                                               └──────────────────────────────────────────┘
 ```
 
@@ -36,8 +45,13 @@ driver or native application needed.
   *snapshot* about every 16 ms: the changed ID rows (latest state, so updates of one ID coalesce) and the new trace entries.
 - Flow control is credit based: at most 4 snapshots may be unacknowledged. If the page is slow the core keeps
   aggregating (bounded memory) instead of queueing frames.
+- Adapters are isolated from each other: every one has its own receive slots, control and TX queues, watchdog and statistics, so a
+  hung or unplugged adapter does not delay the others. Only the matching of permitted devices (`getDevices()`) is serialized.
+  All commands carry the device number, and every worker message carries the device number and the `epoch` of that connection,
+  so messages of an older connection of a slot are discarded.
 - No `SharedArrayBuffer`, `Atomics` or pthreads: only `postMessage` with transferred `ArrayBuffer`s, so no COOP/COEP headers are needed.
-- `requestDevice()` is window-only, so the page asks for the permission and the worker opens the permitted device by VID/PID/serial.
+- `requestDevice()` is window-only, so the page asks for the permission (browser chooser) and the worker opens the permitted device
+  by VID/PID/serial. The page keeps the picked `USBDevice` in a slot, so a disconnected adapter can be reconnected without the chooser.
 
 ## Requirements
 
@@ -79,17 +93,23 @@ Do not rely on `file://`. If the page has a Content-Security-Policy, it must all
 
 ## Usage
 
-1. Open the page and press **Request WebUSB CAN Device**, pick the adapter.
-2. Adjust bit timing in **Hardware & Bit-Timing Setup** (FD, loopback and listen-only switches are there too) and press **Start CAN Channel**.
-   The channel counts as open only after the adapter acknowledged the mode request.
-3. Watch the **Receive Table** and **Trace**, send frames from the **Transmit** window.
+1. Open the page and press **Add Device** in the **Devices & Bit-Timing Setup** window, pick an adapter in the browser dialog.
+   Repeat for every further adapter (up to 8); each gets the next free device number.
+2. Select an adapter in the list to see its information and to adjust its bit timing (FD, loopback and listen-only switches are there too),
+   then press **Start** in its row (or **Start All**). The channel counts as open only after the adapter acknowledged the mode request.
+3. Watch the **Receive Table** and **Trace** (the `Dev` column and the device filter tell the adapters apart; hover a device number to see
+   which adapter it is). Pick the target of a transmission with **Send via** in the **Transmit** window.
 
-The menu bar shows live transport counters: USB transfers per second, parsed frames, dropped trace entries,
-missing snapshots, dropped TX frames and watchdog recoveries.
+An adapter that was unplugged or disconnected stays in the list as *Disconnected*; **Connect** reopens it without the browser dialog,
+**Remove** forgets it and frees its number. Picking an adapter in the dialog that already has a number reconnects that slot.
+
+The menu bar shows live transport counters: connected adapters and how many are BUS ON, parsed frames, dropped trace entries and
+missing snapshots. Per-adapter USB rate, frame count, errors, dropped TX frames and watchdog recoveries are in the information pane.
 
 ### URL parameters
 
-Bit rate and sample point can be preset in the query string; they are used as the targets of the automatic timing calculation.
+Bit rate and sample point can be preset in the query string; they are used as the targets of the automatic timing calculation
+and become the defaults of every adapter you add (each adapter can still be changed on its own).
 
 ```
 index.html?baudrate=500k&sample_point=87.5&data_baudrate=2M&data_sample_point=75
@@ -112,12 +132,12 @@ All sources and headers are in `src_inc/`:
 | File | Role |
 |---|---|
 | `src_inc/main.cpp` | GLFW/ImGui setup, main loop, wiring of bridge callbacks |
-| `src_inc/app_ui.cpp/.h` | All windows, channel start/stop, snapshot ingestion, URL parameters |
+| `src_inc/app_ui.cpp/.h` | All windows, adapter slots (`DeviceSlot`), per-adapter channel start/stop, snapshot ingestion, URL parameters |
 | `src_inc/url_params.h` | Parsing of the URL parameter values |
-| `src_inc/webusb_bridge.cpp/.h` | Page side of the worker link (EM_JS), snapshot validation, transport statistics |
-| `src_inc/usb_worker.js` | Worker: WebUSB I/O, RX slots, control/TX queues, watchdog, snapshot publishing |
-| `src_inc/can_core.cpp` | Worker wasm module: frame parsing, ID table, trace queue, clock mapping |
-| `src_inc/can_protocol.cpp/.h` | gs_usb structures, DLC helpers, bit-timing calculation, `CanMessage`/`CanPayload` |
+| `src_inc/webusb_bridge.cpp/.h` | Page side of the worker link (EM_JS): device slots, device events, snapshot validation, per-adapter statistics |
+| `src_inc/usb_worker.js` | Worker: one `Device` context per adapter (WebUSB I/O, RX slots, control/TX queues, watchdog), snapshot publishing |
+| `src_inc/can_core.cpp` | Worker wasm module: frame parsing, ID table keyed by (device, ID), trace queue, per-adapter clock mapping |
+| `src_inc/can_protocol.cpp/.h` | gs_usb structures, DLC helpers, bit-timing calculation, `CanMessage`/`CanPayload`, `kMaxDevices` |
 | `src_inc/can_wire.h` | Snapshot format shared by the page and the worker core |
 
 Build tooling in the repository root:
@@ -133,7 +153,11 @@ Tunables: `RX_SLOTS`, `TX_INFLIGHT`, `PUBLISH_MS`, `BATCH_CREDITS` at the top of
 
 ## Known limitations
 
-- Chromium only. The adapter is matched by VID/PID/serial; two identical adapters without serial numbers are ambiguous.
+- Chromium only. An adapter is matched by VID/PID/serial. Identical adapters without serial numbers can be told apart only by
+  "not yet in use", so after replugging them their device numbers may be swapped.
+- Only CAN channel 0 of an adapter is used; multi-channel gs_usb adapters show their channel count but are driven as one channel.
+- At most 8 adapters (`kMaxDevices` in `can_protocol.h`, `MAX_DEVICES` in `usb_worker.js`, `MAX_DEVICES` in `webusb_bridge.cpp`). The limits
+  of the ID table (65536 rows) and the trace are shared by all adapters.
 - `TX_INFLIGHT = 4` keeps several bulk OUT transfers in flight; WebUSB does not guarantee their order. Set it to `1` if strict frame order matters.
 - The adapter→page clock mapping is an estimate (lowest observed latency, 100 ppm drift allowance); cycle times use the raw adapter timestamps and are exact.
   Without hardware timestamps cycle times fall back to arrival times and show USB/browser jitter.
@@ -189,13 +213,39 @@ experiments in the build script were removed, `compile_script.sh` usage text mat
 **2026-10-27, build layout.** Sources, headers and the worker moved to `src_inc/`. The build logic moved from the shell script into a
 `Makefile`: results go to `build/<mode>/`, compiled objects are cached in `build/obj` (Dear ImGui is compiled once; a change recompiles only the
 affected files, tracked through generated dependency files), `compile_script.sh` is a wrapper. The page is now compiled and linked with `-O2`
-(it used no optimization flags before); the single-file `index.html` shrank from about 1.7 MB to 0.87 MB. The `-O2` page could not be run in a
-browser in the environment it was built in; it was only checked statically (the optimized JS parses, the Blob-worker start, the snapshot call and the URL
-reader are present, every identifier used by the `EM_JS` bodies is still defined).
+(it used no optimization flags before); the single-file `index.html` shrank from about 1.7 MB to 0.87 MB. In the environment it was built in the
+`-O2` page could only be checked statically (the optimized JS parses, the Blob-worker start, the snapshot call and the URL reader are present, every identifier
+used by the `EM_JS` bodies is still defined); it was then confirmed working on hardware.
 
-What was and was not verified: the CAN core, frame parser and URL parsing were unit-tested natively (ASan/UBSan) and the worker was exercised
-against a mock `USBDevice` with the real core module in Node; the unoptimized single-file Blob-Worker was confirmed on hardware. Throughput numbers
-and the accuracy of hardware timestamps were not measured.
+**2026-10-27, several adapters.** Before, the whole stack assumed one adapter: one `USBDevice` and one set of receive/TX/control queues in the
+worker, one connection and channel state and one bit-timing configuration in the UI, no device number in a frame, a table row per CAN ID.
+- *Worker:* `usb_worker.js` was restructured around a `Device` class; there is one context per device number (0..7) with its own `USBDevice`,
+  receive slots (generation token), control queue, bounded TX queue, watchdog, recovery and statistics. All messages carry `dev` (and `epoch`
+  for the messages that belong to a connection). Opening is serialized across adapters and never hands out a `USBDevice` that another context
+  already holds, which lets identical adapters without serial number coexist. An unplug event is matched by object identity first. The bulk
+  endpoints and the receive size are now read from the interface descriptor (defaults 1/2/512 when it is not available) and reported to the page.
+  The publish timer and the watchdog run while any adapter is open.
+- *Core and formats:* frames are tagged with the device number (`CanMessage::dev`, staging records carry it), the ID table key became
+  (device, extended flag, ID), the clock mapping is kept per adapter (`core_reset_clock(dev)`), and the snapshot header carries per-device
+  frame counters (80 bytes now).
+- *Bridge:* the JS side keeps a table of slots (picked `USBDevice` + connection state + epoch). New calls: connect / disconnect / remove per slot;
+  every command takes the device number. New events: device added (what the browser knows: name, manufacturer, serial, USB and device revision),
+  opened (with the endpoints), closed (with the reason) and a user-facing notice (no free slot, adapter already connected). Statistics are per device.
+- *UI:* the connection window and the adapter information were merged into one window with a device list and an information pane (the adapter
+  description is read from the adapter with `GS_USB_BREQ_DEVICE_CONFIG` in addition to `BT_CONST`). Bit timing, mode and CAN clock are per adapter;
+  the channel start/stop sequence, its acknowledgements and the roll-back on failure are per adapter. The tables got a `Dev` column
+  (receive table, trace, periodic jobs, history) and the receive views a device filter. Transmit has a target selector; jobs and history remember
+  their target, jobs of a removed adapter are disabled instead of being silently retargeted.
+- *Verified:* the worker with three scenarios of mock adapters (independent open, identical adapters without serial, simultaneous reception with the real core,
+  per-device rx gate, control isolation with a hung adapter, TX routing and endpoints, unplug, reconnect with a new epoch, recovery and watchdog of one adapter,
+  stray commands), also on the packed single-file worker; the core and the bridge's event/statistics handling natively (ASan/UBSan); the UI logic
+  (adapter events, per-device channel sequences and acks, send to one/all, history/jobs targets, snapshots with two rows per ID, removal) headless with the real Dear ImGui,
+  and its layout by rendering the ImGui draw lists to an image. Not verified: operation with real, simultaneously connected adapters, and the
+  JS code of the bridge (chooser, slot table, reconnect) in a real browser: it was only checked statically (it parses and its identifiers are defined).
+
+What was and was not verified overall: the CAN core, frame parser and URL parsing were unit-tested natively (ASan/UBSan) and the worker was exercised
+against a mock `USBDevice` with the real core module in Node; the single-file Blob-Worker and the `-O2` page were confirmed on hardware with one adapter.
+Throughput numbers and the accuracy of hardware timestamps were not measured.
 
 ## License
 

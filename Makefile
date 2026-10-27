@@ -52,7 +52,7 @@ PAGE_OBJS := $(addprefix $(OBJ)/page/,$(APP_SRCS:.cpp=.o)) \
 
 PAGE_COMMON := -std=c++17 $(OPT) -I$(SRC) -I$(IMGUI_DIR) -I$(IMGUI_DIR)/backends
 
-PAGE_EXPORTS := ["_main","_malloc","_free","_webusb_cb_connected","_webusb_cb_disconnected","_webusb_cb_snapshot","_webusb_cb_ctrl_in","_webusb_cb_ctrl_ack","_webusb_cb_stats"]
+PAGE_EXPORTS := ["_main","_malloc","_free","_webusb_cb_device_added","_webusb_cb_device_opened","_webusb_cb_device_closed","_webusb_cb_message","_webusb_cb_snapshot","_webusb_cb_ctrl_in","_webusb_cb_ctrl_ack","_webusb_cb_stats"]
 PAGE_LDFLAGS := $(OPT) -sUSE_GLFW=3 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 \
                 -sEXPORTED_RUNTIME_METHODS='["stringToUTF8","lengthBytesUTF8"]' \
                 -sEXPORTED_FUNCTIONS='$(PAGE_EXPORTS)'

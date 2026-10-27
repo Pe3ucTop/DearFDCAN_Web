@@ -21,7 +21,7 @@
 
 namespace {
 
-constexpr size_t   kStageCap            = 1u << 20; // staging records: u16 len | u16 ep | f64 host_ms | bytes
+constexpr size_t   kStageCap            = 1u << 20; // staging records: u16 len | u8 dev | u8 ep | f64 host_ms | bytes
 constexpr size_t   kStageRecHeader      = 12;
 constexpr uint32_t kMaxTablePerPublish  = 1024;
 constexpr uint32_t kMaxTracePerPublish  = 2048;     // the page keeps at most 2000 trace rows anyway
@@ -89,7 +89,8 @@ std::vector<uint64_t> g_dirty;
 std::deque<TraceEntry> g_trace;
 std::vector<CanMessage> g_parsed;
 CanProtocolHandler g_parser;
-ClockSync g_clock;
+ClockSync g_clock[kMaxDevices];          // every adapter has its own clock
+uint32_t g_dev_frames[kMaxDevices] = {};
 
 bool g_trace_enabled = true;
 bool g_force_publish = false;
@@ -102,9 +103,10 @@ uint32_t g_trace_clear_ack = 0;
 
 void OnFrame(CanMessage& m, double host_ms) {
     // Frame time: adapter clock mapped onto the page timeline when available, else completion time
-    const double t = m.has_hw_timestamp ? g_clock.Map(m.hw_timestamp_us, host_ms) : host_ms;
+    const double t = m.has_hw_timestamp ? g_clock[m.dev].Map(m.hw_timestamp_us, host_ms) : host_ms;
     m.host_time_ms = t;
     ++g_frames_total;
+    ++g_dev_frames[m.dev];
 
     if (g_trace_enabled) {
         if (g_trace.size() >= kTraceQueueMax) {
@@ -117,7 +119,7 @@ void OnFrame(CanMessage& m, double host_ms) {
         g_trace.push_back(te);
     }
 
-    const uint64_t key = MakeCanIdKey(m.id, m.is_extended);
+    const uint64_t key = MakeCanIdKey(m.dev, m.id, m.is_extended);
     auto it = g_table.find(key);
     if (it == g_table.end()) {
         if (g_table.size() >= kMaxIds) {
@@ -182,14 +184,20 @@ EMSCRIPTEN_KEEPALIVE void core_process(int used) {
     while (off + static_cast<int>(kStageRecHeader) <= used) {
         uint16_t len = 0;
         double host_ms = 0.0;
+        const uint8_t dev = g_stage[off + 2];
         std::memcpy(&len, g_stage + off, sizeof(len));
         std::memcpy(&host_ms, g_stage + off + 4, sizeof(host_ms));
         off += static_cast<int>(kStageRecHeader);
         if (off + len > used) break;
 
-        g_parsed.clear();
-        g_parser.ParseRxBuffer(g_stage + off, len, g_parsed);
-        for (CanMessage& m : g_parsed) OnFrame(m, host_ms);
+        if (dev < kMaxDevices) {
+            g_parsed.clear();
+            g_parser.ParseRxBuffer(g_stage + off, len, g_parsed);
+            for (CanMessage& m : g_parsed) {
+                m.dev = dev;
+                OnFrame(m, host_ms);
+            }
+        }
         off += len;
     }
 }
@@ -244,6 +252,7 @@ EMSCRIPTEN_KEEPALIVE int core_publish() {
     h.trace_dropped_total = g_trace_dropped;
     h.frames_total = g_frames_total;
     h.table_overflow_total = g_table_overflow;
+    std::memcpy(h.dev_frames, g_dev_frames, sizeof(h.dev_frames));
     std::memcpy(base, &h, sizeof(h));
 
     return static_cast<int>(w - base);
@@ -269,7 +278,9 @@ EMSCRIPTEN_KEEPALIVE void core_set_trace_enabled(int enable) {
     if (!g_trace_enabled) g_trace.clear();
 }
 
-// Forget the adapter clock correlation (call when a CAN channel is (re)started)
-EMSCRIPTEN_KEEPALIVE void core_reset_clock() { g_clock.Reset(); }
+// Forget the clock correlation of one adapter (call when its CAN channel is (re)started)
+EMSCRIPTEN_KEEPALIVE void core_reset_clock(int dev) {
+    if (dev >= 0 && dev < kMaxDevices) g_clock[dev].Reset();
+}
 
 } // extern "C"

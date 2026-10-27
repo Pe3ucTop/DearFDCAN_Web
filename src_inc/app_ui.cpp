@@ -17,7 +17,8 @@ enum IdTableColumnId : ImGuiID {
     ID_COL_LENGTH,
     ID_COL_COUNT,
     ID_COL_CYCLE,
-    ID_COL_DATA
+    ID_COL_DATA,
+    ID_COL_DEV
 };
 
 enum TraceTableColumnId : ImGuiID {
@@ -26,7 +27,8 @@ enum TraceTableColumnId : ImGuiID {
     TRACE_COL_CAN_ID,
     TRACE_COL_FORMAT,
     TRACE_COL_DLC,
-    TRACE_COL_DATA
+    TRACE_COL_DATA,
+    TRACE_COL_DEV
 };
 
 enum PeriodicTableColumnId : ImGuiID {
@@ -35,7 +37,8 @@ enum PeriodicTableColumnId : ImGuiID {
     JOB_COL_CYCLE,
     JOB_COL_SENT,
     JOB_COL_DATA,
-    JOB_COL_ACTIONS
+    JOB_COL_ACTIONS,
+    JOB_COL_DEV
 };
 
 enum HistoryTableColumnId : ImGuiID {
@@ -45,7 +48,8 @@ enum HistoryTableColumnId : ImGuiID {
     HIST_COL_DLC,
     HIST_COL_COUNT,
     HIST_COL_DATA,
-    HIST_COL_OPS
+    HIST_COL_OPS,
+    HIST_COL_DEV
 };
 
 // Helper: Parse space-separated hexadecimal string into byte array
@@ -108,6 +112,51 @@ static int ThreeWayCompare(const T& a, const T& b) {
     return 0;
 }
 
+// One colour per device number, used wherever a device number is shown
+static ImVec4 DeviceColor(int dev) {
+    static const ImVec4 palette[kMaxDevices] = {
+        ImVec4(0.45f, 0.80f, 1.00f, 1.0f), ImVec4(1.00f, 0.75f, 0.35f, 1.0f),
+        ImVec4(0.55f, 0.95f, 0.55f, 1.0f), ImVec4(0.95f, 0.55f, 0.85f, 1.0f),
+        ImVec4(0.95f, 0.90f, 0.45f, 1.0f), ImVec4(0.70f, 0.65f, 1.00f, 1.0f),
+        ImVec4(1.00f, 0.55f, 0.50f, 1.0f), ImVec4(0.60f, 0.90f, 0.85f, 1.0f)
+    };
+    return palette[(dev >= 0 && dev < kMaxDevices) ? dev : 0];
+}
+
+// Human readable list of the gs_usb feature bits an adapter reports
+static std::string FeatureList(uint32_t features) {
+    static const char* const names[] = {
+        "Listen-only", "Loopback", "Triple-sample", "One-shot", "HW timestamp",
+        "Identify", "User ID", "Pad packets", "CAN FD"
+    };
+    constexpr size_t kNames = sizeof(names) / sizeof(names[0]);
+
+    std::string text;
+    for (size_t i = 0; i < kNames; ++i) {
+        if (features & (1u << i)) {
+            if (!text.empty()) text += ", ";
+            text += names[i];
+        }
+    }
+    const uint32_t others = features & ~((1u << kNames) - 1u);
+    if (others) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%s+0x%X", text.empty() ? "" : ", ", others);
+        text += buf;
+    }
+    return text.empty() ? std::string("none") : text;
+}
+
+// State of an adapter for the Devices window
+static const char* DeviceStateText(const DeviceSlot& d, ImVec4& color) {
+    if (d.connected && d.channel_open)  { color = ImVec4(0.3f, 1.0f, 0.4f, 1.0f); return "BUS ON"; }
+    if (d.channel_opening)              { color = ImVec4(1.0f, 0.85f, 0.3f, 1.0f); return "Starting..."; }
+    if (d.connected)                    { color = ImVec4(0.4f, 0.9f, 1.0f, 1.0f); return "Connected, bus off"; }
+    if (d.connecting)                   { color = ImVec4(1.0f, 0.85f, 0.3f, 1.0f); return "Connecting..."; }
+    color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+    return "Disconnected";
+}
+
 // Reads one query parameter of the page URL. `which` indexes the name table in the JS body (a numeric
 // index keeps the string marshalling out of it). Returns 0 if the parameter is absent.
 enum UrlParam : int {
@@ -131,24 +180,16 @@ static bool GetUrlParam(UrlParam which, char* out, int out_size) {
 }
 
 AppUI::AppUI()
-    : is_connected_(false),
-      is_channel_open_(false),
-      channel_opening_(false),
-      device_name_("No Device"),
-      start_time_ms_(emscripten_get_now()),
+    : start_time_ms_(emscripten_get_now()),
+      selected_dev_(-1),
+      notice_time_ms_(0.0),
       auto_tile_layout_(true),
       show_hw_window_(true),
       show_tx_window_(true),
       show_history_window_(true),
       show_id_table_window_(true),
       show_trace_window_(true),
-      target_nom_kbps_(500),
-      target_nom_sp_(87.5f),
-      enable_fd_mode_(true),
-      enable_loopback_(false),
-      enable_listen_only_(false),
-      target_data_kbps_(2000),
-      target_data_sp_(75.0f),
+      tx_target_(kTargetAllDevices),
       tx_id_(0x123),
       tx_is_ext_(false),
       tx_is_fd_(true),
@@ -161,21 +202,10 @@ AppUI::AppUI()
       trace_paused_(false),
       trace_autoscroll_(true),
       trace_filter_id_(-1),
+      trace_filter_dev_(-1),
+      table_filter_dev_(-1),
       selected_history_index_(-1)
 {
-    std::memset(&bt_const_, 0, sizeof(bt_const_));
-    bt_const_.fclk_can  = 80000000U; // Default 80 MHz clock
-    bt_const_.tseg1_min = 1;
-    bt_const_.tseg1_max = 256;
-    bt_const_.tseg2_min = 1;
-    bt_const_.tseg2_max = 128;
-    bt_const_.sjw_max   = 128;
-    bt_const_.brp_min   = 1;
-    bt_const_.brp_max   = 512;
-
-    CanProtocolHandler::AutoCalculateBittiming(bt_const_.fclk_can, target_nom_kbps_ * 1000U, target_nom_sp_, nom_bt_);
-    CanProtocolHandler::AutoCalculateBittiming(bt_const_.fclk_can, target_data_kbps_ * 1000U, target_data_sp_, data_bt_);
-
     std::strncpy(tx_payload_, "01 02 03 04 05 06 07 08", sizeof(tx_payload_) - 1);
     tx_payload_[sizeof(tx_payload_) - 1] = '\0';
 
@@ -209,59 +239,179 @@ void AppUI::ApplyUrlParameters() {
         }
     };
 
-    apply_bitrate(URL_BAUDRATE, "nominal", target_nom_kbps_);
-    apply_sample_point(URL_SAMPLE_POINT, "nominal", target_nom_sp_);
-    apply_bitrate(URL_DATA_BAUDRATE, "data", target_data_kbps_);
-    apply_sample_point(URL_DATA_SAMPLE_POINT, "data", target_data_sp_);
-
-    // Recalculate with the clock known so far; done again once the adapter reports its real clock
-    CanProtocolHandler::AutoCalculateBittiming(bt_const_.fclk_can, target_nom_kbps_ * 1000U, target_nom_sp_, nom_bt_);
-    CanProtocolHandler::AutoCalculateBittiming(bt_const_.fclk_can, target_data_kbps_ * 1000U, target_data_sp_, data_bt_);
+    // They are the defaults of every adapter added later; each adapter can still be changed on its own
+    apply_bitrate(URL_BAUDRATE, "nominal", defaults_.target_nom_kbps);
+    apply_sample_point(URL_SAMPLE_POINT, "nominal", defaults_.target_nom_sp);
+    apply_bitrate(URL_DATA_BAUDRATE, "data", defaults_.target_data_kbps);
+    apply_sample_point(URL_DATA_SAMPLE_POINT, "data", defaults_.target_data_sp);
 }
 
 double AppUI::GetNowMs() const {
     return emscripten_get_now() - start_time_ms_;
 }
 
-void AppUI::OnDeviceConnected(const std::string& name) {
-    is_connected_ = true;
-    is_channel_open_ = false;
-    channel_opening_ = false;
-    device_name_ = name.empty() ? "WebUSB CAN Adapter" : name;
+// ============================================================================
+// Device slots
+// ============================================================================
 
-    // Query bit-timing constants from EP0
-    WebUsbBridge::GetInstance().ControlTransferIn(GS_USB_BREQ_BT_CONST, 0, 0, sizeof(GsDeviceBtConst));
+void AppUI::InitDeviceDefaults(DeviceSlot& d) const {
+    d.target_nom_kbps = defaults_.target_nom_kbps;
+    d.target_nom_sp = defaults_.target_nom_sp;
+    d.target_data_kbps = defaults_.target_data_kbps;
+    d.target_data_sp = defaults_.target_data_sp;
+    d.enable_fd = defaults_.enable_fd;
+    d.enable_loopback = defaults_.enable_loopback;
+    d.enable_listen_only = defaults_.enable_listen_only;
+
+    // Placeholder limits until the adapter answers GS_USB_BREQ_BT_CONST
+    std::memset(&d.bt_const, 0, sizeof(d.bt_const));
+    d.bt_const.fclk_can  = 80000000U; // Default 80 MHz clock
+    d.bt_const.tseg1_min = 1;
+    d.bt_const.tseg1_max = 256;
+    d.bt_const.tseg2_min = 1;
+    d.bt_const.tseg2_max = 128;
+    d.bt_const.sjw_max   = 128;
+    d.bt_const.brp_min   = 1;
+    d.bt_const.brp_max   = 512;
+    d.has_bt_const = false;
+    d.has_config = false;
+    std::memset(&d.config, 0, sizeof(d.config));
+
+    RecalculateTimings(d);
 }
 
-void AppUI::OnDeviceDisconnected() {
-    is_connected_ = false;
-    is_channel_open_ = false;
-    channel_opening_ = false;
-    device_name_ = "Disconnected";
+void AppUI::RecalculateTimings(DeviceSlot& d) {
+    CanProtocolHandler::AutoCalculateBittiming(d.bt_const.fclk_can, d.target_nom_kbps * 1000U, d.target_nom_sp, d.nom_bt);
+    CanProtocolHandler::AutoCalculateBittiming(d.bt_const.fclk_can, d.target_data_kbps * 1000U, d.target_data_sp, d.data_bt);
 }
 
-void AppUI::OnControlDataReceived(uint8_t request, const uint8_t* data, int length) {
-    if (request == GS_USB_BREQ_BT_CONST && length >= static_cast<int>(sizeof(GsDeviceBtConst))) {
-        std::memcpy(&bt_const_, data, sizeof(GsDeviceBtConst));
-        if (bt_const_.fclk_can > 0) {
-            CanProtocolHandler::AutoCalculateBittiming(bt_const_.fclk_can, target_nom_kbps_ * 1000U, target_nom_sp_, nom_bt_);
-            CanProtocolHandler::AutoCalculateBittiming(bt_const_.fclk_can, target_data_kbps_ * 1000U, target_data_sp_, data_bt_);
+bool AppUI::IsBusOn(int dev) const {
+    return ValidDevice(dev) && devices_[dev].used && devices_[dev].connected && devices_[dev].channel_open;
+}
+
+int AppUI::ConnectedDeviceCount() const {
+    int n = 0;
+    for (const DeviceSlot& d : devices_) {
+        if (d.used && d.connected) ++n;
+    }
+    return n;
+}
+
+int AppUI::BusOnDeviceCount() const {
+    int n = 0;
+    for (int dev = 0; dev < kMaxDevices; ++dev) {
+        if (IsBusOn(dev)) ++n;
+    }
+    return n;
+}
+
+std::string AppUI::DeviceLabel(int dev) const {
+    if (!ValidDevice(dev)) return "?";
+    const DeviceSlot& d = devices_[dev];
+    std::string name = d.info.product;
+    if (name.empty()) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%04X:%04X", d.info.vid, d.info.pid);
+        name = buf;
+    }
+    std::string label = std::to_string(dev + 1) + ": " + name;
+    if (!d.info.serial.empty()) label += " (S/N " + d.info.serial + ")";
+    return label;
+}
+
+void AppUI::DeviceCombo(const char* label, int& value, const char* all_label, float width) {
+    if (value >= 0 && (!ValidDevice(value) || !devices_[value].used)) value = kTargetAllDevices;   // slot removed meanwhile
+
+    const std::string preview = (value < 0) ? std::string(all_label) : DeviceLabel(value);
+    ImGui::SetNextItemWidth(width);
+    if (ImGui::BeginCombo(label, preview.c_str())) {
+        if (ImGui::Selectable(all_label, value < 0)) value = kTargetAllDevices;
+        for (int dev = 0; dev < kMaxDevices; ++dev) {
+            if (!devices_[dev].used) continue;
+            ImVec4 color;
+            const char* state = DeviceStateText(devices_[dev], color);
+            const std::string text = DeviceLabel(dev) + "  [" + state + "]";
+            ImGui::PushID(dev);
+            if (ImGui::Selectable(text.c_str(), value == dev)) value = dev;
+            ImGui::PopID();
         }
+        ImGui::EndCombo();
     }
 }
 
-// Control OUT results arrive in submission order. The channel counts as open only after the
+void AppUI::OnDeviceAdded(int dev, const UsbDeviceInfo& info) {
+    if (!ValidDevice(dev)) return;
+    DeviceSlot& d = devices_[dev];
+    if (!d.used) InitDeviceDefaults(d);
+
+    d.used = true;
+    d.info = info;
+    d.connecting = true;
+    d.connected = false;
+    d.channel_opening = false;
+    d.channel_open = false;
+    d.endpoints.clear();
+    d.status.clear();
+
+    if (selected_dev_ < 0 || !devices_[selected_dev_].used) selected_dev_ = dev;
+}
+
+void AppUI::OnDeviceOpened(int dev, const std::string& endpoints) {
+    if (!ValidDevice(dev) || !devices_[dev].used) return;
+    DeviceSlot& d = devices_[dev];
+    d.connecting = false;
+    d.connected = true;
+    d.endpoints = endpoints;
+
+    // Query bit-timing constants and the adapter description from EP0
+    auto& usb = WebUsbBridge::GetInstance();
+    usb.ControlTransferIn(dev, GS_USB_BREQ_BT_CONST, 0, 0, sizeof(GsDeviceBtConst));
+    usb.ControlTransferIn(dev, GS_USB_BREQ_DEVICE_CONFIG, 0, 0, sizeof(GsDeviceConfig));
+}
+
+void AppUI::OnDeviceClosed(int dev, const std::string& reason) {
+    if (!ValidDevice(dev) || !devices_[dev].used) return;
+    DeviceSlot& d = devices_[dev];
+    d.connecting = false;
+    d.connected = false;
+    d.channel_opening = false;
+    d.channel_open = false;
+    d.status = (reason == "closed by host") ? std::string() : reason;
+}
+
+void AppUI::OnNotice(const std::string& text) {
+    notice_ = text;
+    notice_time_ms_ = GetNowMs();
+}
+
+void AppUI::OnControlDataReceived(int dev, uint8_t request, const uint8_t* data, int length) {
+    if (!ValidDevice(dev) || !devices_[dev].used) return;
+    DeviceSlot& d = devices_[dev];
+
+    if (request == GS_USB_BREQ_BT_CONST && length >= static_cast<int>(sizeof(GsDeviceBtConst))) {
+        std::memcpy(&d.bt_const, data, sizeof(GsDeviceBtConst));
+        d.has_bt_const = true;
+        if (d.bt_const.fclk_can > 0) RecalculateTimings(d);
+    } else if (request == GS_USB_BREQ_DEVICE_CONFIG && length >= static_cast<int>(sizeof(GsDeviceConfig))) {
+        std::memcpy(&d.config, data, sizeof(GsDeviceConfig));
+        d.has_config = true;
+    }
+}
+
+// Control OUT results arrive in submission order per adapter. The channel counts as open only after the
 // MODE_START request was acknowledged; any failure of the start sequence rolls it back.
-void AppUI::OnControlOutDone(uint8_t request, bool ok) {
-    if (!channel_opening_) return;
+void AppUI::OnControlOutDone(int dev, uint8_t request, bool ok) {
+    if (!ValidDevice(dev) || !devices_[dev].used) return;
+    DeviceSlot& d = devices_[dev];
+    if (!d.channel_opening) return;
     if (!ok) {
         // Firmware may legitimately reject HOST_FORMAT (it is optional); everything else is fatal
-        if (request != GS_USB_BREQ_HOST_FORMAT) StopCanChannel();
+        if (request != GS_USB_BREQ_HOST_FORMAT) StopCanChannel(dev);
         return;
     }
     if (request == GS_USB_BREQ_MODE) {
-        channel_opening_ = false;
-        is_channel_open_ = true;
+        d.channel_opening = false;
+        d.channel_open = true;
     }
 }
 
@@ -288,43 +438,73 @@ void AppUI::OnSnapshot(const SnapshotView& snapshot) {
     }
 }
 
-void AppUI::StartCanChannel() {
-    if (channel_opening_ || is_channel_open_) return;
+void AppUI::StartCanChannel(int dev) {
+    if (!ValidDevice(dev)) return;
+    DeviceSlot& d = devices_[dev];
+    if (!d.used || !d.connected || d.channel_opening || d.channel_open) return;
     auto& usb = WebUsbBridge::GetInstance();
 
     uint32_t host_format = 0x0000BEEFU;
-    usb.ControlTransferOut(GS_USB_BREQ_HOST_FORMAT, 1, 0, reinterpret_cast<const uint8_t*>(&host_format), sizeof(host_format));
-    usb.ControlTransferOut(GS_USB_BREQ_BITTIMING, 0, 0, reinterpret_cast<const uint8_t*>(&nom_bt_), sizeof(nom_bt_));
+    usb.ControlTransferOut(dev, GS_USB_BREQ_HOST_FORMAT, 1, 0, reinterpret_cast<const uint8_t*>(&host_format), sizeof(host_format));
+    usb.ControlTransferOut(dev, GS_USB_BREQ_BITTIMING, 0, 0, reinterpret_cast<const uint8_t*>(&d.nom_bt), sizeof(d.nom_bt));
 
-    if (enable_fd_mode_) {
-        usb.ControlTransferOut(GS_USB_BREQ_DATA_BITTIMING, 0, 0, reinterpret_cast<const uint8_t*>(&data_bt_), sizeof(data_bt_));
+    if (d.enable_fd) {
+        usb.ControlTransferOut(dev, GS_USB_BREQ_DATA_BITTIMING, 0, 0, reinterpret_cast<const uint8_t*>(&d.data_bt), sizeof(d.data_bt));
     }
 
     GsDeviceMode mode_cmd = {};
     mode_cmd.mode = GS_CAN_MODE_START;
     mode_cmd.flags = 0;
-    if (enable_fd_mode_)     mode_cmd.flags |= GS_CAN_FEATURE_FD;
-    if (enable_loopback_)    mode_cmd.flags |= GS_CAN_FEATURE_LOOP_BACK;
-    if (enable_listen_only_) mode_cmd.flags |= GS_CAN_FEATURE_LISTEN_ONLY;
+    if (d.enable_fd)          mode_cmd.flags |= GS_CAN_FEATURE_FD;
+    if (d.enable_loopback)    mode_cmd.flags |= GS_CAN_FEATURE_LOOP_BACK;
+    if (d.enable_listen_only) mode_cmd.flags |= GS_CAN_FEATURE_LISTEN_ONLY;
     // Ask the adapter to append its microsecond timestamp to every frame: cycle times are then
     // computed from the adapter clock instead of the (jittery) USB/browser arrival time
-    if (bt_const_.feature & GS_CAN_FEATURE_HW_TIMESTAMP) mode_cmd.flags |= GS_CAN_FEATURE_HW_TIMESTAMP;
+    if (d.bt_const.feature & GS_CAN_FEATURE_HW_TIMESTAMP) mode_cmd.flags |= GS_CAN_FEATURE_HW_TIMESTAMP;
 
-    usb.ControlTransferOut(GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd));
+    usb.ControlTransferOut(dev, GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd));
 
-    usb.StartRxPump(0x81, 512);
-    channel_opening_ = true;   // is_channel_open_ is set when MODE_START is acknowledged
+    usb.StartRxPump(dev, 0, 0);   // endpoint and transfer size as detected by the worker
+    d.channel_opening = true;     // channel_open is set when MODE_START is acknowledged
 }
 
-void AppUI::StopCanChannel() {
+void AppUI::StopCanChannel(int dev) {
+    if (!ValidDevice(dev)) return;
+    DeviceSlot& d = devices_[dev];
     auto& usb = WebUsbBridge::GetInstance();
-    usb.StopRxPump();
+    usb.StopRxPump(dev);
 
     GsDeviceMode mode_cmd = {GS_CAN_MODE_RESET, 0};
-    usb.ControlTransferOut(GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd));
-    channel_opening_ = false;
-    is_channel_open_ = false;
+    usb.ControlTransferOut(dev, GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd));
+    d.channel_opening = false;
+    d.channel_open = false;
 }
+
+// Closes the adapter, forgets its slot and everything that referred to it
+void AppUI::RemoveDevice(int dev) {
+    if (!ValidDevice(dev) || !devices_[dev].used) return;
+    if (devices_[dev].channel_open || devices_[dev].channel_opening) StopCanChannel(dev);
+    WebUsbBridge::GetInstance().RemoveDevice(dev);
+    devices_[dev] = DeviceSlot();
+
+    for (PeriodicTxJob& job : periodic_jobs_) {
+        if (job.target == dev) job.enabled = false;   // its adapter is gone: do not silently retarget
+    }
+    if (tx_target_ == dev) tx_target_ = kTargetAllDevices;
+    if (trace_filter_dev_ == dev) trace_filter_dev_ = -1;
+    if (table_filter_dev_ == dev) table_filter_dev_ = -1;
+
+    if (selected_dev_ == dev) {
+        selected_dev_ = -1;
+        for (int i = 0; i < kMaxDevices; ++i) {
+            if (devices_[i].used) { selected_dev_ = i; break; }
+        }
+    }
+}
+
+// ============================================================================
+// Transmit
+// ============================================================================
 
 CanMessage AppUI::BuildComposerMessage() const {
     CanMessage msg;
@@ -348,7 +528,7 @@ CanMessage AppUI::BuildComposerMessage() const {
     return msg;
 }
 
-void AppUI::LoadMessageIntoComposer(const CanMessage& msg, int cycle_ms, const std::string& comment) {
+void AppUI::LoadMessageIntoComposer(const CanMessage& msg, int target, int cycle_ms, const std::string& comment) {
     tx_id_ = static_cast<int>(msg.id);
     tx_is_ext_ = msg.is_extended;
     tx_is_fd_ = msg.is_fd;
@@ -356,6 +536,7 @@ void AppUI::LoadMessageIntoComposer(const CanMessage& msg, int cycle_ms, const s
     tx_is_rtr_ = msg.is_rtr;
     tx_dlc_ = msg.dlc;
     tx_cycle_ms_ = cycle_ms;
+    tx_target_ = (ValidDevice(target) && devices_[target].used) ? target : kTargetAllDevices;
 
     std::string hex = FormatHexPayload(msg.payload);
     std::strncpy(tx_payload_, hex.c_str(), sizeof(tx_payload_) - 1);
@@ -367,20 +548,38 @@ void AppUI::LoadMessageIntoComposer(const CanMessage& msg, int cycle_ms, const s
     show_tx_window_ = true;
 }
 
-void AppUI::TransmitSingleMessage(const CanMessage& msg, bool record_in_history, int associated_cycle_ms, const std::string& comment) {
-    if (is_connected_ && is_channel_open_) {
-        CanProtocolHandler protocol;
-        std::vector<uint8_t> usb_bytes = protocol.BuildTxBuffer(msg);
-        WebUsbBridge::GetInstance().TransferOut(0x02, usb_bytes.data(), static_cast<int>(usb_bytes.size()));
+bool AppUI::TargetHasOpenChannel(int target) const {
+    return (target == kTargetAllDevices) ? BusOnDeviceCount() > 0 : IsBusOn(target);
+}
+
+// Sends one frame to one adapter, or to every adapter that is BUS ON. Returns the number of adapters.
+int AppUI::SendFrame(const CanMessage& msg, int target) {
+    std::vector<uint8_t> usb_bytes;
+    int sent = 0;
+    for (int dev = 0; dev < kMaxDevices; ++dev) {
+        if (target != kTargetAllDevices && target != dev) continue;
+        if (!IsBusOn(dev)) continue;
+        if (usb_bytes.empty()) {
+            CanProtocolHandler protocol;
+            usb_bytes = protocol.BuildTxBuffer(msg);
+        }
+        WebUsbBridge::GetInstance().TransferOut(dev, 0, usb_bytes.data(), static_cast<int>(usb_bytes.size()));
+        ++sent;
     }
+    return sent;
+}
+
+void AppUI::TransmitSingleMessage(const CanMessage& msg, int target, bool record_in_history, int associated_cycle_ms, const std::string& comment) {
+    SendFrame(msg, target);
 
     if (!record_in_history) return;
 
     double now_sec = GetNowMs() / 1000.0;
 
-    // Update existing entry if identical message is already in history
+    // Update existing entry if identical message to the same target is already in history
     for (auto& item : tx_history_) {
-        if (item.msg.id == msg.id &&
+        if (item.target == target &&
+            item.msg.id == msg.id &&
             item.msg.is_extended == msg.is_extended &&
             item.msg.is_fd == msg.is_fd &&
             item.msg.is_brs == msg.is_brs &&
@@ -397,6 +596,7 @@ void AppUI::TransmitSingleMessage(const CanMessage& msg, bool record_in_history,
 
     TxHistoryEntry new_entry;
     new_entry.msg = msg;
+    new_entry.target = target;
     new_entry.cycle_time_ms = associated_cycle_ms;
     new_entry.sent_count = 1;
     new_entry.last_sent_sec = now_sec;
@@ -405,13 +605,12 @@ void AppUI::TransmitSingleMessage(const CanMessage& msg, bool record_in_history,
 }
 
 void AppUI::ProcessPeriodicJobs(double now_ms) {
-    if (!is_connected_ || !is_channel_open_) return;
-
     for (auto& job : periodic_jobs_) {
         if (!job.enabled || job.cycle_ms <= 0) continue;
+        if (!TargetHasOpenChannel(job.target)) continue;
 
         if (now_ms >= job.next_send_ms) {
-            TransmitSingleMessage(job.msg, false);
+            TransmitSingleMessage(job.msg, job.target, false);
             job.tx_count++;
 
             if (job.auto_inc_byte_index >= 0 &&
@@ -437,7 +636,7 @@ float AppUI::RenderMenuBar() {
         if (ImGui::BeginMenu("View Windows")) {
             ImGui::MenuItem("Auto-Tile & Resize Windows with Browser", nullptr, &auto_tile_layout_);
             ImGui::Separator();
-            ImGui::MenuItem("1. Hardware & Bit-Timing Setup", nullptr, &show_hw_window_);
+            ImGui::MenuItem("1. Devices & Bit-Timing Setup", nullptr, &show_hw_window_);
             ImGui::MenuItem("2. Receive Table by ID (Grouped Monitor)", nullptr, &show_id_table_window_);
             ImGui::MenuItem("3. Receive Trace (Chronological Stream)", nullptr, &show_trace_window_);
             ImGui::MenuItem("4. Transmit Frame & Periodic Jobs", nullptr, &show_tx_window_);
@@ -449,16 +648,16 @@ float AppUI::RenderMenuBar() {
         ImGui::Checkbox("Auto-Tile Resize", &auto_tile_layout_);
         ImGui::Separator();
 
-        if (is_connected_) {
-            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "USB: %s (%s)",
-                               device_name_.c_str(), is_channel_open_ ? "BUS ON" : "BUS OFF");
+        const int connected = ConnectedDeviceCount();
+        if (connected > 0) {
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "USB: %d device%s connected, %d BUS ON",
+                               connected, connected == 1 ? "" : "s", BusOnDeviceCount());
             const UsbStats& us = WebUsbBridge::GetInstance().GetStats();
             ImGui::Separator();
-            ImGui::TextDisabled("USB %u/s  frames %u  trace drop %u  gaps %u  TX drop %u  recov %u",
-                                us.rx_per_sec, us.frames_total, us.trace_dropped, us.snapshot_gaps,
-                                us.tx_dropped, us.recoveries);
+            ImGui::TextDisabled("frames %u  trace drop %u  gaps %u",
+                                us.frames_total, us.trace_dropped, us.snapshot_gaps);
         } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "USB: Disconnected");
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "USB: no device connected");
         }
 
         ImGui::EndMainMenuBar();
@@ -514,68 +713,246 @@ static void RenderBittimingEditor(
 }
 
 // ============================================================================
-// Window 1: Hardware Connection & Bit-Timing Setup
+// Window 1: Devices (connection, adapter information) & Bit-Timing Setup
 // ============================================================================
 void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
     ImGuiCond cond = auto_tile_layout_ ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
     ImGui::SetNextWindowPos(ImVec2(x, y), cond);
     ImGui::SetNextWindowSize(ImVec2(w, h), cond);
 
-    if (!ImGui::Begin("1. Hardware & Bit-Timing Setup", &show_hw_window_)) {
+    if (!ImGui::Begin("1. Devices & Bit-Timing Setup", &show_hw_window_)) {
         ImGui::End();
         return;
     }
 
-    if (!is_connected_) {
-        if (ImGui::Button("Request WebUSB CAN Device", ImVec2(210, 26))) {
-            WebUsbBridge::GetInstance().RequestDevice();
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("Select your CANable / Candlelight adapter");
-    } else {
-        if (ImGui::Button("Disconnect USB", ImVec2(130, 26))) {
-            if (is_channel_open_) StopCanChannel();
-            WebUsbBridge::GetInstance().Disconnect();
-        }
-        ImGui::SameLine();
-        if (!is_channel_open_) {
-            if (ImGui::Button("Start CAN Channel", ImVec2(150, 26))) {
-                StartCanChannel();
-            }
-        } else {
-            if (ImGui::Button("Stop CAN Channel", ImVec2(150, 26))) {
-                StopCanChannel();
-            }
-        }
-        ImGui::SameLine();
-        ImGui::Text("Clock: %.1f MHz", bt_const_.fclk_can / 1e6);
+    auto& usb = WebUsbBridge::GetInstance();
+
+    // --- connection controls ---
+    if (ImGui::Button("Add Device", ImVec2(110, 26))) {
+        usb.RequestDevice();
     }
-
-    ImGui::Separator();
-    ImGui::BeginDisabled(is_channel_open_);
-
-    int clk_mhz = static_cast<int>(bt_const_.fclk_can / 1000000U);
-    ImGui::PushItemWidth(80);
-    if (ImGui::InputInt("CAN Clock (MHz)", &clk_mhz, 1, 10)) {
-        bt_const_.fclk_can = static_cast<uint32_t>(std::clamp(clk_mhz, 1, 400)) * 1000000U;
+    ImGui::SameLine();
+    ImGui::BeginDisabled(ConnectedDeviceCount() == 0);
+    if (ImGui::Button("Start All", ImVec2(85, 26))) {
+        for (int dev = 0; dev < kMaxDevices; ++dev) StartCanChannel(dev);
     }
-    ImGui::PopItemWidth();
     ImGui::SameLine();
-    ImGui::Checkbox("CAN FD", &enable_fd_mode_);
-    ImGui::SameLine();
-    ImGui::Checkbox("Loopback", &enable_loopback_);
-    ImGui::SameLine();
-    ImGui::Checkbox("Listen-Only", &enable_listen_only_);
-
-    ImGui::SeparatorText("Nominal Arbitration Timing");
-    RenderBittimingEditor("Nom", bt_const_.fclk_can, nom_bt_, target_nom_kbps_, target_nom_sp_);
-
-    if (enable_fd_mode_) {
-        ImGui::SeparatorText("CAN FD Data Phase Timing");
-        RenderBittimingEditor("Data", bt_const_.fclk_can, data_bt_, target_data_kbps_, target_data_sp_);
+    if (ImGui::Button("Stop All", ImVec2(85, 26))) {
+        for (int dev = 0; dev < kMaxDevices; ++dev) {
+            if (devices_[dev].channel_open || devices_[dev].channel_opening) StopCanChannel(dev);
+        }
     }
-
     ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (!notice_.empty() && GetNowMs() - notice_time_ms_ < 15000.0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s", notice_.c_str());
+    } else {
+        ImGui::TextDisabled("up to %d adapters", kMaxDevices);
+    }
+
+    // --- device list ---
+    int used_count = 0;
+    for (const DeviceSlot& d : devices_) {
+        if (d.used) ++used_count;
+    }
+
+    if (used_count == 0) {
+        ImGui::Separator();
+        ImGui::TextDisabled("No devices yet. Press \"Add Device\" and pick an adapter in the browser dialog.");
+    } else {
+        const float row_h = ImGui::GetFrameHeightWithSpacing();
+        const float list_h = row_h * static_cast<float>(std::min(used_count, 4) + 1) + 6.0f;
+        const ImGuiTableFlags list_flags =
+            ImGuiTableFlags_Borders |
+            ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable |
+            ImGuiTableFlags_SizingStretchProp;
+
+        // VID:PID, USB rate and counters are in the information pane below; the list keeps what fits
+        // next to each other in a narrow window: number, adapter, serial, state, actions
+        if (ImGui::BeginTable("DeviceList", 5, list_flags, ImVec2(0.0f, list_h))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("#",       ImGuiTableColumnFlags_WidthFixed,   26.0f);
+            ImGui::TableSetupColumn("Adapter", ImGuiTableColumnFlags_WidthStretch, 1.3f);
+            ImGui::TableSetupColumn("Serial",  ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("State",   ImGuiTableColumnFlags_WidthFixed,   128.0f);
+            ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed,   190.0f);
+            ImGui::TableHeadersRow();
+
+            int remove_dev = -1;
+            for (int dev = 0; dev < kMaxDevices; ++dev) {
+                DeviceSlot& d = devices_[dev];
+                if (!d.used) continue;
+
+                ImGui::PushID(dev);
+                ImGui::TableNextRow();
+
+                ImGui::TableSetColumnIndex(0);
+                char num[16];
+                std::snprintf(num, sizeof(num), "%d", dev + 1);
+                ImGui::PushStyleColor(ImGuiCol_Text, DeviceColor(dev));
+                if (ImGui::Selectable(num, selected_dev_ == dev,
+                                      ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                    selected_dev_ = dev;
+                }
+                ImGui::PopStyleColor();
+
+                ImGui::TableSetColumnIndex(1);
+                if (d.info.product.empty()) {
+                    ImGui::TextDisabled("(unnamed adapter)");
+                } else {
+                    ImGui::TextUnformatted(d.info.product.c_str());
+                }
+
+                ImGui::TableSetColumnIndex(2);
+                if (d.info.serial.empty()) ImGui::TextDisabled("-");
+                else ImGui::TextUnformatted(d.info.serial.c_str());
+
+                ImGui::TableSetColumnIndex(3);
+                ImVec4 state_color;
+                const char* state_text = DeviceStateText(d, state_color);
+                ImGui::TextColored(state_color, "%s", state_text);
+                if (ImGui::IsItemHovered()) {
+                    const UsbDeviceStats& ds = usb.GetDeviceStats(dev);
+                    ImGui::SetTooltip("%04X:%04X  %s\nUSB %u transfers/s, %u frames%s%s",
+                                      d.info.vid, d.info.pid, d.info.manufacturer.c_str(),
+                                      d.connected ? ds.rx_per_sec : 0u, d.connected ? ds.frames : 0u,
+                                      d.status.empty() ? "" : "\nLast event: ", d.status.c_str());
+                }
+
+                ImGui::TableSetColumnIndex(4);
+                if (d.connecting) {
+                    ImGui::BeginDisabled();
+                    ImGui::SmallButton("Connecting");
+                    ImGui::EndDisabled();
+                } else if (!d.connected) {
+                    if (ImGui::SmallButton("Connect")) usb.ConnectDevice(dev);
+                } else {
+                    if (ImGui::SmallButton("Disconnect")) {
+                        if (d.channel_open || d.channel_opening) StopCanChannel(dev);
+                        usb.DisconnectDevice(dev);
+                    }
+                    ImGui::SameLine();
+                    if (d.channel_open) {
+                        if (ImGui::SmallButton("Stop")) StopCanChannel(dev);
+                        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Stop the CAN channel (BUS OFF)");
+                    } else {
+                        ImGui::BeginDisabled(d.channel_opening);
+                        if (ImGui::SmallButton("Start")) StartCanChannel(dev);
+                        ImGui::EndDisabled();
+                        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Start the CAN channel (BUS ON)");
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Remove")) remove_dev = dev;
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Disconnect and forget this adapter");
+
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+
+            if (remove_dev >= 0) RemoveDevice(remove_dev);
+        }
+    }
+
+    // --- details and settings of the selected adapter ---
+    if (selected_dev_ < 0 || !ValidDevice(selected_dev_) || !devices_[selected_dev_].used) {
+        ImGui::End();
+        return;
+    }
+
+    const int dev = selected_dev_;
+    DeviceSlot& d = devices_[dev];
+    const UsbDeviceStats& ds = usb.GetDeviceStats(dev);
+
+    // Collapsible so that the settings below stay reachable in a short window; "###" keeps the open/closed
+    // state when another adapter is selected
+    char title[64];
+    std::snprintf(title, sizeof(title), "Device %d information###devinfo", dev + 1);
+
+    if (ImGui::CollapsingHeader(title, ImGuiTreeNodeFlags_DefaultOpen) &&
+        ImGui::BeginTable("DeviceInfo", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("k1", ImGuiTableColumnFlags_WidthFixed,   85.0f);
+        ImGui::TableSetupColumn("v1", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("k2", ImGuiTableColumnFlags_WidthFixed,   85.0f);
+        ImGui::TableSetupColumn("v2", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+
+        auto cell = [](const char* text) {
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(text);
+        };
+        auto label_cell = [](const char* text) {
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", text);
+        };
+        auto row = [&](const char* k1, const std::string& v1, const char* k2, const std::string& v2) {
+            ImGui::TableNextRow();
+            label_cell(k1);
+            cell(v1.empty() ? "-" : v1.c_str());
+            label_cell(k2);
+            cell(v2.empty() ? "-" : v2.c_str());
+        };
+        auto fmt = [](const char* f, auto... args) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), f, args...);
+            return std::string(buf);
+        };
+
+        ImVec4 state_color;
+        const std::string state_text = DeviceStateText(d, state_color);
+        ImGui::TableNextRow();
+        label_cell("State");
+        ImGui::TableNextColumn();
+        ImGui::TextColored(state_color, "%s", state_text.c_str());
+        label_cell("Last event");
+        cell(d.status.empty() ? "-" : d.status.c_str());
+
+        row("Adapter",  d.info.product,      "Manufacturer", d.info.manufacturer);
+        row("Serial",   d.info.serial,       "VID:PID",      fmt("%04X:%04X", d.info.vid, d.info.pid));
+        row("USB",      d.info.usb_version,  "Device rev.",  d.info.device_version);
+        row("Firmware", d.has_config ? fmt("v%u", d.config.sw_version) : std::string(),
+            "Hardware", d.has_config ? fmt("v%u", d.config.hw_version) : std::string());
+        row("CAN clock", d.has_bt_const ? fmt("%.1f MHz", d.bt_const.fclk_can / 1e6) : std::string("(not read yet)"),
+            "CAN channels", d.has_config ? fmt("%u", static_cast<unsigned>(d.config.icount) + 1u) : std::string());
+        row("Endpoints", d.endpoints, "Features", d.has_bt_const ? FeatureList(d.bt_const.feature) : std::string());
+        row("USB/s",    d.connected ? fmt("%u transfers/s", ds.rx_per_sec) : std::string(),
+            "Frames",   d.connected ? fmt("%u", ds.frames) : std::string());
+        row("Errors",   d.connected ? fmt("RX %u, TX %u", ds.rx_errors, ds.tx_errors) : std::string(),
+            "TX drop / recov.", d.connected ? fmt("%u / %u", ds.tx_dropped, ds.recoveries) : std::string());
+
+        ImGui::EndTable();
+    }
+
+    // --- bit timing and mode of the selected adapter ---
+    std::snprintf(title, sizeof(title), "Device %d bit timing and mode###devcfg", dev + 1);
+    if (ImGui::CollapsingHeader(title, ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::BeginDisabled(d.channel_open || d.channel_opening);
+
+        int clk_mhz = static_cast<int>(d.bt_const.fclk_can / 1000000U);
+        ImGui::PushItemWidth(80);
+        if (ImGui::InputInt("CAN Clock (MHz)", &clk_mhz, 1, 10)) {
+            d.bt_const.fclk_can = static_cast<uint32_t>(std::clamp(clk_mhz, 1, 400)) * 1000000U;
+        }
+        ImGui::PopItemWidth();
+        ImGui::SameLine();
+        ImGui::Checkbox("CAN FD", &d.enable_fd);
+        ImGui::SameLine();
+        ImGui::Checkbox("Loopback", &d.enable_loopback);
+        ImGui::SameLine();
+        ImGui::Checkbox("Listen-Only", &d.enable_listen_only);
+
+        ImGui::SeparatorText("Nominal Arbitration Timing");
+        RenderBittimingEditor("Nom", d.bt_const.fclk_can, d.nom_bt, d.target_nom_kbps, d.target_nom_sp);
+
+        if (d.enable_fd) {
+            ImGui::SeparatorText("CAN FD Data Phase Timing");
+            RenderBittimingEditor("Data", d.bt_const.fclk_can, d.data_bt, d.target_data_kbps, d.target_data_sp);
+        }
+
+        ImGui::EndDisabled();
+    }
+
     ImGui::End();
 }
 
@@ -592,7 +969,12 @@ void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float 
         return;
     }
 
-    ImGui::Text("Unique CAN IDs: %zu (Click column headers to sort)", id_table_.size());
+    ImGui::Text("Unique CAN IDs: %zu", id_table_.size());
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click column headers to sort");
+    ImGui::SameLine();
+    ImGui::TextDisabled("Device:");
+    ImGui::SameLine();
+    DeviceCombo("##tablefilter", table_filter_dev_, "All devices", 190.0f);
     ImGui::SameLine(ImGui::GetWindowWidth() - 110);
     if (ImGui::SmallButton("Reset Table")) {
         id_table_.clear();
@@ -607,8 +989,9 @@ void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float 
         ImGuiTableFlags_Sortable |
         ImGuiTableFlags_SizingStretchProp;
 
-    if (ImGui::BeginTable("IdMonitorTable", 6, flags)) {
+    if (ImGui::BeginTable("IdMonitorTable", 7, flags)) {
         ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Dev",             ImGuiTableColumnFlags_WidthFixed,                                     40.0f,  ID_COL_DEV);
         ImGui::TableSetupColumn("CAN ID",          ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthFixed, 90.0f,  ID_COL_CAN_ID);
         ImGui::TableSetupColumn("Type",            ImGuiTableColumnFlags_WidthFixed,                                     95.0f,  ID_COL_TYPE);
         ImGui::TableSetupColumn("Length",          ImGuiTableColumnFlags_WidthFixed,                                     65.0f,  ID_COL_LENGTH);
@@ -621,6 +1004,7 @@ void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float 
         std::vector<const IdTableEntry*> sorted_rows;
         sorted_rows.reserve(id_table_.size());
         for (const auto& kv : id_table_) {
+            if (table_filter_dev_ >= 0 && kv.second.last_msg.dev != table_filter_dev_) continue;
             sorted_rows.push_back(&kv.second);
         }
 
@@ -632,6 +1016,9 @@ void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float 
                 std::sort(sorted_rows.begin(), sorted_rows.end(), [&](const IdTableEntry* a, const IdTableEntry* b) {
                     int cmp = 0;
                     switch (spec.ColumnUserID) {
+                        case ID_COL_DEV:
+                            cmp = ThreeWayCompare(a->last_msg.dev, b->last_msg.dev);
+                            break;
                         case ID_COL_CAN_ID:
                             cmp = ThreeWayCompare(a->last_msg.id, b->last_msg.id);
                             break;
@@ -653,9 +1040,12 @@ void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float 
                         default:
                             break;
                     }
-                    // Fallback tie-breaker by CAN ID
+                    // Fallback tie-breakers: CAN ID, then device
                     if (cmp == 0) {
                         cmp = ThreeWayCompare(a->last_msg.id, b->last_msg.id);
+                    }
+                    if (cmp == 0) {
+                        cmp = ThreeWayCompare(a->last_msg.dev, b->last_msg.dev);
                     }
                     return ascending ? (cmp < 0) : (cmp > 0);
                 });
@@ -670,30 +1060,36 @@ void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float 
             ImGui::TableNextRow();
 
             ImGui::TableSetColumnIndex(0);
-            ImGui::Text(m.is_extended ? "0x%08X" : "0x%03X", m.id);
+            ImGui::TextColored(DeviceColor(m.dev), "%d", m.dev + 1);
+            if (ImGui::IsItemHovered() && ValidDevice(m.dev) && devices_[m.dev].used) {
+                ImGui::SetTooltip("%s", DeviceLabel(m.dev).c_str());
+            }
 
             ImGui::TableSetColumnIndex(1);
+            ImGui::Text(m.is_extended ? "0x%08X" : "0x%03X", m.id);
+
+            ImGui::TableSetColumnIndex(2);
             ImGui::Text("%s %s%s%s",
                         m.is_extended ? "EXT" : "STD",
                         m.is_fd ? "FD" : "2.0",
                         m.is_brs ? " BRS" : "",
                         m.is_rtr ? " RTR" : "");
 
-            ImGui::TableSetColumnIndex(2);
+            ImGui::TableSetColumnIndex(3);
             uint8_t byte_len = m.is_fd ? CanProtocolHandler::DlcToBytes(m.dlc) : std::min<uint8_t>(m.dlc, 8);
             ImGui::Text("%u (%uB)", m.dlc, byte_len);
 
-            ImGui::TableSetColumnIndex(3);
+            ImGui::TableSetColumnIndex(4);
             ImGui::Text("%llu", static_cast<unsigned long long>(entry.count));
 
-            ImGui::TableSetColumnIndex(4);
+            ImGui::TableSetColumnIndex(5);
             if (entry.count > 1) {
                 ImGui::Text("%.1f ms", entry.cycle_time_ms);
             } else {
                 ImGui::TextDisabled("---");
             }
 
-            ImGui::TableSetColumnIndex(5);
+            ImGui::TableSetColumnIndex(6);
             if (m.is_rtr) {
                 ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1.0f), "REMOTE REQUEST");
             } else {
@@ -738,15 +1134,19 @@ void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
     }
     ImGui::SameLine();
     ImGui::Checkbox("Auto-Scroll", &trace_autoscroll_);
-    ImGui::SameLine();
-    ImGui::PushItemWidth(90);
-    ImGui::InputInt("Filter ID (Hex, -1=All)", &trace_filter_id_, 1, 16);
-    ImGui::PopItemWidth();
     ImGui::SameLine(ImGui::GetWindowWidth() - 105);
     if (ImGui::SmallButton("Clear Trace")) {
         rx_trace_.clear();
         WebUsbBridge::GetInstance().ClearTrace();
     }
+
+    ImGui::PushItemWidth(90);
+    ImGui::InputInt("Filter ID (Hex, -1=All)", &trace_filter_id_, 1, 16);
+    ImGui::PopItemWidth();
+    ImGui::SameLine();
+    ImGui::TextDisabled("Device:");
+    ImGui::SameLine();
+    DeviceCombo("##tracefilter", trace_filter_dev_, "All devices", 190.0f);
 
     const ImGuiTableFlags flags =
         ImGuiTableFlags_Borders |
@@ -755,9 +1155,10 @@ void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
         ImGuiTableFlags_Sortable |
         ImGuiTableFlags_SizingStretchProp;
 
-    if (ImGui::BeginTable("TraceStreamTable", 6, flags)) {
+    if (ImGui::BeginTable("TraceStreamTable", 7, flags)) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Time (s)",   ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthFixed, 75.0f, TRACE_COL_TIME);
+        ImGui::TableSetupColumn("Dev",        ImGuiTableColumnFlags_WidthFixed,                                     40.0f, TRACE_COL_DEV);
         ImGui::TableSetupColumn("Dir",        ImGuiTableColumnFlags_WidthFixed,                                     55.0f, TRACE_COL_DIR);
         ImGui::TableSetupColumn("CAN ID",     ImGuiTableColumnFlags_WidthFixed,                                     85.0f, TRACE_COL_CAN_ID);
         ImGui::TableSetupColumn("Format",     ImGuiTableColumnFlags_WidthFixed,                                     85.0f, TRACE_COL_FORMAT);
@@ -770,6 +1171,9 @@ void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
         visible_trace.reserve(rx_trace_.size());
         for (const auto& item : rx_trace_) {
             if (trace_filter_id_ >= 0 && static_cast<int>(item.msg.id) != trace_filter_id_) {
+                continue;
+            }
+            if (trace_filter_dev_ >= 0 && item.msg.dev != trace_filter_dev_) {
                 continue;
             }
             visible_trace.push_back(&item);
@@ -789,6 +1193,9 @@ void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
                         switch (spec.ColumnUserID) {
                             case TRACE_COL_TIME:
                                 cmp = ThreeWayCompare(a->timestamp_sec, b->timestamp_sec);
+                                break;
+                            case TRACE_COL_DEV:
+                                cmp = ThreeWayCompare(a->msg.dev, b->msg.dev);
                                 break;
                             case TRACE_COL_DIR:
                                 cmp = ThreeWayCompare(a->msg.is_tx_echo ? 1 : 0, b->msg.is_tx_echo ? 1 : 0);
@@ -828,25 +1235,31 @@ void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
             ImGui::Text("%.3f", item.timestamp_sec);
 
             ImGui::TableSetColumnIndex(1);
+            ImGui::TextColored(DeviceColor(m.dev), "%d", m.dev + 1);
+            if (ImGui::IsItemHovered() && ValidDevice(m.dev) && devices_[m.dev].used) {
+                ImGui::SetTooltip("%s", DeviceLabel(m.dev).c_str());
+            }
+
+            ImGui::TableSetColumnIndex(2);
             if (m.is_tx_echo) {
                 ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "TX");
             } else {
                 ImGui::TextColored(ImVec4(0.4f, 0.9f, 1.0f, 1.0f), "RX");
             }
 
-            ImGui::TableSetColumnIndex(2);
+            ImGui::TableSetColumnIndex(3);
             ImGui::Text(m.is_extended ? "0x%08X" : "0x%03X", m.id);
 
-            ImGui::TableSetColumnIndex(3);
+            ImGui::TableSetColumnIndex(4);
             ImGui::Text("%s %s%s",
                         m.is_extended ? "EXT" : "STD",
                         m.is_fd ? "FD" : "2.0",
                         m.is_brs ? " BRS" : "");
 
-            ImGui::TableSetColumnIndex(4);
+            ImGui::TableSetColumnIndex(5);
             ImGui::Text("%u", m.dlc);
 
-            ImGui::TableSetColumnIndex(5);
+            ImGui::TableSetColumnIndex(6);
             if (m.is_rtr) {
                 ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1.0f), "RTR");
             } else {
@@ -876,6 +1289,14 @@ void AppUI::RenderTransmitWindow(double now_ms, float x, float y, float w, float
     if (!ImGui::Begin("4. Transmit Frame Composer & Periodic Jobs", &show_tx_window_)) {
         ImGui::End();
         return;
+    }
+
+    DeviceCombo("Send via##tx", tx_target_, "All devices with BUS ON", std::max(220.0f, w * 0.40f));
+    if (!TargetHasOpenChannel(tx_target_)) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f),
+                           tx_target_ == kTargetAllDevices ? "no device is BUS ON: frames are not sent"
+                                                           : "this device is not BUS ON: frames are not sent");
     }
 
     ImGui::PushItemWidth(90);
@@ -927,7 +1348,7 @@ void AppUI::RenderTransmitWindow(double now_ms, float x, float y, float w, float
     if (ImGui::Button("Single Send / Burst", ImVec2(165, 26))) {
         CanMessage msg = BuildComposerMessage();
         for (int i = 0; i < tx_burst_count_; ++i) {
-            TransmitSingleMessage(msg, (i == 0), tx_cycle_ms_, tx_comment_);
+            TransmitSingleMessage(msg, tx_target_, (i == 0), tx_cycle_ms_, tx_comment_);
             if (tx_auto_inc_byte_ >= 0 && tx_auto_inc_byte_ < static_cast<int>(msg.payload.size())) {
                 msg.payload[tx_auto_inc_byte_]++;
             }
@@ -938,6 +1359,7 @@ void AppUI::RenderTransmitWindow(double now_ms, float x, float y, float w, float
         PeriodicTxJob job;
         job.enabled = true;
         job.msg = BuildComposerMessage();
+        job.target = tx_target_;
         job.cycle_ms = (tx_cycle_ms_ > 0) ? tx_cycle_ms_ : 100;
         job.auto_inc_byte_index = tx_auto_inc_byte_;
         job.next_send_ms = now_ms + job.cycle_ms;
@@ -945,7 +1367,7 @@ void AppUI::RenderTransmitWindow(double now_ms, float x, float y, float w, float
         job.comment = tx_comment_;
         periodic_jobs_.push_back(job);
 
-        TransmitSingleMessage(job.msg, true, job.cycle_ms, job.comment);
+        TransmitSingleMessage(job.msg, job.target, true, job.cycle_ms, job.comment);
     }
 
     ImGui::SeparatorText("Active Periodic Transmit Jobs");
@@ -957,9 +1379,10 @@ void AppUI::RenderTransmitWindow(double now_ms, float x, float y, float w, float
         ImGuiTableFlags_Sortable |
         ImGuiTableFlags_SizingStretchProp;
 
-    if (ImGui::BeginTable("PeriodicJobsTable", 6, flags)) {
+    if (ImGui::BeginTable("PeriodicJobsTable", 7, flags)) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("On",         ImGuiTableColumnFlags_WidthFixed,                                     30.0f,  JOB_COL_ENABLED);
+        ImGui::TableSetupColumn("Dev",        ImGuiTableColumnFlags_WidthFixed,                                     40.0f,  JOB_COL_DEV);
         ImGui::TableSetupColumn("ID",         ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthFixed, 75.0f,  JOB_COL_CAN_ID);
         ImGui::TableSetupColumn("Cycle",      ImGuiTableColumnFlags_WidthFixed,                                     65.0f,  JOB_COL_CYCLE);
         ImGui::TableSetupColumn("Sent",       ImGuiTableColumnFlags_WidthFixed,                                     55.0f,  JOB_COL_SENT);
@@ -985,6 +1408,9 @@ void AppUI::RenderTransmitWindow(double now_ms, float x, float y, float w, float
                     switch (spec.ColumnUserID) {
                         case JOB_COL_ENABLED:
                             cmp = ThreeWayCompare(a.enabled ? 1 : 0, b.enabled ? 1 : 0);
+                            break;
+                        case JOB_COL_DEV:
+                            cmp = ThreeWayCompare(a.target, b.target);
                             break;
                         case JOB_COL_CAN_ID:
                             cmp = ThreeWayCompare(a.msg.id, b.msg.id);
@@ -1018,21 +1444,28 @@ void AppUI::RenderTransmitWindow(double now_ms, float x, float y, float w, float
             ImGui::Checkbox("##en", &job.enabled);
 
             ImGui::TableSetColumnIndex(1);
-            ImGui::Text(job.msg.is_extended ? "0x%08X" : "0x%03X", job.msg.id);
+            if (job.target == kTargetAllDevices) {
+                ImGui::TextDisabled("All");
+            } else {
+                ImGui::TextColored(DeviceColor(job.target), "%d", job.target + 1);
+            }
 
             ImGui::TableSetColumnIndex(2);
-            ImGui::Text("%d ms", job.cycle_ms);
+            ImGui::Text(job.msg.is_extended ? "0x%08X" : "0x%03X", job.msg.id);
 
             ImGui::TableSetColumnIndex(3);
-            ImGui::Text("%llu", static_cast<unsigned long long>(job.tx_count));
+            ImGui::Text("%d ms", job.cycle_ms);
 
             ImGui::TableSetColumnIndex(4);
+            ImGui::Text("%llu", static_cast<unsigned long long>(job.tx_count));
+
+            ImGui::TableSetColumnIndex(5);
             std::string hex = FormatHexPayload(job.msg.payload);
             ImGui::TextUnformatted(hex.c_str());
 
-            ImGui::TableSetColumnIndex(5);
+            ImGui::TableSetColumnIndex(6);
             if (ImGui::SmallButton("Shot")) {
-                TransmitSingleMessage(job.msg, false);
+                TransmitSingleMessage(job.msg, job.target, false);
                 job.tx_count++;
             }
             ImGui::SameLine();
@@ -1080,9 +1513,10 @@ void AppUI::RenderSentHistoryWindow(float x, float y, float w, float h) {
         ImGuiTableFlags_Sortable |
         ImGuiTableFlags_SizingStretchProp;
 
-    if (ImGui::BeginTable("SentHistoryTable", 7, flags)) {
+    if (ImGui::BeginTable("SentHistoryTable", 8, flags)) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("Last Sent",            ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending | ImGuiTableColumnFlags_WidthFixed, 75.0f,  HIST_COL_LAST_SENT);
+        ImGui::TableSetupColumn("Dev",                  ImGuiTableColumnFlags_WidthFixed,                                                                                  40.0f,  HIST_COL_DEV);
         ImGui::TableSetupColumn("CAN ID",               ImGuiTableColumnFlags_WidthFixed,                                                                                  85.0f,  HIST_COL_CAN_ID);
         ImGui::TableSetupColumn("Format",               ImGuiTableColumnFlags_WidthFixed,                                                                                  90.0f,  HIST_COL_FORMAT);
         ImGui::TableSetupColumn("DLC",                  ImGuiTableColumnFlags_WidthFixed,                                                                                  45.0f,  HIST_COL_DLC);
@@ -1109,6 +1543,9 @@ void AppUI::RenderSentHistoryWindow(float x, float y, float w, float h) {
                     switch (spec.ColumnUserID) {
                         case HIST_COL_LAST_SENT:
                             cmp = ThreeWayCompare(a.last_sent_sec, b.last_sent_sec);
+                            break;
+                        case HIST_COL_DEV:
+                            cmp = ThreeWayCompare(a.target, b.target);
                             break;
                         case HIST_COL_CAN_ID:
                             cmp = ThreeWayCompare(a.msg.id, b.msg.id);
@@ -1147,21 +1584,28 @@ void AppUI::RenderSentHistoryWindow(float x, float y, float w, float h) {
             ImGui::Text("%.2f s", item.last_sent_sec);
 
             ImGui::TableSetColumnIndex(1);
-            ImGui::Text(m.is_extended ? "0x%08X" : "0x%03X", m.id);
+            if (item.target == kTargetAllDevices) {
+                ImGui::TextDisabled("All");
+            } else {
+                ImGui::TextColored(DeviceColor(item.target), "%d", item.target + 1);
+            }
 
             ImGui::TableSetColumnIndex(2);
+            ImGui::Text(m.is_extended ? "0x%08X" : "0x%03X", m.id);
+
+            ImGui::TableSetColumnIndex(3);
             ImGui::Text("%s %s%s",
                         m.is_extended ? "EXT" : "STD",
                         m.is_fd ? "FD" : "2.0",
                         m.is_brs ? " BRS" : "");
 
-            ImGui::TableSetColumnIndex(3);
+            ImGui::TableSetColumnIndex(4);
             ImGui::Text("%u", m.dlc);
 
-            ImGui::TableSetColumnIndex(4);
+            ImGui::TableSetColumnIndex(5);
             ImGui::Text("%u", item.sent_count);
 
-            ImGui::TableSetColumnIndex(5);
+            ImGui::TableSetColumnIndex(6);
             std::string hex = FormatHexPayload(m.payload);
             if (!item.comment.empty()) {
                 ImGui::Text("%s  [%s]", hex.c_str(), item.comment.c_str());
@@ -1169,14 +1613,14 @@ void AppUI::RenderSentHistoryWindow(float x, float y, float w, float h) {
                 ImGui::TextUnformatted(hex.c_str());
             }
 
-            ImGui::TableSetColumnIndex(6);
+            ImGui::TableSetColumnIndex(7);
             if (ImGui::SmallButton("Resend")) {
-                TransmitSingleMessage(item.msg, true, item.cycle_time_ms, item.comment);
+                TransmitSingleMessage(item.msg, item.target, true, item.cycle_time_ms, item.comment);
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Load")) {
                 selected_history_index_ = static_cast<int>(real_idx);
-                LoadMessageIntoComposer(item.msg, item.cycle_time_ms, item.comment);
+                LoadMessageIntoComposer(item.msg, item.target, item.cycle_time_ms, item.comment);
             }
 
             ImGui::PopID();
