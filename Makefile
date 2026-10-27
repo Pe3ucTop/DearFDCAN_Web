@@ -43,7 +43,7 @@ OBJ := $(BUILD)/obj
 # ---------------------------------------------------------------------------------------------
 # Page: Dear ImGui user interface + WebUSB bridge
 # ---------------------------------------------------------------------------------------------
-APP_SRCS   := main.cpp webusb_bridge.cpp can_protocol.cpp app_ui.cpp
+APP_SRCS   := main.cpp webusb_bridge.cpp can_protocol.cpp can_protocol_gsusb.cpp app_ui.cpp
 IMGUI_SRCS := imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp \
               backends/imgui_impl_glfw.cpp backends/imgui_impl_opengl3.cpp
 
@@ -60,7 +60,7 @@ PAGE_LDFLAGS := $(OPT) -sUSE_GLFW=3 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 
 # ---------------------------------------------------------------------------------------------
 # CAN core: separate wasm module that runs inside the USB worker
 # ---------------------------------------------------------------------------------------------
-CORE_OBJS := $(OBJ)/core/can_core.o $(OBJ)/core/can_protocol.o
+CORE_OBJS := $(OBJ)/core/can_core.o $(OBJ)/core/can_protocol.o $(OBJ)/core/can_protocol_gsusb.o
 
 CORE_COMMON := -std=c++17 $(OPT) -I$(SRC)
 

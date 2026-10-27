@@ -137,7 +137,9 @@ All sources and headers are in `src_inc/`:
 | `src_inc/webusb_bridge.cpp/.h` | Page side of the worker link (EM_JS): device slots, device events, snapshot validation, per-adapter statistics |
 | `src_inc/usb_worker.js` | Worker: one `Device` context per adapter (WebUSB I/O, RX slots, control/TX queues, watchdog), snapshot publishing |
 | `src_inc/can_core.cpp` | Worker wasm module: frame parsing, ID table keyed by (device, ID), trace queue, per-adapter clock mapping |
-| `src_inc/can_protocol.cpp/.h` | gs_usb structures, DLC helpers, bit-timing calculation, `CanMessage`/`CanPayload`, `kMaxDevices` |
+| `src_inc/can_protocol_common.h` | Protocol independent definitions: `CanMessage`/`CanPayload`, `CanBittiming`, `CanProtocolType`, DLC helpers, bit-timing calculation, `kMaxDevices` |
+| `src_inc/can_protocol_gsusb.cpp/.h` | gs_usb (candleLight / CANable): control requests, structures, bulk frame parsing and building |
+| `src_inc/can_protocol.cpp/.h` | Umbrella header and the `CanProtocolHandler` facade: the single entry point the UI and the core use, forwards to the protocol backend |
 | `src_inc/can_wire.h` | Snapshot format shared by the page and the worker core |
 
 Build tooling in the repository root:
@@ -242,6 +244,18 @@ worker, one connection and channel state and one bit-timing configuration in the
   (adapter events, per-device channel sequences and acks, send to one/all, history/jobs targets, snapshots with two rows per ID, removal) headless with the real Dear ImGui,
   and its layout by rendering the ImGui draw lists to an image. Not verified: operation with real, simultaneously connected adapters, and the
   JS code of the bridge (chooser, slot table, reconnect) in a real browser: it was only checked statically (it parses and its identifiers are defined).
+
+**2026-10-27, protocol layer split (stage 1 of adding a second protocol).** `can_protocol.h/.cpp` held both the protocol independent types
+and everything gs_usb specific. They were split into `can_protocol_common.h` (types, bit-timing and DLC helpers) and `can_protocol_gsusb.h/.cpp`
+(gs_usb requests, structures, frame parsing/building), following the structure of the proposal in `to_merge/`, but based on the current code
+(that proposal predates the `CanPayload`/`dev` types and the multi-frame parser). `can_protocol.h` stays the entry point: `CanProtocolHandler`
+keeps its API and forwards to the gs_usb backend, so the UI and the core did not change; `GsDeviceBittiming` is an alias of the generic
+`CanBittiming` (same 20-byte layout). Behaviour is unchanged, checked by running the old and the new implementation on the same inputs
+(about 400 000 random and malformed receive transfers, 200 000 frames to build, all bit-timing and DLC cases) and comparing digests: identical.
+One defect was fixed on the way: a frame announcing more data than it holds (for example a 24-byte transfer with the FD flag and DLC 15, or such
+a frame inside a multi-frame transfer) made the parser read up to 64 bytes beyond the frame (AddressSanitizer: heap-buffer-overflow). The parser
+now copies what is there and pads the payload with zeros; frames that are well formed are not affected. The next stages are the PCAN-USB FD protocol
+and adapters with several CAN ports.
 
 What was and was not verified overall: the CAN core, frame parser and URL parsing were unit-tested natively (ASan/UBSan) and the worker was exercised
 against a mock `USBDevice` with the real core module in Node; the single-file Blob-Worker and the `-O2` page were confirmed on hardware with one adapter.
