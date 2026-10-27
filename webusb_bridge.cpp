@@ -4,10 +4,11 @@
 
 #include <cstring>
 
-// All USB I/O lives in usb_worker.js (dedicated Worker, served next to index.html).
-// The page side only forwards commands with postMessage and feeds batched RX data into wasm.
-// Every worker message carries the `epoch` of the connection it belongs to; messages of an older
-// connection are discarded here (batch buffers are still handed back to keep the credit flow).
+// All USB I/O and CAN processing live in usb_worker.js (dedicated Worker, served next to index.html)
+// and its can_core wasm module. The page side forwards commands with postMessage and applies the
+// snapshots (changed ID rows + new trace entries) it receives.
+// Worker messages carry the `epoch` of the connection they belong to; messages of an older connection
+// are discarded here. Snapshots are the exception: they describe state that outlives connections.
 
 // Create the worker and route its messages into the exported wasm callbacks
 EM_JS(void, js_webusb_init, (), {
@@ -17,8 +18,7 @@ EM_JS(void, js_webusb_init, (), {
         return;
     }
 
-    const BATCH_CAP = 64 * 1024;          // must match BATCH_CAP in usb_worker.js
-    const usb = Module.usb = { worker: null, epoch: 0, staging: 0 };
+    const usb = Module.usb = { worker: null, epoch: 0, staging: 0, stagingCap: 0 };
 
     let w;
     try {
@@ -36,13 +36,16 @@ EM_JS(void, js_webusb_init, (), {
     w.onmessage = (ev) => {
         const m = ev.data;
 
-        if (m.type === 'batch') {
-            if (m.epoch === usb.epoch && m.used <= BATCH_CAP) {
-                if (!usb.staging) usb.staging = _malloc(BATCH_CAP);
-                HEAPU8.set(new Uint8Array(m.buf, 0, m.used), usb.staging);
-                _webusb_cb_rx_batch(usb.staging, m.used);
+        if (m.type === 'snapshot') {
+            // Snapshots carry the table/trace state, which lives across connections: apply them
+            // whatever the session. The buffer always goes back (it is the flow-control credit).
+            if (m.used > usb.stagingCap) {
+                if (usb.staging) _free(usb.staging);
+                usb.staging = _malloc(m.buf.byteLength);
+                usb.stagingCap = m.buf.byteLength;
             }
-            // Handing the buffer back is the flow-control credit; do it for stale batches too
+            HEAPU8.set(new Uint8Array(m.buf, 0, m.used), usb.staging);
+            _webusb_cb_snapshot(usb.staging, m.used);
             w.postMessage({ type: 'ret', buf: m.buf }, [m.buf]);
             return;
         }
@@ -81,7 +84,7 @@ EM_JS(void, js_webusb_init, (), {
             _webusb_cb_ctrl_ack(m.request, m.ok ? 1 : 0);
             break;
         case 'stats':
-            _webusb_cb_stats(m.rxPerSec, m.rxDropped, m.txDropped, m.recoveries);
+            _webusb_cb_stats(m.rxPerSec, m.txDropped, m.recoveries);
             break;
         }
     };
@@ -121,6 +124,13 @@ EM_JS(void, js_webusb_set_rx_pump, (int enable, int ep, int max_len), {
     usb.worker.postMessage({ type: 'rx', enable: !!enable, ep: ep & 0x7F, size: max_len });
 });
 
+// Commands for the CAN core in the worker: 1 = clear ID table, 2 = clear trace, 3 = trace on/off
+EM_JS(void, js_webusb_core_cmd, (int op, int arg), {
+    const usb = Module.usb;
+    if (!usb || !usb.worker) return;
+    usb.worker.postMessage({ type: 'core', op: op, arg: arg });
+});
+
 // Queue a Bulk OUT transfer in the worker (buffer ownership is transferred, no shared memory)
 EM_JS(void, js_webusb_transfer_out, (int ep, const uint8_t* data, int len), {
     const usb = Module.usb;
@@ -154,8 +164,8 @@ extern "C" {
         WebUsbBridge::GetInstance().InternalOnDisconnected();
     }
 
-    EMSCRIPTEN_KEEPALIVE void webusb_cb_rx_batch(const uint8_t* data, int len) {
-        WebUsbBridge::GetInstance().InternalOnRxBatch(data, len);
+    EMSCRIPTEN_KEEPALIVE void webusb_cb_snapshot(const uint8_t* data, int len) {
+        WebUsbBridge::GetInstance().InternalOnSnapshot(data, len);
     }
 
     EMSCRIPTEN_KEEPALIVE void webusb_cb_ctrl_in(int request, const uint8_t* data, int len) {
@@ -166,9 +176,9 @@ extern "C" {
         WebUsbBridge::GetInstance().InternalOnControlOutDone(static_cast<uint8_t>(request), ok != 0);
     }
 
-    EMSCRIPTEN_KEEPALIVE void webusb_cb_stats(int rx_per_sec, int rx_dropped, int tx_dropped, int recoveries) {
-        WebUsbBridge::GetInstance().InternalOnStats(static_cast<uint32_t>(rx_per_sec), static_cast<uint32_t>(rx_dropped),
-                                                    static_cast<uint32_t>(tx_dropped), static_cast<uint32_t>(recoveries));
+    EMSCRIPTEN_KEEPALIVE void webusb_cb_stats(int rx_per_sec, int tx_dropped, int recoveries) {
+        WebUsbBridge::GetInstance().InternalOnStats(static_cast<uint32_t>(rx_per_sec), static_cast<uint32_t>(tx_dropped),
+                                                    static_cast<uint32_t>(recoveries));
     }
 }
 
@@ -209,10 +219,21 @@ void WebUsbBridge::ControlTransferIn(uint8_t request, uint16_t value, uint16_t i
     js_webusb_control_in(request, value, index, length);
 }
 
+void WebUsbBridge::ClearIdTable() {
+    ++table_clear_sent_;
+    js_webusb_core_cmd(1, 0);
+}
+
+void WebUsbBridge::ClearTrace() {
+    ++trace_clear_sent_;
+    js_webusb_core_cmd(2, 0);
+}
+
+void WebUsbBridge::SetTraceEnabled(bool enable) {
+    js_webusb_core_cmd(3, enable ? 1 : 0);
+}
+
 void WebUsbBridge::InternalOnConnected(uint16_t vid, uint16_t pid, const char* mfg, const char* prod) {
-    // Batch sequence numbers continue across connections inside the worker: restart the gap check
-    have_batch_seq_ = false;
-    stats_.batch_gaps = 0;
     if (on_connected_) {
         UsbDeviceInfo info{vid, pid, mfg ? mfg : "", prod ? prod : ""};
         on_connected_(info);
@@ -223,35 +244,43 @@ void WebUsbBridge::InternalOnDisconnected() {
     if (on_disconnected_) on_disconnected_();
 }
 
-// Batch layout (little endian), produced by usb_worker.js:
-//   u32 seq | u32 count | count x { u16 len | u16 ep_address | f64 host_time_ms | len bytes }
-void WebUsbBridge::InternalOnRxBatch(const uint8_t* data, int length) {
-    constexpr int kBatchHeader = 8;
-    constexpr int kRecordHeader = 12;
-    if (length < kBatchHeader) return;
+// Snapshot layout: SnapshotHeader | n_table x WireTableRecord | n_trace x TraceEntry (see can_wire.h)
+void WebUsbBridge::InternalOnSnapshot(const uint8_t* data, int length) {
+    SnapshotView view;
+    if (length < static_cast<int>(sizeof(SnapshotHeader))) { ++stats_.bad_snapshots; return; }
+    std::memcpy(&view.header, data, sizeof(SnapshotHeader));
+    const SnapshotHeader& h = view.header;
 
-    uint32_t seq = 0, count = 0;
-    std::memcpy(&seq, data, sizeof(seq));
-    std::memcpy(&count, data + 4, sizeof(count));
-
-    if (have_batch_seq_ && seq != next_batch_seq_) {
-        stats_.batch_gaps += seq - next_batch_seq_;
+    const uint64_t need = sizeof(SnapshotHeader)
+                        + static_cast<uint64_t>(h.n_table) * sizeof(WireTableRecord)
+                        + static_cast<uint64_t>(h.n_trace) * sizeof(TraceEntry);
+    if (h.magic != kSnapshotMagic || h.table_rec_size != sizeof(WireTableRecord) ||
+        h.trace_rec_size != sizeof(TraceEntry) || need > static_cast<uint64_t>(length)) {
+        ++stats_.bad_snapshots;
+        return;
     }
-    have_batch_seq_ = true;
-    next_batch_seq_ = seq + 1;
 
-    int off = kBatchHeader;
-    for (uint32_t i = 0; i < count && off + kRecordHeader <= length; ++i) {
-        uint16_t len = 0, ep = 0;
-        double host_time_ms = 0.0;
-        std::memcpy(&len, data + off, sizeof(len));
-        std::memcpy(&ep, data + off + 2, sizeof(ep));
-        std::memcpy(&host_time_ms, data + off + 4, sizeof(host_time_ms));
-        off += kRecordHeader;
-        if (off + len > length) break;
-        if (on_data_received_) on_data_received_(ep, data + off, len, host_time_ms);
-        off += len;
+    if (have_snapshot_seq_ && h.seq != next_snapshot_seq_) {
+        stats_.snapshot_gaps += h.seq - next_snapshot_seq_;
     }
+    have_snapshot_seq_ = true;
+    next_snapshot_seq_ = h.seq + 1;
+
+    stats_.frames_total = h.frames_total;
+    stats_.trace_dropped = h.trace_dropped_total;
+    stats_.table_overflow = h.table_overflow_total;
+
+    // A part produced before the core processed our latest clear is stale: skip it
+    const uint8_t* body = data + sizeof(SnapshotHeader);
+    if (static_cast<int32_t>(h.table_clear_ack - table_clear_sent_) >= 0 && h.n_table > 0) {
+        view.table = body;
+        view.n_table = h.n_table;
+    }
+    if (static_cast<int32_t>(h.trace_clear_ack - trace_clear_sent_) >= 0 && h.n_trace > 0) {
+        view.trace = body + static_cast<size_t>(h.n_table) * sizeof(WireTableRecord);
+        view.n_trace = h.n_trace;
+    }
+    if (on_snapshot_) on_snapshot_(view);
 }
 
 void WebUsbBridge::InternalOnControlIn(uint8_t request, const uint8_t* data, int length) {
@@ -262,9 +291,8 @@ void WebUsbBridge::InternalOnControlOutDone(uint8_t request, bool ok) {
     if (on_control_out_done_) on_control_out_done_(request, ok);
 }
 
-void WebUsbBridge::InternalOnStats(uint32_t rx_per_sec, uint32_t rx_dropped, uint32_t tx_dropped, uint32_t recoveries) {
+void WebUsbBridge::InternalOnStats(uint32_t rx_per_sec, uint32_t tx_dropped, uint32_t recoveries) {
     stats_.rx_per_sec = rx_per_sec;
-    stats_.rx_dropped = rx_dropped;
     stats_.tx_dropped = tx_dropped;
     stats_.recoveries = recoveries;
 }

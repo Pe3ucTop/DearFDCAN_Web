@@ -17,11 +17,23 @@ IMGUI_DIR="/Src_Libs/imgui"
   -sMIN_WEBGL_VERSION=2 \
   -sMAX_WEBGL_VERSION=2 \
   -sEXPORTED_RUNTIME_METHODS='["stringToUTF8","lengthBytesUTF8"]' \
-  -sEXPORTED_FUNCTIONS='["_main","_malloc","_free","_webusb_cb_connected","_webusb_cb_disconnected","_webusb_cb_rx_batch","_webusb_cb_ctrl_in","_webusb_cb_ctrl_ack","_webusb_cb_stats"]' \
+  -sEXPORTED_FUNCTIONS='["_main","_malloc","_free","_webusb_cb_connected","_webusb_cb_disconnected","_webusb_cb_snapshot","_webusb_cb_ctrl_in","_webusb_cb_ctrl_ack","_webusb_cb_stats"]' \
   -o index.html
 
-# USB I/O runs in a dedicated Worker: usb_worker.js must be served next to index.html.
-# No pthreads / SharedArrayBuffer are used, so no COOP/COEP headers are required.
+# CAN core for the USB worker: a second, independent wasm module (frame parsing, ID table, trace
+# queue, snapshots). It is loaded by usb_worker.js via importScripts('can_core.js').
+./emsdk-exec.sh em++ can_core.cpp can_protocol.cpp -O2 -std=c++17 \
+  -sMODULARIZE=1 \
+  -sEXPORT_NAME=createCanCore \
+  -sENVIRONMENT=worker \
+  -sALLOW_MEMORY_GROWTH=1 \
+  -sEXPORTED_RUNTIME_METHODS='["HEAPU8"]' \
+  -sEXPORTED_FUNCTIONS='["_core_stage_ptr","_core_stage_cap","_core_out_ptr","_core_out_cap","_core_process","_core_publish","_core_clear_table","_core_clear_trace","_core_set_trace_enabled","_core_reset_clock"]' \
+  -o can_core.js
+
+# Deploy index.html + index.js + index.wasm + usb_worker.js + can_core.js + can_core.wasm in one
+# directory served over HTTP(S). USB I/O runs in a dedicated Worker; no pthreads / SharedArrayBuffer
+# are used, so no COOP/COEP headers are required.
 
 
 # $IMGUI_DIR/backends/imgui_impl_sdl2.cpp \

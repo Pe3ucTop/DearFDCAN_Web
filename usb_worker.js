@@ -1,9 +1,14 @@
 'use strict';
-// usb_worker.js - WebUSB transport running in a dedicated Worker.
+// usb_worker.js - WebUSB transport and CAN processing, running in a dedicated Worker.
 //
 // The page (Emscripten/wasm + ImGui) talks to this worker only through postMessage; there is no
 // SharedArrayBuffer/Atomics. Ownership of every ArrayBuffer is handed over with the transfer list,
 // so two contexts never touch the same bytes.
+//
+// Received transfers are copied straight into the staging buffer of a second wasm module
+// (can_core.js/.wasm, built from can_core.cpp) which parses the frames, keeps the "Table by ID"
+// aggregates and the trace queue, and publishes compact snapshots of what changed. The page only
+// applies snapshots; it never sees individual frames of a busy bus.
 //
 // Main -> worker messages
 //   init     {timeOrigin}                     performance.timeOrigin of the page (clock alignment)
@@ -12,20 +17,18 @@
 //   ctrl_out {request, value, index, data}    vendor control OUT, executed strictly in order
 //   ctrl_in  {request, value, index, length}  vendor control IN, executed strictly in order
 //   tx       {ep, data}                       bulk OUT frame (bounded queue, limited in-flight)
-//   rx       {enable, ep, size}               gate delivery of received frames (+ endpoint config)
-//   ret      {buf}                            batch buffer handed back = one flow-control credit
+//   rx       {enable, ep, size}               gate processing of received frames (+ endpoint config)
+//   core     {op, arg}                        op 1 = clear ID table, 2 = clear trace, 3 = trace on/off
+//   ret      {buf}                            snapshot buffer handed back = one flow-control credit
 //
-// Worker -> main messages (all carry `epoch` of the session they belong to)
+// Worker -> main messages (`epoch` = session the message belongs to; snapshots are valid in any
+// session because the table and trace live across connections)
 //   opened   {vid, pid, mfg, prod}
 //   closed   {reason}
-//   batch    {buf, used}                      see "Batch layout" below
+//   snapshot {buf, used}                      SnapshotHeader + records, see can_wire.h
 //   ctrl_in  {request, data}
 //   ctrl_ack {request, ok}                    completion of a control OUT
-//   stats    {rxPerSec, rxDropped, txDropped, recoveries, rxErrors, txErrors}
-//
-// Batch layout (little endian), BATCH_CAP bytes, `used` valid:
-//   u32 seq | u32 count | count x { u16 len | u16 ep_address | f64 host_time_ms | len bytes }
-// host_time_ms is in the page's performance.now() timeline, taken when the transfer completed.
+//   stats    {rxPerSec, txDropped, recoveries, rxErrors, txErrors}
 
 const IFACE = 0;
 const DEFAULT_EP_IN = 1;            // endpoint number without direction bit
@@ -33,13 +36,9 @@ const DEFAULT_RX_SIZE = 512;
 const RX_SLOTS = 6;                 // concurrent transferIn requests kept pending on the IN endpoint
 const TX_INFLIGHT = 4;              // concurrent transferOut; set to 1 for strictly serialized TX
 const TX_QUEUE_MAX = 4096;
-const BATCH_CAP = 64 * 1024;
-const BATCH_CREDITS = 4;            // batches that may be unacknowledged by the page
-const BATCH_HEADER = 8;
-const REC_HEADER = 12;
-const FLUSH_MS = 2;                 // max extra latency added by batching at low rates
-const FLUSH_PACKETS = 64;           // flush immediately at this many pending packets
-const PEND_MAX_BYTES = 2 * 1024 * 1024; // backlog cap while the page is not acknowledging batches
+const BATCH_CREDITS = 4;            // snapshots that may be unacknowledged by the page
+const PUBLISH_MS = 16;              // snapshot period (about one display frame)
+const STAGE_REC_HEADER = 12;        // u16 len | u16 ep_address | f64 host_time_ms
 const CTRL_TIMEOUT_MS = 2000;
 const WATCHDOG_MS = 1000;
 const IDLE_PING_MS = 2000;          // RX silence after which the device is probed with a control IN
@@ -63,13 +62,27 @@ let rxSize = DEFAULT_RX_SIZE;
 const slotErr = new Array(RX_SLOTS).fill(0);
 let recovering = false;
 
-// Batching / flow control
-let pend = [];
-let pendBytes = 0;
-let flushTimer = null;
+// CAN core (second wasm module) and snapshot flow control
+let core = null;
+let stagePtr = 0, stageCap = 0, stageOff = 0, outPtr = 0, snapCap = 0;
+let pubTimer = null;
 let credits = BATCH_CREDITS;
 let pool = [];
-let batchSeq = 0;
+const stageHdr = new DataView(new ArrayBuffer(STAGE_REC_HEADER));
+const stageHdrBytes = new Uint8Array(stageHdr.buffer);
+
+// Loaded once per worker. importScripts() is available in classic workers; MODULARIZE'd Emscripten
+// output defines the createCanCore factory. If loading fails, open requests are answered with 'closed'.
+const coreReady = (async () => {
+    importScripts('can_core.js');
+    const m = await createCanCore();
+    core = m;
+    stagePtr = m._core_stage_ptr();
+    stageCap = m._core_stage_cap();
+    outPtr = m._core_out_ptr();
+    snapCap = m._core_out_cap();
+})();
+coreReady.catch(err => console.error('[usb_worker] cannot load can_core.js/.wasm:', err));
 
 // TX state
 let txQueue = [];
@@ -83,7 +96,7 @@ let lastPingOk = 0;
 let pingBusy = false;
 let pingFails = 0;
 
-const st = { rx: 0, rxPrev: 0, rxDropped: 0, rxErrors: 0, txDropped: 0, txErrors: 0, recoveries: 0 };
+const st = { rx: 0, rxPrev: 0, rxErrors: 0, txDropped: 0, txErrors: 0, recoveries: 0 };
 
 function now() {
     return performance.now() + performance.timeOrigin - mainOrigin;
@@ -135,6 +148,7 @@ self.onmessage = (ev) => {
         case 'ctrl_in':  enqueue(() => doControl(m)); break;
         case 'tx':       enqueueTx(m.data, m.ep); break;
         case 'rx':       setRx(m); break;
+        case 'core':     coreCommand(m); break;
         case 'ret':      returnBuffer(m.buf); break;
     }
 };
@@ -152,6 +166,13 @@ if (typeof navigator !== 'undefined' && navigator.usb) {
 async function doOpen(m) {
     if (dev) await doClose(null, true);
     epoch = m.epoch;
+
+    try {
+        await coreReady;
+    } catch (err) {
+        post('closed', { reason: 'CAN core module failed to load: ' + errText(err) });
+        return;
+    }
 
     let d = null;
     try {
@@ -176,6 +197,7 @@ async function doOpen(m) {
     rxSize = DEFAULT_RX_SIZE;
     startRx();
     startWatchdog();
+    if (pubTimer === null) pubTimer = setInterval(publishTick, PUBLISH_MS);
     post('opened', {
         vid: d.vendorId, pid: d.productId,
         mfg: d.manufacturerName || '', prod: d.productName || ''
@@ -205,13 +227,12 @@ function deviceLost(reason) {
 // Invalidates every chain of the current session. `dev` is cleared first so that the rejections
 // produced by close()/releaseInterface() find a mismatching generation and are ignored.
 function teardown() {
+    publishTick();                      // hand over the last aggregates of this session
     dev = null;
     rxGen++;
     rxEnabled = false;
     stopWatchdog();
-    if (flushTimer !== null) { clearTimeout(flushTimer); flushTimer = null; }
-    pend = [];
-    pendBytes = 0;
+    if (pubTimer !== null) { clearInterval(pubTimer); pubTimer = null; }
     txQueue = [];
     txHead = 0;
 }
@@ -338,11 +359,11 @@ async function recover(reason) {
 function setRx(m) {
     const enable = !!m.enable;
     if (!enable) {
+        processStage();                 // everything received before the stop still counts
         rxEnabled = false;
-        pend = [];
-        pendBytes = 0;
         return;
     }
+    if (!rxEnabled && core) core._core_reset_clock();   // new channel start: adapter clock may restart
     rxEnabled = true;
     if (!dev) return;
     const ep = (m.ep == null ? rxEp : m.ep) & 0x7F;
@@ -355,60 +376,65 @@ function setRx(m) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Batching with credit-based flow control
+// CAN core: staging, periodic snapshots with credit-based flow control
 // ---------------------------------------------------------------------------------------------
 
+// Copy one completed transfer into the core's staging buffer as [u16 len][u16 ep][f64 time][bytes]
 function onPacket(dv) {
     st.rx++;
-    if (!rxEnabled) return;
-    const need = REC_HEADER + dv.byteLength;
-    if (pendBytes + need > PEND_MAX_BYTES) { st.rxDropped++; return; }
-    pend.push({ dv: dv, t: now() });
-    pendBytes += need;
-    if (pend.length >= FLUSH_PACKETS) flush();
-    else if (flushTimer === null) flushTimer = setTimeout(flush, FLUSH_MS);
+    if (!rxEnabled || !core) return;
+    const len = dv.byteLength;
+    if (len > 0xFFFF) return;
+    if (stageOff + STAGE_REC_HEADER + len > stageCap) processStage();
+
+    stageHdr.setUint16(0, len, true);
+    stageHdr.setUint16(2, 0x80 | rxEp, true);
+    stageHdr.setFloat64(4, now(), true);
+
+    const heap = core.HEAPU8;           // re-read on every use: the heap may be replaced on growth
+    heap.set(stageHdrBytes, stagePtr + stageOff);
+    heap.set(new Uint8Array(dv.buffer, dv.byteOffset, len), stagePtr + stageOff + STAGE_REC_HEADER);
+    stageOff += STAGE_REC_HEADER + len;
 }
 
-function flush() {
-    if (flushTimer !== null) { clearTimeout(flushTimer); flushTimer = null; }
-    while (pend.length > 0 && credits > 0) {
-        const buf = pool.pop() || new ArrayBuffer(BATCH_CAP);
-        const bytes = new Uint8Array(buf);
-        const view = new DataView(buf);
-        let off = BATCH_HEADER;
-        let n = 0;
-        while (n < pend.length) {
-            const p = pend[n];
-            const len = p.dv.byteLength;
-            if (off + REC_HEADER + len > BATCH_CAP) break;
-            view.setUint16(off, len, true);
-            view.setUint16(off + 2, 0x80 | rxEp, true);
-            view.setFloat64(off + 4, p.t, true);
-            bytes.set(new Uint8Array(p.dv.buffer, p.dv.byteOffset, len), off + REC_HEADER);
-            off += REC_HEADER + len;
-            pendBytes -= REC_HEADER + len;
-            n++;
-        }
-        if (n === 0) {                  // a single record larger than a batch: cannot be sent
-            pendBytes -= REC_HEADER + pend[0].dv.byteLength;
-            pend.shift();
-            st.rxDropped++;
-            pool.push(buf);
-            continue;
-        }
-        view.setUint32(0, batchSeq >>> 0, true);
-        view.setUint32(4, n, true);
-        batchSeq = (batchSeq + 1) >>> 0;
-        pend.splice(0, n);
-        credits--;
-        post('batch', { buf: buf, used: off }, [buf]);
+function processStage() {
+    if (stageOff > 0 && core) {
+        core._core_process(stageOff);
+        stageOff = 0;
     }
 }
 
+// Publishes at most one snapshot per tick. Without a credit nothing is published and the core keeps
+// aggregating: updates of one ID coalesce, the trace queue is bounded, so a slow page costs
+// resolution but never memory.
+function publishTick() {
+    if (!core) return;
+    processStage();
+    if (credits <= 0) return;
+    const n = core._core_publish();
+    if (n <= 0) return;
+    const buf = pool.pop() || new ArrayBuffer(snapCap);
+    new Uint8Array(buf, 0, n).set(core.HEAPU8.subarray(outPtr, outPtr + n));
+    credits--;
+    post('snapshot', { buf: buf, used: n }, [buf]);
+}
+
 function returnBuffer(buf) {
-    if (buf && buf.byteLength === BATCH_CAP && pool.length < BATCH_CREDITS) pool.push(buf);
+    if (buf && buf.byteLength === snapCap && pool.length < BATCH_CREDITS) pool.push(buf);
     if (credits < BATCH_CREDITS) credits++;
-    if (pend.length > 0) flush();
+}
+
+// Commands from the page that act on the core state. They run after the already received frames
+// have been processed, so a "clear" also removes everything that arrived before it.
+function coreCommand(m) {
+    coreReady.then(() => {
+        processStage();
+        switch (m.op) {
+            case 1: core._core_clear_table(); break;
+            case 2: core._core_clear_trace(); break;
+            case 3: core._core_set_trace_enabled(m.arg ? 1 : 0); break;
+        }
+    }, () => {});
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -465,7 +491,7 @@ function stopWatchdog() {
 function watchdogTick() {
     if (!dev) return;
     post('stats', {
-        rxPerSec: st.rx - st.rxPrev, rxDropped: st.rxDropped, txDropped: st.txDropped,
+        rxPerSec: st.rx - st.rxPrev, txDropped: st.txDropped,
         recoveries: st.recoveries, rxErrors: st.rxErrors, txErrors: st.txErrors
     });
     st.rxPrev = st.rx;

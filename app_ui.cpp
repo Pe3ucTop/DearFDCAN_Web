@@ -66,8 +66,8 @@ static std::vector<uint8_t> ParseHexPayload(const char* hex_str, size_t max_len)
     return result;
 }
 
-// Helper: Format byte vector into a space-separated hexadecimal string
-static std::string FormatHexPayload(const std::vector<uint8_t>& data) {
+// Helper: Format payload into a space-separated hexadecimal string
+static std::string FormatHexPayload(const CanPayload& data) {
     char buf[256] = {0};
     int offset = 0;
     for (size_t i = 0; i < data.size() && offset < 245; ++i) {
@@ -75,11 +75,6 @@ static std::string FormatHexPayload(const std::vector<uint8_t>& data) {
                                 data[i], (i + 1 < data.size()) ? " " : "");
     }
     return std::string(buf);
-}
-
-// Helper: Build unique 64-bit lookup key for ID Table (combines 29-bit/11-bit ID and EXT flag)
-static uint64_t MakeCanIdKey(uint32_t id, bool is_extended) {
-    return (static_cast<uint64_t>(is_extended ? 1 : 0) << 32) | static_cast<uint64_t>(id);
 }
 
 // Helper: Compute an integer rank for CAN frame format flags to allow sorting by frame type
@@ -92,8 +87,8 @@ static int GetFrameFormatRank(const CanMessage& m) {
     return rank;
 }
 
-// Helper: Compare two byte vectors lexicographically (-1 if a < b, 1 if a > b, 0 if equal)
-static int ComparePayloads(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+// Helper: Compare two payloads lexicographically (-1 if a < b, 1 if a > b, 0 if equal)
+static int ComparePayloads(const CanPayload& a, const CanPayload& b) {
     size_t min_len = std::min(a.size(), b.size());
     if (min_len > 0) {
         int cmp = std::memcmp(a.data(), b.data(), min_len);
@@ -117,7 +112,7 @@ AppUI::AppUI()
       is_channel_open_(false),
       channel_opening_(false),
       device_name_("No Device"),
-      start_time_ms_(glfwGetTime() * 1000.0),
+      start_time_ms_(emscripten_get_now()),
       auto_tile_layout_(true),
       show_hw_window_(true),
       show_tx_window_(true),
@@ -166,7 +161,7 @@ AppUI::AppUI()
 }
 
 double AppUI::GetNowMs() const {
-    return (glfwGetTime() * 1000.0) - start_time_ms_;
+    return emscripten_get_now() - start_time_ms_;
 }
 
 void AppUI::OnDeviceConnected(const std::string& name) {
@@ -211,50 +206,26 @@ void AppUI::OnControlOutDone(uint8_t request, bool ok) {
     }
 }
 
-void AppUI::OnCanMessageReceived(const CanMessage& msg) {
-    // Use the time the USB transfer completed in the worker instead of the (batched, frame-delayed)
-    // delivery time, so cycle times keep their accuracy
-    double now_ms = GetNowMs();
-    if (msg.host_time_ms > 0.0) {
-        now_ms -= std::max(0.0, emscripten_get_now() - msg.host_time_ms);
+// The worker core owns parsing, per-ID aggregation (count, cycle time from adapter timestamps) and
+// the trace queue. Rows arrive as complete latest states, so applying them is a plain overwrite.
+// Core times are on the performance.now() timeline; subtract our start time to match GetNowMs().
+void AppUI::OnSnapshot(const SnapshotView& snapshot) {
+    for (uint32_t i = 0; i < snapshot.n_table; ++i) {
+        WireTableRecord rec;
+        std::memcpy(&rec, snapshot.table + static_cast<size_t>(i) * sizeof(rec), sizeof(rec));
+        rec.entry.last_rx_time_ms -= start_time_ms_;
+        id_table_[rec.key] = rec.entry;
     }
 
-    // 1. Update Linear Receive Trace (if not paused)
-    if (!trace_paused_) {
-        if (rx_trace_.size() >= 2000) {
-            rx_trace_.pop_front();
-        }
-        TraceEntry trace_item;
-        trace_item.timestamp_sec = now_ms / 1000.0;
-        trace_item.msg = msg;
-        rx_trace_.push_back(trace_item);
+    if (trace_paused_) return;
+    for (uint32_t i = 0; i < snapshot.n_trace; ++i) {
+        TraceEntry entry;
+        std::memcpy(&entry, snapshot.trace + static_cast<size_t>(i) * sizeof(entry), sizeof(entry));
+        entry.timestamp_sec -= start_time_ms_ / 1000.0;
+        rx_trace_.push_back(entry);
     }
-
-    // 2. Update Grouped ID Table (PCAN-View style)
-    uint64_t key = MakeCanIdKey(msg.id, msg.is_extended);
-    auto it = id_table_.find(key);
-    if (it == id_table_.end()) {
-        IdTableEntry entry;
-        entry.last_msg = msg;
-        entry.prev_payload = msg.payload;
-        entry.count = 1;
-        entry.last_rx_time_ms = now_ms;
-        entry.cycle_time_ms = 0.0;
-        entry.min_cycle_ms = 0.0;
-        entry.max_cycle_ms = 0.0;
-        id_table_[key] = entry;
-    } else {
-        IdTableEntry& entry = it->second;
-        double dt = now_ms - entry.last_rx_time_ms;
-        if (dt >= 0.0) {
-            entry.cycle_time_ms = dt;
-            if (entry.count == 1 || dt < entry.min_cycle_ms) entry.min_cycle_ms = dt;
-            if (entry.count == 1 || dt > entry.max_cycle_ms) entry.max_cycle_ms = dt;
-        }
-        entry.prev_payload = entry.last_msg.payload;
-        entry.last_msg = msg;
-        entry.last_rx_time_ms = now_ms;
-        entry.count++;
+    while (rx_trace_.size() > 2000) {
+        rx_trace_.pop_front();
     }
 }
 
@@ -276,6 +247,9 @@ void AppUI::StartCanChannel() {
     if (enable_fd_mode_)     mode_cmd.flags |= GS_CAN_FEATURE_FD;
     if (enable_loopback_)    mode_cmd.flags |= GS_CAN_FEATURE_LOOP_BACK;
     if (enable_listen_only_) mode_cmd.flags |= GS_CAN_FEATURE_LISTEN_ONLY;
+    // Ask the adapter to append its microsecond timestamp to every frame: cycle times are then
+    // computed from the adapter clock instead of the (jittery) USB/browser arrival time
+    if (bt_const_.feature & GS_CAN_FEATURE_HW_TIMESTAMP) mode_cmd.flags |= GS_CAN_FEATURE_HW_TIMESTAMP;
 
     usb.ControlTransferOut(GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd));
 
@@ -421,8 +395,9 @@ float AppUI::RenderMenuBar() {
                                device_name_.c_str(), is_channel_open_ ? "BUS ON" : "BUS OFF");
             const UsbStats& us = WebUsbBridge::GetInstance().GetStats();
             ImGui::Separator();
-            ImGui::TextDisabled("RX %u/s  drop %u  gaps %u  TX drop %u  recov %u",
-                                us.rx_per_sec, us.rx_dropped, us.batch_gaps, us.tx_dropped, us.recoveries);
+            ImGui::TextDisabled("USB %u/s  frames %u  trace drop %u  gaps %u  TX drop %u  recov %u",
+                                us.rx_per_sec, us.frames_total, us.trace_dropped, us.snapshot_gaps,
+                                us.tx_dropped, us.recoveries);
         } else {
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "USB: Disconnected");
         }
@@ -562,6 +537,7 @@ void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float 
     ImGui::SameLine(ImGui::GetWindowWidth() - 110);
     if (ImGui::SmallButton("Reset Table")) {
         id_table_.clear();
+        WebUsbBridge::GetInstance().ClearIdTable();
     }
 
     const ImGuiTableFlags flags =
@@ -698,7 +674,9 @@ void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
         return;
     }
 
-    ImGui::Checkbox("Pause Trace", &trace_paused_);
+    if (ImGui::Checkbox("Pause Trace", &trace_paused_)) {
+        WebUsbBridge::GetInstance().SetTraceEnabled(!trace_paused_);
+    }
     ImGui::SameLine();
     ImGui::Checkbox("Auto-Scroll", &trace_autoscroll_);
     ImGui::SameLine();
@@ -708,6 +686,7 @@ void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
     ImGui::SameLine(ImGui::GetWindowWidth() - 105);
     if (ImGui::SmallButton("Clear Trace")) {
         rx_trace_.clear();
+        WebUsbBridge::GetInstance().ClearTrace();
     }
 
     const ImGuiTableFlags flags =

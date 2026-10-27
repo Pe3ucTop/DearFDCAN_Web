@@ -1,27 +1,11 @@
 #pragma once
 #include "can_protocol.h"
+#include "can_wire.h"
 #include <deque>
 #include <map>
 #include <vector>
 #include <string>
 #include <cstdint>
-
-// Chronological trace entry for the Linear Receive Window
-struct TraceEntry {
-    double timestamp_sec = 0.0;
-    CanMessage msg;
-};
-
-// Aggregated entry for the "Table by ID" Window (PCAN-View Receive Table style)
-struct IdTableEntry {
-    CanMessage last_msg;
-    std::vector<uint8_t> prev_payload;
-    uint64_t count = 0;
-    double last_rx_time_ms = 0.0;
-    double cycle_time_ms = 0.0;
-    double min_cycle_ms = 0.0;
-    double max_cycle_ms = 0.0;
-};
 
 // Sent History item for re-selection and quick re-transmission
 struct TxHistoryEntry {
@@ -52,7 +36,8 @@ public:
 
     void OnDeviceConnected(const std::string& name);
     void OnDeviceDisconnected();
-    void OnCanMessageReceived(const CanMessage& msg);
+    // Applies a snapshot from the worker core: changed ID table rows and new trace entries
+    void OnSnapshot(const SnapshotView& snapshot);
     void OnControlDataReceived(uint8_t request, const uint8_t* data, int length);
     void OnControlOutDone(uint8_t request, bool ok);
 
@@ -60,7 +45,8 @@ private:
     void StartCanChannel();
     void StopCanChannel();
 
-    // High-resolution monotonic time in milliseconds via GLFW
+    // Monotonic time in milliseconds since startup, on the same timeline the worker core uses for
+    // frame times (performance.now() minus start_time_ms_)
     double GetNowMs() const;
 
     // Transmit helpers

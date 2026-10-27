@@ -15,7 +15,6 @@
 // Global application instances
 GLFWwindow* g_Window = nullptr;
 AppUI g_AppUI;
-CanProtocolHandler g_Protocol;
 
 // Move the WebGL canvas directly to document.body and remove default Emscripten shell clutter.
 // Hiding parent divs (.emscripten_border) via CSS would also hide the child #canvas!
@@ -160,14 +159,8 @@ int main(int, char**) {
         g_AppUI.OnControlOutDone(request, ok);
     });
 
-    webusb.SetOnDataReceived([](int ep, const uint8_t* data, int length, double host_time_ms) {
-        if (ep == 0x81) {
-            auto messages = g_Protocol.ParseRxBuffer(data, length);
-            for (auto& msg : messages) {
-                msg.host_time_ms = host_time_ms;
-                g_AppUI.OnCanMessageReceived(msg);
-            }
-        }
+    webusb.SetOnSnapshot([](const SnapshotView& snapshot) {
+        g_AppUI.OnSnapshot(snapshot);
     });
 
     webusb.Initialize();
