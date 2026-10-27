@@ -66,3 +66,17 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Build outputs of compile_script.sh (single mode produces just index.html; multi mode the rest)
+/index.html
+/index.js
+/index.wasm
+/can_core.js
+/can_core.wasm
+/build_tmp/
+
+# Local tool / IDE settings
+.claude/settings.local.json
+.claude/.cc-writes/
+.idea/
+.vscode/

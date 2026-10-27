@@ -6,7 +6,6 @@
 // Standard SocketCAN / gs_usb CAN ID flags
 constexpr uint32_t CAN_EFF_FLAG = 0x80000000U; // Extended Frame Format (29-bit)
 constexpr uint32_t CAN_RTR_FLAG = 0x40000000U; // Remote Transmission Request
-constexpr uint32_t CAN_ERR_FLAG = 0x20000000U; // Error Frame
 constexpr uint32_t CAN_EFF_MASK = 0x1FFFFFFFU;
 constexpr uint32_t CAN_SFF_MASK = 0x000007FFU;
 
@@ -141,7 +140,7 @@ void CanProtocolHandler::ParseRxBuffer(const uint8_t* buffer, int length, std::v
 }
 
 std::vector<uint8_t> CanProtocolHandler::BuildTxBuffer(const CanMessage& msg) {
-    GsHostFrame frame = {0};
+    GsHostFrame frame = {};
     // Unique echo id per frame (0xFFFFFFFF is reserved for received frames) so the TX echo
     // returned by the adapter can be matched with the request
     static uint32_t next_echo_id = 0;

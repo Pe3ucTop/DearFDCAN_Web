@@ -1,6 +1,9 @@
 #!/bin/sh
 #
-# Usage: ./compile_scipt_Elmue_2.sh [single|multi]      (default: single)
+# Usage: ./compile_script.sh [single|multi]      (default: single)
+#
+# Requires the Emscripten SDK (sourced by ./emsdk-exec.sh), Dear ImGui sources in IMGUI_DIR and python3.
+# Run it from this directory.
 #
 #   single  one self-contained index.html: page wasm and CAN core wasm are embedded
 #           (-sSINGLE_FILE=1) and the worker source (can_core glue + usb_worker.js) is packed into
@@ -82,61 +85,4 @@ if [ "$MODE" = "single" ]; then
 else
   echo "Done: deploy index.html index.js index.wasm usb_worker.js can_core.js can_core.wasm together."
 fi
-
-# $IMGUI_DIR/backends/imgui_impl_sdl2.cpp \
-# -sUSE_SDL=2 \
-
-#emcc main.cpp webusb_bridge.cpp can_protocol.cpp app_ui.cpp \
-#  ./imgui/imgui.cpp \
-#  ./imgui/imgui_draw.cpp \
-#  ./imgui/imgui_tables.cpp \
-#  ./imgui/imgui_widgets.cpp \
-#  ./imgui/backends/imgui_impl_sdl2.cpp \
-#  ./imgui/backends/imgui_impl_opengl3.cpp \
-#  -I./imgui \
-#  -I./imgui/backends \
-#  -sUSE_SDL=2 \
-#  -sMIN_WEBGL_VERSION=2 \
-#  -sMAX_WEBGL_VERSION=2 \
-#  -sALLOW_MEMORY_GROWTH=1 \
-#  -sEXPORTED_RUNTIME_METHODS='["stringToUTF8","lengthBytesUTF8"]' \
-#  -sEXPORTED_FUNCTIONS='["_main","_malloc","_free","_webusb_cb_connected","_webusb_cb_disconnected","_webusb_cb_rx","_webusb_cb_ctrl_in"]' \
-#  -o index.html
-
-#em++ main.cpp webusb_bridge.cpp can_protocol.cpp app_ui.cpp \
-#  ./imgui/imgui.cpp \
-#  ./imgui/imgui_draw.cpp \
-#  ./imgui/imgui_tables.cpp \
-#  ./imgui/imgui_widgets.cpp \
-#  ./imgui/backends/imgui_impl_sdl2.cpp \
-#  ./imgui/backends/imgui_impl_opengl3.cpp \
-#  -I./imgui \
-#  -I./imgui/backends \
-
-#-sEXPORTED_FUNCTIONS='["_main","_malloc","_free", "_webusb_cb_connected", "_webusb_cb_disconnected", "_webusb_cb_rx"]' \
-
-#em++ WebUSB_Esmcripten_ImGUI__4_Elmue.cpp \
-#  $IMGUI_DIR/imgui.cpp \
-#  $IMGUI_DIR/imgui_draw.cpp \
-#  $IMGUI_DIR/imgui_tables.cpp \
-#  $IMGUI_DIR/imgui_widgets.cpp \
-#  $IMGUI_DIR/backends/imgui_impl_sdl2.cpp \
-#  $IMGUI_DIR/backends/imgui_impl_opengl3.cpp \
-#  -I$IMGUI_DIR \
-#  -I$IMGUI_DIR/backends \
-#  -sUSE_SDL=2 \
-#  -sMIN_WEBGL_VERSION=2 \
-#  -sMAX_WEBGL_VERSION=2 \
-#  -sALLOW_MEMORY_GROWTH=1 \
-#  -sEXPORTED_RUNTIME_METHODS='["stringToUTF8","lengthBytesUTF8"]' \
-#  -sEXPORTED_FUNCTIONS='["_main","_malloc","_free"]' \
-#  -o index.html
-
-# -sEXPORTED_FUNCTIONS='["_main","_malloc","_free","_on_webusb_connected","_on_webusb_disconnected","_on_webusb_error","_on_webusb_tx_complete","_on_webusb_rx_complete"]' \
-#  --bind \
-# --pre-js redef_Atomics_waitAsync.js \
-# -pthread
-# -sSHARED_MEMORY=1
-#
-# -sSINGLE_FILE \
 
