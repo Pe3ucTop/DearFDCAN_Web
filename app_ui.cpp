@@ -1,7 +1,7 @@
 #include "app_ui.h"
 #include "webusb_bridge.h"
 #include "imgui.h"
-#include <SDL.h>
+#include <GLFW/glfw3.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -47,7 +47,8 @@ AppUI::AppUI()
     : is_connected_(false),
       is_channel_open_(false),
       device_name_("No Device"),
-      start_time_ms_(static_cast<double>(SDL_GetTicks64())),
+      start_time_ms_(glfwGetTime() * 1000.0),
+      auto_tile_layout_(true),
       show_hw_window_(true),
       show_tx_window_(true),
       show_history_window_(true),
@@ -94,6 +95,10 @@ AppUI::AppUI()
     tx_comment_[sizeof(tx_comment_) - 1] = '\0';
 }
 
+double AppUI::GetNowMs() const {
+    return (glfwGetTime() * 1000.0) - start_time_ms_;
+}
+
 void AppUI::OnDeviceConnected(const std::string& name) {
     is_connected_ = true;
     is_channel_open_ = false;
@@ -120,7 +125,7 @@ void AppUI::OnControlDataReceived(uint8_t request, const uint8_t* data, int leng
 }
 
 void AppUI::OnCanMessageReceived(const CanMessage& msg) {
-    double now_ms = static_cast<double>(SDL_GetTicks64()) - start_time_ms_;
+    double now_ms = GetNowMs();
 
     // 1. Update Linear Receive Trace (if not paused)
     if (!trace_paused_) {
@@ -209,7 +214,6 @@ CanMessage AppUI::BuildComposerMessage() const {
     size_t target_len = msg.is_fd ? CanProtocolHandler::DlcToBytes(msg.dlc) : std::min<uint8_t>(msg.dlc, 8);
     if (!msg.is_rtr) {
         msg.payload = ParseHexPayload(tx_payload_, target_len);
-        // Pad with zeros up to target DLC byte length
         if (msg.payload.size() < target_len) {
             msg.payload.resize(target_len, 0x00);
         }
@@ -233,7 +237,6 @@ void AppUI::LoadMessageIntoComposer(const CanMessage& msg, int cycle_ms, const s
     std::strncpy(tx_comment_, comment.c_str(), sizeof(tx_comment_) - 1);
     tx_comment_[sizeof(tx_comment_) - 1] = '\0';
 
-    // Focus the transmit window
     show_tx_window_ = true;
 }
 
@@ -246,9 +249,9 @@ void AppUI::TransmitSingleMessage(const CanMessage& msg, bool record_in_history,
 
     if (!record_in_history) return;
 
-    double now_sec = (static_cast<double>(SDL_GetTicks64()) - start_time_ms_) / 1000.0;
+    double now_sec = GetNowMs() / 1000.0;
 
-    // Check if an identical message (same ID, flags, DLC, and payload) already exists in history
+    // Update existing entry if identical message is already in history
     for (auto& item : tx_history_) {
         if (item.msg.id == msg.id &&
             item.msg.is_extended == msg.is_extended &&
@@ -265,7 +268,6 @@ void AppUI::TransmitSingleMessage(const CanMessage& msg, bool record_in_history,
         }
     }
 
-    // Add new entry to Sent History
     TxHistoryEntry new_entry;
     new_entry.msg = msg;
     new_entry.cycle_time_ms = associated_cycle_ms;
@@ -285,14 +287,12 @@ void AppUI::ProcessPeriodicJobs(double now_ms) {
             TransmitSingleMessage(job.msg, false);
             job.tx_count++;
 
-            // Apply optional byte auto-increment (for testing rolling counters)
             if (job.auto_inc_byte_index >= 0 &&
                 job.auto_inc_byte_index < static_cast<int>(job.msg.payload.size()))
             {
                 job.msg.payload[job.auto_inc_byte_index]++;
             }
 
-            // Schedule next transmission
             if (now_ms - job.next_send_ms > job.cycle_ms * 5) {
                 job.next_send_ms = now_ms + job.cycle_ms;
             } else {
@@ -302,9 +302,14 @@ void AppUI::ProcessPeriodicJobs(double now_ms) {
     }
 }
 
-void AppUI::RenderMenuBar() {
+float AppUI::RenderMenuBar() {
+    float bar_height = 0.0f;
     if (ImGui::BeginMainMenuBar()) {
-        if (ImGui::BeginMenu("View Windows (PCAN-View Layout)")) {
+        bar_height = ImGui::GetWindowSize().y;
+
+        if (ImGui::BeginMenu("View Windows")) {
+            ImGui::MenuItem("Auto-Tile & Resize Windows with Browser", nullptr, &auto_tile_layout_);
+            ImGui::Separator();
             ImGui::MenuItem("1. Hardware & Bit-Timing Setup", nullptr, &show_hw_window_);
             ImGui::MenuItem("2. Receive Table by ID (Grouped Monitor)", nullptr, &show_id_table_window_);
             ImGui::MenuItem("3. Receive Trace (Chronological Stream)", nullptr, &show_trace_window_);
@@ -314,6 +319,9 @@ void AppUI::RenderMenuBar() {
         }
 
         ImGui::Separator();
+        ImGui::Checkbox("Auto-Tile Resize", &auto_tile_layout_);
+        ImGui::Separator();
+
         if (is_connected_) {
             ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "USB: %s (%s)",
                                device_name_.c_str(), is_channel_open_ ? "BUS ON" : "BUS OFF");
@@ -323,6 +331,7 @@ void AppUI::RenderMenuBar() {
 
         ImGui::EndMainMenuBar();
     }
+    return bar_height;
 }
 
 // Helper for Bit-Timing configuration UI
@@ -335,7 +344,7 @@ static void RenderBittimingEditor(
 {
     ImGui::PushID(label_prefix);
 
-    ImGui::PushItemWidth(90);
+    ImGui::PushItemWidth(85);
     ImGui::InputInt("Bitrate (kbps)", &target_kbps, 50, 250);
     target_kbps = std::max(10, target_kbps);
     ImGui::SameLine();
@@ -352,16 +361,16 @@ static void RenderBittimingEditor(
     int seg2 = static_cast<int>(bt.phase_seg2);
     int sjw  = static_cast<int>(bt.sjw);
 
-    ImGui::PushItemWidth(75);
-    if (ImGui::InputInt("BRP", &brp, 1, 5))       bt.brp = std::clamp(brp, 1, 1024);
+    ImGui::PushItemWidth(70);
+    if (ImGui::InputInt("BRP", &brp, 1, 5))   bt.brp = std::clamp(brp, 1, 1024);
     ImGui::SameLine();
-    if (ImGui::InputInt("Prop", &prop, 1, 2))     bt.prop_seg = std::clamp(prop, 0, 256);
+    if (ImGui::InputInt("Prop", &prop, 1, 2)) bt.prop_seg = std::clamp(prop, 0, 256);
     ImGui::SameLine();
-    if (ImGui::InputInt("Seg1", &seg1, 1, 2))     bt.phase_seg1 = std::clamp(seg1, 1, 256);
+    if (ImGui::InputInt("Seg1", &seg1, 1, 2)) bt.phase_seg1 = std::clamp(seg1, 1, 256);
     ImGui::SameLine();
-    if (ImGui::InputInt("Seg2", &seg2, 1, 2))     bt.phase_seg2 = std::clamp(seg2, 1, 128);
+    if (ImGui::InputInt("Seg2", &seg2, 1, 2)) bt.phase_seg2 = std::clamp(seg2, 1, 128);
     ImGui::SameLine();
-    if (ImGui::InputInt("SJW", &sjw, 1, 1))       bt.sjw = std::clamp(sjw, 1, 128);
+    if (ImGui::InputInt("SJW", &sjw, 1, 1))   bt.sjw = std::clamp(sjw, 1, 128);
     ImGui::PopItemWidth();
 
     CanTimingMetrics m = CanProtocolHandler::ComputeTimingMetrics(fclk_hz, bt);
@@ -375,9 +384,10 @@ static void RenderBittimingEditor(
 // ============================================================================
 // Window 1: Hardware Connection & Bit-Timing Setup
 // ============================================================================
-void AppUI::RenderHardwareSetupWindow() {
-    ImGui::SetNextWindowPos(ImVec2(10, 30), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(550, 340), ImGuiCond_FirstUseEver);
+void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
+    ImGuiCond cond = auto_tile_layout_ ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
+    ImGui::SetNextWindowPos(ImVec2(x, y), cond);
+    ImGui::SetNextWindowSize(ImVec2(w, h), cond);
 
     if (!ImGui::Begin("1. Hardware & Bit-Timing Setup", &show_hw_window_)) {
         ImGui::End();
@@ -385,23 +395,23 @@ void AppUI::RenderHardwareSetupWindow() {
     }
 
     if (!is_connected_) {
-        if (ImGui::Button("Request WebUSB CAN Device", ImVec2(220, 28))) {
+        if (ImGui::Button("Request WebUSB CAN Device", ImVec2(210, 26))) {
             WebUsbBridge::GetInstance().RequestDevice();
         }
         ImGui::SameLine();
         ImGui::TextDisabled("Select your CANable / Candlelight adapter");
     } else {
-        if (ImGui::Button("Disconnect USB", ImVec2(140, 28))) {
+        if (ImGui::Button("Disconnect USB", ImVec2(130, 26))) {
             if (is_channel_open_) StopCanChannel();
             WebUsbBridge::GetInstance().Disconnect();
         }
         ImGui::SameLine();
         if (!is_channel_open_) {
-            if (ImGui::Button("Start CAN Channel", ImVec2(160, 28))) {
+            if (ImGui::Button("Start CAN Channel", ImVec2(150, 26))) {
                 StartCanChannel();
             }
         } else {
-            if (ImGui::Button("Stop CAN Channel", ImVec2(160, 28))) {
+            if (ImGui::Button("Stop CAN Channel", ImVec2(150, 26))) {
                 StopCanChannel();
             }
         }
@@ -413,7 +423,7 @@ void AppUI::RenderHardwareSetupWindow() {
     ImGui::BeginDisabled(is_channel_open_);
 
     int clk_mhz = static_cast<int>(bt_const_.fclk_can / 1000000U);
-    ImGui::PushItemWidth(85);
+    ImGui::PushItemWidth(80);
     if (ImGui::InputInt("CAN Clock (MHz)", &clk_mhz, 1, 10)) {
         bt_const_.fclk_can = static_cast<uint32_t>(std::clamp(clk_mhz, 1, 400)) * 1000000U;
     }
@@ -440,9 +450,10 @@ void AppUI::RenderHardwareSetupWindow() {
 // ============================================================================
 // Window 2: Receive Monitor Table Grouped by ID (PCAN-View Receive Table)
 // ============================================================================
-void AppUI::RenderIdTableWindow(double now_ms) {
-    ImGui::SetNextWindowPos(ImVec2(570, 30), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(690, 340), ImGuiCond_FirstUseEver);
+void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float h) {
+    ImGuiCond cond = auto_tile_layout_ ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
+    ImGui::SetNextWindowPos(ImVec2(x, y), cond);
+    ImGui::SetNextWindowSize(ImVec2(w, h), cond);
 
     if (!ImGui::Begin("2. Receive Table by ID (PCAN-View Monitor)", &show_id_table_window_)) {
         ImGui::End();
@@ -450,7 +461,7 @@ void AppUI::RenderIdTableWindow(double now_ms) {
     }
 
     ImGui::Text("Unique CAN IDs: %zu", id_table_.size());
-    ImGui::SameLine(ImGui::GetWindowWidth() - 120);
+    ImGui::SameLine(ImGui::GetWindowWidth() - 110);
     if (ImGui::SmallButton("Reset Table")) {
         id_table_.clear();
     }
@@ -478,11 +489,9 @@ void AppUI::RenderIdTableWindow(double now_ms) {
 
             ImGui::TableNextRow();
 
-            // Column 0: CAN ID
             ImGui::TableSetColumnIndex(0);
             ImGui::Text(m.is_extended ? "0x%08X" : "0x%03X", m.id);
 
-            // Column 1: Frame Type / Flags
             ImGui::TableSetColumnIndex(1);
             ImGui::Text("%s %s%s%s",
                         m.is_extended ? "EXT" : "STD",
@@ -490,16 +499,13 @@ void AppUI::RenderIdTableWindow(double now_ms) {
                         m.is_brs ? " BRS" : "",
                         m.is_rtr ? " RTR" : "");
 
-            // Column 2: DLC and Byte Length
             ImGui::TableSetColumnIndex(2);
             uint8_t byte_len = m.is_fd ? CanProtocolHandler::DlcToBytes(m.dlc) : std::min<uint8_t>(m.dlc, 8);
             ImGui::Text("%u (%uB)", m.dlc, byte_len);
 
-            // Column 3: Total Packet Counter
             ImGui::TableSetColumnIndex(3);
             ImGui::Text("%llu", static_cast<unsigned long long>(entry.count));
 
-            // Column 4: Cycle Time in ms
             ImGui::TableSetColumnIndex(4);
             if (entry.count > 1) {
                 ImGui::Text("%.1f ms", entry.cycle_time_ms);
@@ -507,7 +513,6 @@ void AppUI::RenderIdTableWindow(double now_ms) {
                 ImGui::TextDisabled("---");
             }
 
-            // Column 5: Payload with Byte-Change Highlighting
             ImGui::TableSetColumnIndex(5);
             if (m.is_rtr) {
                 ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1.0f), "REMOTE REQUEST");
@@ -538,9 +543,10 @@ void AppUI::RenderIdTableWindow(double now_ms) {
 // ============================================================================
 // Window 3: Chronological Receive Trace (Linear Stream)
 // ============================================================================
-void AppUI::RenderTraceWindow() {
-    ImGui::SetNextWindowPos(ImVec2(570, 380), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(690, 360), ImGuiCond_FirstUseEver);
+void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
+    ImGuiCond cond = auto_tile_layout_ ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
+    ImGui::SetNextWindowPos(ImVec2(x, y), cond);
+    ImGui::SetNextWindowSize(ImVec2(w, h), cond);
 
     if (!ImGui::Begin("3. Received Messages Trace (Chronological)", &show_trace_window_)) {
         ImGui::End();
@@ -551,7 +557,7 @@ void AppUI::RenderTraceWindow() {
     ImGui::SameLine();
     ImGui::Checkbox("Auto-Scroll", &trace_autoscroll_);
     ImGui::SameLine();
-    ImGui::PushItemWidth(95);
+    ImGui::PushItemWidth(90);
     ImGui::InputInt("Filter ID (Hex, -1=All)", &trace_filter_id_, 1, 16);
     ImGui::PopItemWidth();
     ImGui::SameLine(ImGui::GetWindowWidth() - 105);
@@ -627,17 +633,17 @@ void AppUI::RenderTraceWindow() {
 // ============================================================================
 // Window 4: Dedicated Transmit Window & Active Periodic Jobs
 // ============================================================================
-void AppUI::RenderTransmitWindow(double now_ms) {
-    ImGui::SetNextWindowPos(ImVec2(10, 380), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(550, 360), ImGuiCond_FirstUseEver);
+void AppUI::RenderTransmitWindow(double now_ms, float x, float y, float w, float h) {
+    ImGuiCond cond = auto_tile_layout_ ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
+    ImGui::SetNextWindowPos(ImVec2(x, y), cond);
+    ImGui::SetNextWindowSize(ImVec2(w, h), cond);
 
     if (!ImGui::Begin("4. Transmit Frame Composer & Periodic Jobs", &show_tx_window_)) {
         ImGui::End();
         return;
     }
 
-    // --- Row 1: ID, Format Flags, and DLC ---
-    ImGui::PushItemWidth(95);
+    ImGui::PushItemWidth(90);
     ImGui::InputInt("ID (Hex)", &tx_id_, 1, 16, ImGuiInputTextFlags_CharsHexadecimal);
     ImGui::PopItemWidth();
     ImGui::SameLine();
@@ -653,28 +659,26 @@ void AppUI::RenderTransmitWindow(double now_ms) {
     ImGui::Checkbox("RTR", &tx_is_rtr_);
     ImGui::EndDisabled();
     ImGui::SameLine();
-    ImGui::PushItemWidth(65);
+    ImGui::PushItemWidth(60);
     int max_dlc = tx_is_fd_ ? 15 : 8;
     if (ImGui::SliderInt("DLC", &tx_dlc_, 0, max_dlc)) {
         tx_dlc_ = std::clamp(tx_dlc_, 0, max_dlc);
     }
     ImGui::PopItemWidth();
 
-    // --- Row 2: Payload & Comment ---
     uint8_t expected_bytes = tx_is_fd_ ? CanProtocolHandler::DlcToBytes(tx_dlc_) : std::min(tx_dlc_, 8);
     char payload_label[64];
     std::snprintf(payload_label, sizeof(payload_label), "Data (%u B)", expected_bytes);
 
-    ImGui::PushItemWidth(340);
+    ImGui::PushItemWidth(w * 0.55f);
     ImGui::InputText(payload_label, tx_payload_, sizeof(tx_payload_));
     ImGui::PopItemWidth();
     ImGui::SameLine();
-    ImGui::PushItemWidth(110);
+    ImGui::PushItemWidth(w * 0.20f);
     ImGui::InputText("Comment", tx_comment_, sizeof(tx_comment_));
     ImGui::PopItemWidth();
 
-    // --- Row 3: Extra Transmit Parameters (Cycle Time, Burst, Auto-Increment) ---
-    ImGui::PushItemWidth(95);
+    ImGui::PushItemWidth(85);
     ImGui::InputInt("Cycle (ms)", &tx_cycle_ms_, 10, 100);
     tx_cycle_ms_ = std::max(0, tx_cycle_ms_);
     ImGui::SameLine();
@@ -685,8 +689,7 @@ void AppUI::RenderTransmitWindow(double now_ms) {
     tx_auto_inc_byte_ = std::clamp(tx_auto_inc_byte_, -1, 63);
     ImGui::PopItemWidth();
 
-    // --- Row 4: Action Buttons ---
-    if (ImGui::Button("Single Send / Burst", ImVec2(170, 28))) {
+    if (ImGui::Button("Single Send / Burst", ImVec2(165, 26))) {
         CanMessage msg = BuildComposerMessage();
         for (int i = 0; i < tx_burst_count_; ++i) {
             TransmitSingleMessage(msg, (i == 0), tx_cycle_ms_, tx_comment_);
@@ -696,7 +699,7 @@ void AppUI::RenderTransmitWindow(double now_ms) {
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Add to Periodic Transmit List", ImVec2(220, 28))) {
+    if (ImGui::Button("Add to Periodic Transmit List", ImVec2(215, 26))) {
         PeriodicTxJob job;
         job.enabled = true;
         job.msg = BuildComposerMessage();
@@ -707,11 +710,10 @@ void AppUI::RenderTransmitWindow(double now_ms) {
         job.comment = tx_comment_;
         periodic_jobs_.push_back(job);
 
-        // Also record in Sent History for later reference
         TransmitSingleMessage(job.msg, true, job.cycle_ms, job.comment);
     }
 
-    ImGui::SeparatorText("Active Periodic Transmit Jobs (PCAN-View Transmit List)");
+    ImGui::SeparatorText("Active Periodic Transmit Jobs");
 
     const ImGuiTableFlags flags =
         ImGuiTableFlags_Borders |
@@ -777,16 +779,17 @@ void AppUI::RenderTransmitWindow(double now_ms) {
 // ============================================================================
 // Window 5: Sent Messages History (Select, Load to Composer, or Quick Resend)
 // ============================================================================
-void AppUI::RenderSentHistoryWindow() {
-    ImGui::SetNextWindowPos(ImVec2(10, 750), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(1250, 220), ImGuiCond_FirstUseEver);
+void AppUI::RenderSentHistoryWindow(float x, float y, float w, float h) {
+    ImGuiCond cond = auto_tile_layout_ ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
+    ImGui::SetNextWindowPos(ImVec2(x, y), cond);
+    ImGui::SetNextWindowSize(ImVec2(w, h), cond);
 
     if (!ImGui::Begin("5. Sent Messages History (Select & Resend)", &show_history_window_)) {
         ImGui::End();
         return;
     }
 
-    ImGui::Text("History Entries: %zu (Click 'Load' to edit in Transmit Composer, or 'Resend' for immediate transmission)", tx_history_.size());
+    ImGui::Text("History Entries: %zu (Click 'Load' to edit in Composer, or 'Resend' for immediate transmission)", tx_history_.size());
     ImGui::SameLine(ImGui::GetWindowWidth() - 120);
     if (ImGui::SmallButton("Clear History")) {
         tx_history_.clear();
@@ -863,21 +866,40 @@ void AppUI::RenderSentHistoryWindow() {
 }
 
 // ============================================================================
-// Main Workspace Render Entry Point
+// Main Workspace Render Entry Point (Dynamic Full-Viewport Responsive Layout)
 // ============================================================================
 void AppUI::Render() {
-    double now_ms = static_cast<double>(SDL_GetTicks64()) - start_time_ms_;
+    double now_ms = GetNowMs();
 
     // 1. Execute periodic CAN transmissions scheduled by user
     ProcessPeriodicJobs(now_ms);
 
-    // 2. Render Top Menu Bar
-    RenderMenuBar();
+    // 2. Render Top Menu Bar and get its height
+    float menu_h = RenderMenuBar();
 
-    // 3. Render Independent PCAN-View Style Windows
-    if (show_hw_window_)       RenderHardwareSetupWindow();
-    if (show_id_table_window_) RenderIdTableWindow(now_ms);
-    if (show_trace_window_)    RenderTraceWindow();
-    if (show_tx_window_)       RenderTransmitWindow(now_ms);
-    if (show_history_window_)  RenderSentHistoryWindow();
+    // 3. Calculate responsive tiling coordinates from current browser viewport size
+    ImVec2 display_size = ImGui::GetIO().DisplaySize;
+    float pad = 4.0f;
+    float usable_w = std::max(600.0f, display_size.x - pad * 3.0f);
+    float usable_h = std::max(450.0f, display_size.y - menu_h - pad * 4.0f);
+
+    float left_w  = std::floor(usable_w * 0.44f);
+    float right_w = usable_w - left_w;
+
+    float row1_h  = std::floor(usable_h * 0.38f);
+    float row2_h  = std::floor(usable_h * 0.39f);
+    float row3_h  = usable_h - row1_h - row2_h;
+
+    float y1 = menu_h + pad;
+    float y2 = y1 + row1_h + pad;
+    float y3 = y2 + row2_h + pad;
+    float x_left  = pad;
+    float x_right = pad * 2.0f + left_w;
+
+    // 4. Render Independent PCAN-View Style Windows
+    if (show_hw_window_)       RenderHardwareSetupWindow(x_left, y1, left_w, row1_h);
+    if (show_id_table_window_) RenderIdTableWindow(now_ms, x_right, y1, right_w, row1_h);
+    if (show_tx_window_)       RenderTransmitWindow(now_ms, x_left, y2, left_w, row2_h);
+    if (show_trace_window_)    RenderTraceWindow(x_right, y2, right_w, row2_h);
+    if (show_history_window_)  RenderSentHistoryWindow(x_left, y3, usable_w + pad, row3_h);
 }
