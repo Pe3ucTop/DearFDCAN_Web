@@ -1,7 +1,8 @@
 # Build driver for DearFDCAN_Web (Emscripten).
 #
-#   make                     single-file build  -> build/single/index.html          (deploy this file alone)
-#   make MODE=multi          multi-file build   -> build/multi/index.html index.js index.wasm
+#   make                     single-file build  -> build/single/index.html, copied to docs/index.html
+#                                                  (docs/ is the GitHub Pages folder: commit it and publish it)
+#   make MODE=multi         multi-file build   -> build/multi/index.html index.js index.wasm
 #                                                  usb_worker.js can_core.js can_core.wasm
 #   make serve               serve the result of the selected MODE on http://localhost:8000/
 #   make clean               remove the whole build directory
@@ -10,6 +11,7 @@
 # Variables (command line or environment):
 #   MODE        single | multi                    (default: single)
 #   BUILD       build directory                   (default: build)
+#   DOCS        GitHub Pages directory            (default: docs; the single build is published there)
 #   IMGUI_DIR   Dear ImGui source directory       (default: /Src_Libs/imgui)
 #   OPT         optimization flag                 (default: -O2; use -O0 -g for debugging)
 #   EMSDK_EXEC  wrapper that sets up the SDK      (default: ./emsdk-exec.sh)
@@ -20,6 +22,7 @@
 
 MODE       ?= single
 BUILD      ?= build
+DOCS       ?= docs
 IMGUI_DIR  ?= /Src_Libs/imgui
 OPT        ?= -O2
 EMSDK_EXEC ?= $(CURDIR)/emsdk-exec.sh
@@ -75,7 +78,7 @@ CORE_JS    := $(TMP)/can_core.js
 BUNDLE     := $(TMP)/usb_worker_bundle.js
 PRE_JS     := --pre-js $(BUNDLE)
 PAGE_DEPS  := $(BUNDLE)
-ARTIFACTS  := $(OUT)/index.html
+ARTIFACTS  := $(OUT)/index.html $(DOCS)/index.html $(DOCS)/.nojekyll
 else
 CORE_JS    := $(OUT)/can_core.js
 BUNDLE     :=
@@ -132,12 +135,24 @@ $(OUT)/index.html: $(PAGE_OBJS) $(PAGE_DEPS)
 	@mkdir -p $(@D)
 	$(CXX) $(PAGE_OBJS) -o $@ $(PAGE_LDFLAGS) $(SINGLE_FLAG) $(PRE_JS)
 
+# --- GitHub Pages: the single-file page is published as docs/index.html (single mode only) ---
+ifeq ($(MODE),single)
+$(DOCS)/index.html: $(OUT)/index.html
+	@mkdir -p $(@D)
+	cp $< $@
+
+# Tells GitHub Pages to serve the folder as is (no Jekyll processing)
+$(DOCS)/.nojekyll:
+	@mkdir -p $(@D)
+	touch $@
+endif
+
 serve:
 	@echo "Serving $(OUT) on http://localhost:$(PORT)/ (Ctrl+C to stop)"
 	python3 -m http.server $(PORT) --bind 127.0.0.1 --directory $(OUT)
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD)    # docs/ is left alone: it is the published page
 
 help:
 	@sed -n '1,/^MODE /p' $(firstword $(MAKEFILE_LIST)) | sed -n '/^#/p' | sed 's/^# \{0,1\}//'

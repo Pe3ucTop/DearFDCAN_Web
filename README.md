@@ -73,7 +73,7 @@ driver is not bound to the device (unbind it, or use WinUSB/Zadig on Windows).
 ## Build
 
 ```sh
-make -j                        # single (default): build/single/index.html, one self-contained file
+make -j                        # single (default): build/single/index.html, one self-contained file, also copied to docs/index.html
 make -j MODE=multi             # build/multi/: index.html index.js index.wasm usb_worker.js can_core.js can_core.wasm
 make serve                     # serve the selected mode on http://localhost:8000/
 make clean                     # remove build/
@@ -85,6 +85,10 @@ make help                      # all variables
 `single` builds the CAN core with `-sSINGLE_FILE`, packs its glue together with `usb_worker.js` into a string
 (`pack_worker.py`) and embeds that into the page, which starts the worker from a Blob URL. Deploy `index.html` alone.
 `multi` keeps the worker as a separate file; deploy all six files from one directory.
+
+**GitHub Pages.** The single build is copied to `docs/index.html` (plus an empty `docs/.nojekyll`), the folder GitHub Pages serves.
+Build, commit `docs/` and in the repository settings choose *Pages → Deploy from a branch → `main` / `/docs`*; the page is then available
+over HTTPS, which WebUSB requires. `make clean` does not touch `docs/` (override the folder with `make DOCS=...`).
 
 Layout of the build directory: `build/<mode>/` holds the results, `build/obj/` the compiled objects (shared by both modes, so
 Dear ImGui is compiled only once and a changed source recompiles just itself), `build/tmp/<mode>/` intermediates.

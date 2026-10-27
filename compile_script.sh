@@ -3,7 +3,8 @@
 # Usage: ./compile_script.sh [single|multi]      (default: single)
 #
 # Thin wrapper around the Makefile (the build logic lives there): same as `make -jN MODE=<mode>`.
-# The result goes to build/<mode>/ (single: build/single/index.html is the only file to deploy;
+# The result goes to build/<mode>/ (single: build/single/index.html is the only file to deploy, and it is
+# also copied to docs/index.html, the GitHub Pages folder;
 # multi: index.html index.js index.wasm usb_worker.js can_core.js can_core.wasm together).
 #
 # Requires make, python3, the Emscripten SDK (set up by ./emsdk-exec.sh) and Dear ImGui sources
