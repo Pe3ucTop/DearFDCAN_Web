@@ -44,7 +44,8 @@ driver or native application needed.
 | What | Tested with |
 |---|---|
 | Emscripten SDK | 6.0.10 (`emsdk-exec.sh` sources `/opt/Emscripten_SDK/emsdk_env.sh`, adjust the path for your machine) |
-| Dear ImGui | 1.93.0, sources in `IMGUI_DIR` (default `/Src_Libs/imgui` in `compile_script.sh`) |
+| Dear ImGui | 1.93.0, sources in `IMGUI_DIR` (default `/Src_Libs/imgui`, see `Makefile`) |
+| GNU make | 4.3 |
 | Python 3 | 3.12 (standard library only, used by `pack_worker.py`) |
 | Browser | Chromium-based (Chrome/Edge) with WebUSB, served over `https://` or `http://localhost` |
 | Adapter | GS-USB compatible firmware (candleLight FD style); hardware timestamps need the `HW_TIMESTAMP` feature |
@@ -54,19 +55,25 @@ On Linux the adapter usually needs a udev rule that grants your user access to t
 ## Build
 
 ```sh
-./compile_script.sh            # single (default): one self-contained index.html
-./compile_script.sh multi      # index.html + index.js + index.wasm + usb_worker.js + can_core.js + can_core.wasm
+make -j                        # single (default): build/single/index.html, one self-contained file
+make -j MODE=multi             # build/multi/: index.html index.js index.wasm usb_worker.js can_core.js can_core.wasm
+make serve                     # serve the selected mode on http://localhost:8000/
+make clean                     # remove build/
+make help                      # all variables
 ```
+
+`./compile_script.sh [single|multi]` is a thin wrapper for the same (`make -j MODE=...`). Both modes can coexist.
 
 `single` builds the CAN core with `-sSINGLE_FILE`, packs its glue together with `usb_worker.js` into a string
 (`pack_worker.py`) and embeds that into the page, which starts the worker from a Blob URL. Deploy `index.html` alone.
 `multi` keeps the worker as a separate file; deploy all six files from one directory.
 
-Serve the result over HTTPS or `http://localhost` (WebUSB needs a secure context), for example:
+Layout of the build directory: `build/<mode>/` holds the results, `build/obj/` the compiled objects (shared by both modes, so
+Dear ImGui is compiled only once and a changed source recompiles just itself), `build/tmp/<mode>/` intermediates.
+The page and the core are built with `-O2`; override with `make OPT="-O0 -g"` for debugging. `IMGUI_DIR`, `BUILD` and `EMSDK_EXEC` can be set the same way.
 
-```sh
-python3 -m http.server 8000     # then open http://localhost:8000/
-```
+Serve the result over HTTPS or `http://localhost` (WebUSB needs a secure context), for example with `make serve`
+(or `python3 -m http.server 8000` inside the output directory).
 
 Do not rely on `file://`. If the page has a Content-Security-Policy, it must allow `worker-src blob:` for the single-file build.
 
@@ -100,20 +107,29 @@ Defaults: 500 kbit/s at 87.5 % nominal, 2000 kbit/s at 75 % data. The bit rate i
 
 ## Source layout
 
+All sources and headers are in `src_inc/`:
+
 | File | Role |
 |---|---|
-| `main.cpp` | GLFW/ImGui setup, main loop, wiring of bridge callbacks |
-| `app_ui.cpp/.h` | All windows, channel start/stop, snapshot ingestion, URL parameters |
-| `url_params.h` | Parsing of the URL parameter values |
-| `webusb_bridge.cpp/.h` | Page side of the worker link (EM_JS), snapshot validation, transport statistics |
-| `usb_worker.js` | Worker: WebUSB I/O, RX slots, control/TX queues, watchdog, snapshot publishing |
-| `can_core.cpp` | Worker wasm module: frame parsing, ID table, trace queue, clock mapping |
-| `can_protocol.cpp/.h` | gs_usb structures, DLC helpers, bit-timing calculation, `CanMessage`/`CanPayload` |
-| `can_wire.h` | Snapshot format shared by the page and the worker core |
-| `pack_worker.py` | Packs the worker for the single-file build |
-| `compile_script.sh`, `emsdk-exec.sh` | Build driver and Emscripten environment wrapper |
+| `src_inc/main.cpp` | GLFW/ImGui setup, main loop, wiring of bridge callbacks |
+| `src_inc/app_ui.cpp/.h` | All windows, channel start/stop, snapshot ingestion, URL parameters |
+| `src_inc/url_params.h` | Parsing of the URL parameter values |
+| `src_inc/webusb_bridge.cpp/.h` | Page side of the worker link (EM_JS), snapshot validation, transport statistics |
+| `src_inc/usb_worker.js` | Worker: WebUSB I/O, RX slots, control/TX queues, watchdog, snapshot publishing |
+| `src_inc/can_core.cpp` | Worker wasm module: frame parsing, ID table, trace queue, clock mapping |
+| `src_inc/can_protocol.cpp/.h` | gs_usb structures, DLC helpers, bit-timing calculation, `CanMessage`/`CanPayload` |
+| `src_inc/can_wire.h` | Snapshot format shared by the page and the worker core |
 
-Tunables: `RX_SLOTS`, `TX_INFLIGHT`, `PUBLISH_MS`, `BATCH_CREDITS` at the top of `usb_worker.js`; table/trace limits at the top of `can_core.cpp`.
+Build tooling in the repository root:
+
+| File | Role |
+|---|---|
+| `Makefile` | Build driver (modes, object cache, `serve`, `clean`) |
+| `compile_script.sh` | Wrapper around `make` for `single` / `multi` |
+| `emsdk-exec.sh` | Sets up the Emscripten environment and runs a command (edit the SDK path for your machine) |
+| `pack_worker.py` | Packs the worker for the single-file build |
+
+Tunables: `RX_SLOTS`, `TX_INFLIGHT`, `PUBLISH_MS`, `BATCH_CREDITS` at the top of `src_inc/usb_worker.js`; table/trace limits at the top of `src_inc/can_core.cpp`.
 
 ## Known limitations
 
@@ -122,7 +138,7 @@ Tunables: `RX_SLOTS`, `TX_INFLIGHT`, `PUBLISH_MS`, `BATCH_CREDITS` at the top of
 - The adapter→page clock mapping is an estimate (lowest observed latency, 100 ppm drift allowance); cycle times use the raw adapter timestamps and are exact.
   Without hardware timestamps cycle times fall back to arrival times and show USB/browser jitter.
 - The ID table holds at most 65536 IDs, the page keeps 2000 trace rows.
-- The page itself is built without optimization flags (`-O2` is used only for the worker core).
+- The page wasm has Emscripten's default fixed 16 MB heap (no `ALLOW_MEMORY_GROWTH`); the ID table costs roughly 250 bytes per ID.
 - There is no automated test suite in the repository yet.
 
 ## Change history
@@ -170,8 +186,15 @@ under `/bin/sh` (dash); builds go through `emsdk-exec.sh`.
 **2026-10-27, repository cleanup.** Build outputs are ignored, the unused `CAN_ERR_FLAG` constant and the commented-out SDL/pthread
 experiments in the build script were removed, `compile_script.sh` usage text matches its name, this README was written.
 
+**2026-10-27, build layout.** Sources, headers and the worker moved to `src_inc/`. The build logic moved from the shell script into a
+`Makefile`: results go to `build/<mode>/`, compiled objects are cached in `build/obj` (Dear ImGui is compiled once; a change recompiles only the
+affected files, tracked through generated dependency files), `compile_script.sh` is a wrapper. The page is now compiled and linked with `-O2`
+(it used no optimization flags before); the single-file `index.html` shrank from about 1.7 MB to 0.87 MB. The `-O2` page could not be run in a
+browser in the environment it was built in; it was only checked statically (the optimized JS parses, the Blob-worker start, the snapshot call and the URL
+reader are present, every identifier used by the `EM_JS` bodies is still defined).
+
 What was and was not verified: the CAN core, frame parser and URL parsing were unit-tested natively (ASan/UBSan) and the worker was exercised
-against a mock `USBDevice` with the real core module in Node; the single-file Blob-Worker was confirmed on hardware. Throughput numbers
+against a mock `USBDevice` with the real core module in Node; the unoptimized single-file Blob-Worker was confirmed on hardware. Throughput numbers
 and the accuracy of hardware timestamps were not measured.
 
 ## License
