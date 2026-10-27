@@ -1,5 +1,8 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <type_traits>
 #include <vector>
 
 // gs_usb control request codes (bRequest)
@@ -79,23 +82,92 @@ struct CanTimingMetrics {
     double sample_point_pct; // Sample point position in %
 };
 
-// Structure representing a parsed CAN / CAN FD message
+// Fixed-capacity payload (CAN FD maximum is 64 bytes) with a std::vector-like surface.
+// It is trivially copyable, so frames can travel between the worker and page wasm modules by memcpy
+// and a frame never allocates on the heap.
+struct CanPayload {
+    static constexpr size_t kCapacity = 64;
+
+    CanPayload() = default;
+    CanPayload(const std::vector<uint8_t>& v) { assign(v.data(), v.data() + v.size()); }
+    CanPayload& operator=(const std::vector<uint8_t>& v) { assign(v.data(), v.data() + v.size()); return *this; }
+
+    size_t size() const { return len_; }
+    bool empty() const { return len_ == 0; }
+    void clear() { len_ = 0; }
+
+    uint8_t& operator[](size_t i) { return bytes_[i]; }
+    const uint8_t& operator[](size_t i) const { return bytes_[i]; }
+    uint8_t* data() { return bytes_; }
+    const uint8_t* data() const { return bytes_; }
+    const uint8_t* begin() const { return bytes_; }
+    const uint8_t* end() const { return bytes_ + len_; }
+
+    void assign(const uint8_t* first, const uint8_t* last) {
+        const size_t n = last > first ? static_cast<size_t>(last - first) : 0;
+        len_ = static_cast<uint8_t>(n < kCapacity ? n : kCapacity);
+        if (len_) std::memcpy(bytes_, first, len_);
+    }
+
+    void resize(size_t n, uint8_t fill = 0) {
+        if (n > kCapacity) n = kCapacity;
+        for (size_t i = len_; i < n; ++i) bytes_[i] = fill;
+        len_ = static_cast<uint8_t>(n);
+    }
+
+    bool operator==(const CanPayload& o) const { return len_ == o.len_ && (len_ == 0 || std::memcmp(bytes_, o.bytes_, len_) == 0); }
+    bool operator!=(const CanPayload& o) const { return !(*this == o); }
+
+private:
+    uint8_t bytes_[kCapacity] = {};
+    uint8_t len_ = 0;
+};
+
+// Structure representing a parsed CAN / CAN FD message (plain data: no heap, trivially copyable)
 struct CanMessage {
     uint32_t id = 0;
+    uint32_t hw_timestamp_us = 0;   // adapter clock, valid if has_hw_timestamp
+    double host_time_ms = 0.0;      // frame time in the page's performance.now() timeline (0 = unknown)
     bool is_extended = false;
     bool is_rtr = false;
     bool is_fd = false;
     bool is_brs = false;
     bool is_esi = false;
     bool is_tx_echo = false;
+    bool has_hw_timestamp = false;
     uint8_t dlc = 0;
-    uint32_t hw_timestamp_us = 0;
-    std::vector<uint8_t> payload;
+    CanPayload payload;
 };
+
+// Aggregated entry for the "Table by ID" window (PCAN-View Receive Table style)
+struct IdTableEntry {
+    CanMessage last_msg;
+    CanPayload prev_payload;
+    uint64_t count = 0;
+    double last_rx_time_ms = 0.0;
+    double cycle_time_ms = 0.0;
+    double min_cycle_ms = 0.0;
+    double max_cycle_ms = 0.0;
+};
+
+// Chronological trace entry for the Linear Receive window
+struct TraceEntry {
+    double timestamp_sec = 0.0;
+    CanMessage msg;
+};
+
+static_assert(std::is_trivially_copyable<CanPayload>::value, "CanPayload must be memcpy-able");
+static_assert(std::is_trivially_copyable<CanMessage>::value, "CanMessage must be memcpy-able");
+static_assert(std::is_trivially_copyable<IdTableEntry>::value, "IdTableEntry must be memcpy-able");
+static_assert(std::is_trivially_copyable<TraceEntry>::value, "TraceEntry must be memcpy-able");
 
 class CanProtocolHandler {
 public:
+    // Parses one bulk IN transfer. gs_usb normally delivers exactly one frame per transfer; if the
+    // buffer holds several equally sized frames they are all returned.
     std::vector<CanMessage> ParseRxBuffer(const uint8_t* buffer, int length);
+    // Same, appending to `out` (lets a caller reuse one vector and avoid per-transfer allocations)
+    void ParseRxBuffer(const uint8_t* buffer, int length, std::vector<CanMessage>& out);
     std::vector<uint8_t> BuildTxBuffer(const CanMessage& msg);
 
     static CanTimingMetrics ComputeTimingMetrics(uint32_t fclk_hz, const GsDeviceBittiming& bt);

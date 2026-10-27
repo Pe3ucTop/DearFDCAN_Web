@@ -2,6 +2,7 @@
 #include "webusb_bridge.h"
 #include "imgui.h"
 #include <GLFW/glfw3.h>
+#include <emscripten.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -114,6 +115,7 @@ static int ThreeWayCompare(const T& a, const T& b) {
 AppUI::AppUI()
     : is_connected_(false),
       is_channel_open_(false),
+      channel_opening_(false),
       device_name_("No Device"),
       start_time_ms_(glfwGetTime() * 1000.0),
       auto_tile_layout_(true),
@@ -170,6 +172,7 @@ double AppUI::GetNowMs() const {
 void AppUI::OnDeviceConnected(const std::string& name) {
     is_connected_ = true;
     is_channel_open_ = false;
+    channel_opening_ = false;
     device_name_ = name.empty() ? "WebUSB CAN Adapter" : name;
 
     // Query bit-timing constants from EP0
@@ -179,6 +182,7 @@ void AppUI::OnDeviceConnected(const std::string& name) {
 void AppUI::OnDeviceDisconnected() {
     is_connected_ = false;
     is_channel_open_ = false;
+    channel_opening_ = false;
     device_name_ = "Disconnected";
 }
 
@@ -192,8 +196,28 @@ void AppUI::OnControlDataReceived(uint8_t request, const uint8_t* data, int leng
     }
 }
 
+// Control OUT results arrive in submission order. The channel counts as open only after the
+// MODE_START request was acknowledged; any failure of the start sequence rolls it back.
+void AppUI::OnControlOutDone(uint8_t request, bool ok) {
+    if (!channel_opening_) return;
+    if (!ok) {
+        // Firmware may legitimately reject HOST_FORMAT (it is optional); everything else is fatal
+        if (request != GS_USB_BREQ_HOST_FORMAT) StopCanChannel();
+        return;
+    }
+    if (request == GS_USB_BREQ_MODE) {
+        channel_opening_ = false;
+        is_channel_open_ = true;
+    }
+}
+
 void AppUI::OnCanMessageReceived(const CanMessage& msg) {
+    // Use the time the USB transfer completed in the worker instead of the (batched, frame-delayed)
+    // delivery time, so cycle times keep their accuracy
     double now_ms = GetNowMs();
+    if (msg.host_time_ms > 0.0) {
+        now_ms -= std::max(0.0, emscripten_get_now() - msg.host_time_ms);
+    }
 
     // 1. Update Linear Receive Trace (if not paused)
     if (!trace_paused_) {
@@ -235,6 +259,7 @@ void AppUI::OnCanMessageReceived(const CanMessage& msg) {
 }
 
 void AppUI::StartCanChannel() {
+    if (channel_opening_ || is_channel_open_) return;
     auto& usb = WebUsbBridge::GetInstance();
 
     uint32_t host_format = 0x0000BEEFU;
@@ -255,7 +280,7 @@ void AppUI::StartCanChannel() {
     usb.ControlTransferOut(GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd));
 
     usb.StartRxPump(0x81, 512);
-    is_channel_open_ = true;
+    channel_opening_ = true;   // is_channel_open_ is set when MODE_START is acknowledged
 }
 
 void AppUI::StopCanChannel() {
@@ -264,6 +289,7 @@ void AppUI::StopCanChannel() {
 
     GsDeviceMode mode_cmd = {GS_CAN_MODE_RESET, 0};
     usb.ControlTransferOut(GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd));
+    channel_opening_ = false;
     is_channel_open_ = false;
 }
 
@@ -393,6 +419,10 @@ float AppUI::RenderMenuBar() {
         if (is_connected_) {
             ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.4f, 1.0f), "USB: %s (%s)",
                                device_name_.c_str(), is_channel_open_ ? "BUS ON" : "BUS OFF");
+            const UsbStats& us = WebUsbBridge::GetInstance().GetStats();
+            ImGui::Separator();
+            ImGui::TextDisabled("RX %u/s  drop %u  gaps %u  TX drop %u  recov %u",
+                                us.rx_per_sec, us.rx_dropped, us.batch_gaps, us.tx_dropped, us.recoveries);
         } else {
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "USB: Disconnected");
         }

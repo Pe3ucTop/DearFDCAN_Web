@@ -156,10 +156,15 @@ int main(int, char**) {
         g_AppUI.OnControlDataReceived(request, data, length);
     });
 
-    webusb.SetOnDataReceived([](int ep, const uint8_t* data, int length) {
+    webusb.SetOnControlOutDone([](uint8_t request, bool ok) {
+        g_AppUI.OnControlOutDone(request, ok);
+    });
+
+    webusb.SetOnDataReceived([](int ep, const uint8_t* data, int length, double host_time_ms) {
         if (ep == 0x81) {
             auto messages = g_Protocol.ParseRxBuffer(data, length);
-            for (const auto& msg : messages) {
+            for (auto& msg : messages) {
+                msg.host_time_ms = host_time_ms;
                 g_AppUI.OnCanMessageReceived(msg);
             }
         }

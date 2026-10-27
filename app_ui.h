@@ -54,6 +54,7 @@ public:
     void OnDeviceDisconnected();
     void OnCanMessageReceived(const CanMessage& msg);
     void OnControlDataReceived(uint8_t request, const uint8_t* data, int length);
+    void OnControlOutDone(uint8_t request, bool ok);
 
 private:
     void StartCanChannel();
@@ -79,6 +80,7 @@ private:
     // Connection and channel states
     bool is_connected_;
     bool is_channel_open_;
+    bool channel_opening_;   // control sequence sent, waiting for the MODE_START acknowledgement
     std::string device_name_;
     double start_time_ms_;
 

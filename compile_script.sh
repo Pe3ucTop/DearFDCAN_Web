@@ -1,27 +1,30 @@
 #!/bin/sh
 #
 
-IMGUI_DIR="../../DearImGUI/imgui-1.92.7"
-# LIBUSB_DIR="../libusb/out"
+IMGUI_DIR="/Src_Libs/imgui"
 
-em++ main.cpp webusb_bridge.cpp can_protocol.cpp app_ui.cpp \
-  ./$IMGUI_DIR/imgui.cpp \
-  ./$IMGUI_DIR/imgui_draw.cpp \
-  ./$IMGUI_DIR/imgui_tables.cpp \
-  ./$IMGUI_DIR/imgui_widgets.cpp \
-  ./$IMGUI_DIR/backends/imgui_impl_glfw.cpp \
-  ./$IMGUI_DIR/backends/imgui_impl_opengl3.cpp \
-  -I./$IMGUI_DIR \
-  -I./$IMGUI_DIR/backends \
+# emsdk-exec.sh sources the Emscripten SDK environment and runs the given command
+./emsdk-exec.sh em++ main.cpp webusb_bridge.cpp can_protocol.cpp app_ui.cpp \
+  $IMGUI_DIR/imgui.cpp \
+  $IMGUI_DIR/imgui_draw.cpp \
+  $IMGUI_DIR/imgui_tables.cpp \
+  $IMGUI_DIR/imgui_widgets.cpp \
+  $IMGUI_DIR/backends/imgui_impl_glfw.cpp \
+  $IMGUI_DIR/backends/imgui_impl_opengl3.cpp \
+  -I$IMGUI_DIR \
+  -I$IMGUI_DIR/backends \
   -sUSE_GLFW=3 \
   -sMIN_WEBGL_VERSION=2 \
   -sMAX_WEBGL_VERSION=2 \
   -sEXPORTED_RUNTIME_METHODS='["stringToUTF8","lengthBytesUTF8"]' \
-  -sEXPORTED_FUNCTIONS='["_main","_malloc","_free","_webusb_cb_connected","_webusb_cb_disconnected","_webusb_cb_rx","_webusb_cb_ctrl_in"]' \
+  -sEXPORTED_FUNCTIONS='["_main","_malloc","_free","_webusb_cb_connected","_webusb_cb_disconnected","_webusb_cb_rx_batch","_webusb_cb_ctrl_in","_webusb_cb_ctrl_ack","_webusb_cb_stats"]' \
   -o index.html
 
+# USB I/O runs in a dedicated Worker: usb_worker.js must be served next to index.html.
+# No pthreads / SharedArrayBuffer are used, so no COOP/COEP headers are required.
 
-# ./$IMGUI_DIR/backends/imgui_impl_sdl2.cpp \
+
+# $IMGUI_DIR/backends/imgui_impl_sdl2.cpp \
 # -sUSE_SDL=2 \
 
 #emcc main.cpp webusb_bridge.cpp can_protocol.cpp app_ui.cpp \
@@ -54,14 +57,14 @@ em++ main.cpp webusb_bridge.cpp can_protocol.cpp app_ui.cpp \
 #-sEXPORTED_FUNCTIONS='["_main","_malloc","_free", "_webusb_cb_connected", "_webusb_cb_disconnected", "_webusb_cb_rx"]' \
 
 #em++ WebUSB_Esmcripten_ImGUI__4_Elmue.cpp \
-#  ./$IMGUI_DIR/imgui.cpp \
-#  ./$IMGUI_DIR/imgui_draw.cpp \
-#  ./$IMGUI_DIR/imgui_tables.cpp \
-#  ./$IMGUI_DIR/imgui_widgets.cpp \
-#  ./$IMGUI_DIR/backends/imgui_impl_sdl2.cpp \
-#  ./$IMGUI_DIR/backends/imgui_impl_opengl3.cpp \
-#  -I./$IMGUI_DIR \
-#  -I./$IMGUI_DIR/backends \
+#  $IMGUI_DIR/imgui.cpp \
+#  $IMGUI_DIR/imgui_draw.cpp \
+#  $IMGUI_DIR/imgui_tables.cpp \
+#  $IMGUI_DIR/imgui_widgets.cpp \
+#  $IMGUI_DIR/backends/imgui_impl_sdl2.cpp \
+#  $IMGUI_DIR/backends/imgui_impl_opengl3.cpp \
+#  -I$IMGUI_DIR \
+#  -I$IMGUI_DIR/backends \
 #  -sUSE_SDL=2 \
 #  -sMIN_WEBGL_VERSION=2 \
 #  -sMAX_WEBGL_VERSION=2 \

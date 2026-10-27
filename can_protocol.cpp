@@ -85,10 +85,8 @@ bool CanProtocolHandler::AutoCalculateBittiming(uint32_t fclk_hz, uint32_t targe
     return true;
 }
 
-std::vector<CanMessage> CanProtocolHandler::ParseRxBuffer(const uint8_t* buffer, int length) {
-    std::vector<CanMessage> messages;
-    if (length < 20) return messages;
-
+// Parses exactly one gs_host_frame occupying `length` bytes (optionally followed by a timestamp)
+static CanMessage ParseSingleFrame(const uint8_t* buffer, int length) {
     const GsHostFrame* frame = reinterpret_cast<const GsHostFrame*>(buffer);
 
     CanMessage msg;
@@ -101,7 +99,7 @@ std::vector<CanMessage> CanProtocolHandler::ParseRxBuffer(const uint8_t* buffer,
     msg.is_esi      = (frame->flags & GS_CAN_FLAG_ESI) != 0;
     msg.dlc         = frame->can_dlc & 0x0F;
 
-    uint8_t data_len = msg.is_fd ? DlcToBytes(msg.dlc) : std::min<uint8_t>(msg.dlc, 8);
+    uint8_t data_len = msg.is_fd ? CanProtocolHandler::DlcToBytes(msg.dlc) : std::min<uint8_t>(msg.dlc, 8);
     if (!msg.is_rtr) {
         msg.payload.assign(frame->data, frame->data + data_len);
     }
@@ -109,17 +107,46 @@ std::vector<CanMessage> CanProtocolHandler::ParseRxBuffer(const uint8_t* buffer,
     // Extract hardware timestamp if present (offset 20 for Classic CAN, offset 76 for CAN FD)
     if (length == 24) {
         std::memcpy(&msg.hw_timestamp_us, buffer + 20, sizeof(uint32_t));
+        msg.has_hw_timestamp = true;
     } else if (length >= 80) {
         std::memcpy(&msg.hw_timestamp_us, buffer + 76, sizeof(uint32_t));
+        msg.has_hw_timestamp = true;
+    }
+    return msg;
+}
+
+std::vector<CanMessage> CanProtocolHandler::ParseRxBuffer(const uint8_t* buffer, int length) {
+    std::vector<CanMessage> messages;
+    ParseRxBuffer(buffer, length, messages);
+    return messages;
+}
+
+void CanProtocolHandler::ParseRxBuffer(const uint8_t* buffer, int length, std::vector<CanMessage>& out) {
+    if (length < 20) return;
+
+    // Frame sizes: Classic 20 (+4 timestamp), FD 76 (+4 timestamp). A transfer of one of these exact
+    // sizes is a single frame (this is what gs_usb firmware sends). Anything else is split into
+    // equal frames only if the stride is unambiguous; otherwise the first frame is parsed as before.
+    int stride = length;
+    if (length != 20 && length != 24 && length != 76 && length != 80) {
+        const int base = (buffer[10] & GS_CAN_FLAG_FD) ? 76 : 20;
+        const bool with_ts    = (length % (base + 4)) == 0;
+        const bool without_ts = (length % base) == 0;
+        if (with_ts != without_ts) stride = with_ts ? base + 4 : base;
     }
 
-    messages.push_back(msg);
-    return messages;
+    for (int off = 0; off + stride <= length; off += stride) {
+        out.push_back(ParseSingleFrame(buffer + off, stride));
+    }
 }
 
 std::vector<uint8_t> CanProtocolHandler::BuildTxBuffer(const CanMessage& msg) {
     GsHostFrame frame = {0};
-    frame.echo_id = 0; // Request TX echo from adapter
+    // Unique echo id per frame (0xFFFFFFFF is reserved for received frames) so the TX echo
+    // returned by the adapter can be matched with the request
+    static uint32_t next_echo_id = 0;
+    frame.echo_id = next_echo_id++;
+    if (next_echo_id == 0xFFFFFFFFU) next_echo_id = 0;
 
     frame.can_id = msg.id & (msg.is_extended ? CAN_EFF_MASK : CAN_SFF_MASK);
     if (msg.is_extended) frame.can_id |= CAN_EFF_FLAG;
