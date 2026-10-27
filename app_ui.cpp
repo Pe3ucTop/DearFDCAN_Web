@@ -8,6 +8,44 @@
 #include <algorithm>
 #include <cmath>
 
+// Column User IDs for ImGui table sorting specifications
+enum IdTableColumnId : ImGuiID {
+    ID_COL_CAN_ID = 1,
+    ID_COL_TYPE,
+    ID_COL_LENGTH,
+    ID_COL_COUNT,
+    ID_COL_CYCLE,
+    ID_COL_DATA
+};
+
+enum TraceTableColumnId : ImGuiID {
+    TRACE_COL_TIME = 1,
+    TRACE_COL_DIR,
+    TRACE_COL_CAN_ID,
+    TRACE_COL_FORMAT,
+    TRACE_COL_DLC,
+    TRACE_COL_DATA
+};
+
+enum PeriodicTableColumnId : ImGuiID {
+    JOB_COL_ENABLED = 1,
+    JOB_COL_CAN_ID,
+    JOB_COL_CYCLE,
+    JOB_COL_SENT,
+    JOB_COL_DATA,
+    JOB_COL_ACTIONS
+};
+
+enum HistoryTableColumnId : ImGuiID {
+    HIST_COL_LAST_SENT = 1,
+    HIST_COL_CAN_ID,
+    HIST_COL_FORMAT,
+    HIST_COL_DLC,
+    HIST_COL_COUNT,
+    HIST_COL_DATA,
+    HIST_COL_OPS
+};
+
 // Helper: Parse space-separated hexadecimal string into byte array
 static std::vector<uint8_t> ParseHexPayload(const char* hex_str, size_t max_len) {
     std::vector<uint8_t> result;
@@ -41,6 +79,36 @@ static std::string FormatHexPayload(const std::vector<uint8_t>& data) {
 // Helper: Build unique 64-bit lookup key for ID Table (combines 29-bit/11-bit ID and EXT flag)
 static uint64_t MakeCanIdKey(uint32_t id, bool is_extended) {
     return (static_cast<uint64_t>(is_extended ? 1 : 0) << 32) | static_cast<uint64_t>(id);
+}
+
+// Helper: Compute an integer rank for CAN frame format flags to allow sorting by frame type
+static int GetFrameFormatRank(const CanMessage& m) {
+    int rank = 0;
+    if (m.is_extended) rank |= (1 << 0);
+    if (m.is_fd)       rank |= (1 << 1);
+    if (m.is_brs)      rank |= (1 << 2);
+    if (m.is_rtr)      rank |= (1 << 3);
+    return rank;
+}
+
+// Helper: Compare two byte vectors lexicographically (-1 if a < b, 1 if a > b, 0 if equal)
+static int ComparePayloads(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    size_t min_len = std::min(a.size(), b.size());
+    if (min_len > 0) {
+        int cmp = std::memcmp(a.data(), b.data(), min_len);
+        if (cmp != 0) return (cmp < 0) ? -1 : 1;
+    }
+    if (a.size() < b.size()) return -1;
+    if (a.size() > b.size()) return 1;
+    return 0;
+}
+
+// Generic three-way comparison helper returning -1, 0, or +1
+template <typename T>
+static int ThreeWayCompare(const T& a, const T& b) {
+    if (a < b) return -1;
+    if (b < a) return 1;
+    return 0;
 }
 
 AppUI::AppUI()
@@ -448,7 +516,7 @@ void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
 }
 
 // ============================================================================
-// Window 2: Receive Monitor Table Grouped by ID (PCAN-View Receive Table)
+// Window 2: Receive Monitor Table Grouped by ID (Indirect Sorting via Pointers)
 // ============================================================================
 void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float h) {
     ImGuiCond cond = auto_tile_layout_ ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
@@ -460,7 +528,7 @@ void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float 
         return;
     }
 
-    ImGui::Text("Unique CAN IDs: %zu", id_table_.size());
+    ImGui::Text("Unique CAN IDs: %zu (Click column headers to sort)", id_table_.size());
     ImGui::SameLine(ImGui::GetWindowWidth() - 110);
     if (ImGui::SmallButton("Reset Table")) {
         id_table_.clear();
@@ -471,20 +539,67 @@ void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float 
         ImGuiTableFlags_RowBg |
         ImGuiTableFlags_ScrollY |
         ImGuiTableFlags_Resizable |
+        ImGuiTableFlags_Sortable |
         ImGuiTableFlags_SizingStretchProp;
 
     if (ImGui::BeginTable("IdMonitorTable", 6, flags)) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("CAN ID", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 95.0f);
-        ImGui::TableSetupColumn("Length", ImGuiTableColumnFlags_WidthFixed, 65.0f);
-        ImGui::TableSetupColumn("Count", ImGuiTableColumnFlags_WidthFixed, 65.0f);
-        ImGui::TableSetupColumn("Cycle Time (ms)", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-        ImGui::TableSetupColumn("Data (Changed bytes highlighted)", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("CAN ID",          ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthFixed, 90.0f,  ID_COL_CAN_ID);
+        ImGui::TableSetupColumn("Type",            ImGuiTableColumnFlags_WidthFixed,                                     95.0f,  ID_COL_TYPE);
+        ImGui::TableSetupColumn("Length",          ImGuiTableColumnFlags_WidthFixed,                                     65.0f,  ID_COL_LENGTH);
+        ImGui::TableSetupColumn("Count",           ImGuiTableColumnFlags_WidthFixed,                                     65.0f,  ID_COL_COUNT);
+        ImGui::TableSetupColumn("Cycle Time (ms)", ImGuiTableColumnFlags_WidthFixed,                                     110.0f, ID_COL_CYCLE);
+        ImGui::TableSetupColumn("Data (HEX)",      ImGuiTableColumnFlags_WidthStretch,                                   0.0f,   ID_COL_DATA);
         ImGui::TableHeadersRow();
 
+        // Build indirect pointer view over std::map entries to sort without mutating map keys or copying payloads
+        std::vector<const IdTableEntry*> sorted_rows;
+        sorted_rows.reserve(id_table_.size());
         for (const auto& kv : id_table_) {
-            const IdTableEntry& entry = kv.second;
+            sorted_rows.push_back(&kv.second);
+        }
+
+        if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs()) {
+            if (sort_specs->SpecsCount > 0 && sorted_rows.size() > 1) {
+                const ImGuiTableColumnSortSpecs& spec = sort_specs->Specs[0];
+                const bool ascending = (spec.SortDirection == ImGuiSortDirection_Ascending);
+
+                std::sort(sorted_rows.begin(), sorted_rows.end(), [&](const IdTableEntry* a, const IdTableEntry* b) {
+                    int cmp = 0;
+                    switch (spec.ColumnUserID) {
+                        case ID_COL_CAN_ID:
+                            cmp = ThreeWayCompare(a->last_msg.id, b->last_msg.id);
+                            break;
+                        case ID_COL_TYPE:
+                            cmp = ThreeWayCompare(GetFrameFormatRank(a->last_msg), GetFrameFormatRank(b->last_msg));
+                            break;
+                        case ID_COL_LENGTH:
+                            cmp = ThreeWayCompare(a->last_msg.dlc, b->last_msg.dlc);
+                            break;
+                        case ID_COL_COUNT:
+                            cmp = ThreeWayCompare(a->count, b->count);
+                            break;
+                        case ID_COL_CYCLE:
+                            cmp = ThreeWayCompare(a->cycle_time_ms, b->cycle_time_ms);
+                            break;
+                        case ID_COL_DATA:
+                            cmp = ComparePayloads(a->last_msg.payload, b->last_msg.payload);
+                            break;
+                        default:
+                            break;
+                    }
+                    // Fallback tie-breaker by CAN ID
+                    if (cmp == 0) {
+                        cmp = ThreeWayCompare(a->last_msg.id, b->last_msg.id);
+                    }
+                    return ascending ? (cmp < 0) : (cmp > 0);
+                });
+            }
+            sort_specs->SpecsDirty = false;
+        }
+
+        for (const IdTableEntry* entry_ptr : sorted_rows) {
+            const IdTableEntry& entry = *entry_ptr;
             const CanMessage& m = entry.last_msg;
 
             ImGui::TableNextRow();
@@ -541,7 +656,7 @@ void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float 
 }
 
 // ============================================================================
-// Window 3: Chronological Receive Trace (Linear Stream)
+// Window 3: Chronological Receive Trace (Indirect Sorting via Pointers)
 // ============================================================================
 void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
     ImGuiCond cond = auto_tile_layout_ ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
@@ -569,23 +684,75 @@ void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
         ImGuiTableFlags_Borders |
         ImGuiTableFlags_RowBg |
         ImGuiTableFlags_ScrollY |
+        ImGuiTableFlags_Sortable |
         ImGuiTableFlags_SizingStretchProp;
 
     if (ImGui::BeginTable("TraceStreamTable", 6, flags)) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Time (s)", ImGuiTableColumnFlags_WidthFixed, 75.0f);
-        ImGui::TableSetupColumn("Dir", ImGuiTableColumnFlags_WidthFixed, 55.0f);
-        ImGui::TableSetupColumn("CAN ID", ImGuiTableColumnFlags_WidthFixed, 85.0f);
-        ImGui::TableSetupColumn("Format", ImGuiTableColumnFlags_WidthFixed, 85.0f);
-        ImGui::TableSetupColumn("DLC", ImGuiTableColumnFlags_WidthFixed, 45.0f);
-        ImGui::TableSetupColumn("Data (HEX)", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Time (s)",   ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthFixed, 75.0f, TRACE_COL_TIME);
+        ImGui::TableSetupColumn("Dir",        ImGuiTableColumnFlags_WidthFixed,                                     55.0f, TRACE_COL_DIR);
+        ImGui::TableSetupColumn("CAN ID",     ImGuiTableColumnFlags_WidthFixed,                                     85.0f, TRACE_COL_CAN_ID);
+        ImGui::TableSetupColumn("Format",     ImGuiTableColumnFlags_WidthFixed,                                     85.0f, TRACE_COL_FORMAT);
+        ImGui::TableSetupColumn("DLC",        ImGuiTableColumnFlags_WidthFixed,                                     45.0f, TRACE_COL_DLC);
+        ImGui::TableSetupColumn("Data (HEX)", ImGuiTableColumnFlags_WidthStretch,                                   0.0f,  TRACE_COL_DATA);
         ImGui::TableHeadersRow();
 
+        // Filter and collect pointers into std::deque without disturbing chronological ring buffer order
+        std::vector<const TraceEntry*> visible_trace;
+        visible_trace.reserve(rx_trace_.size());
         for (const auto& item : rx_trace_) {
-            const CanMessage& m = item.msg;
-            if (trace_filter_id_ >= 0 && static_cast<int>(m.id) != trace_filter_id_) {
+            if (trace_filter_id_ >= 0 && static_cast<int>(item.msg.id) != trace_filter_id_) {
                 continue;
             }
+            visible_trace.push_back(&item);
+        }
+
+        if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs()) {
+            if (sort_specs->SpecsCount > 0 && visible_trace.size() > 1) {
+                const ImGuiTableColumnSortSpecs& spec = sort_specs->Specs[0];
+                const bool ascending = (spec.SortDirection == ImGuiSortDirection_Ascending);
+
+                // Optimization:rx_trace_ is naturally sorted by timestamp ascending;
+                // only run std::sort if another column or descending order is requested
+                bool is_default_time_asc = (spec.ColumnUserID == TRACE_COL_TIME && ascending);
+                if (!is_default_time_asc) {
+                    std::sort(visible_trace.begin(), visible_trace.end(), [&](const TraceEntry* a, const TraceEntry* b) {
+                        int cmp = 0;
+                        switch (spec.ColumnUserID) {
+                            case TRACE_COL_TIME:
+                                cmp = ThreeWayCompare(a->timestamp_sec, b->timestamp_sec);
+                                break;
+                            case TRACE_COL_DIR:
+                                cmp = ThreeWayCompare(a->msg.is_tx_echo ? 1 : 0, b->msg.is_tx_echo ? 1 : 0);
+                                break;
+                            case TRACE_COL_CAN_ID:
+                                cmp = ThreeWayCompare(a->msg.id, b->msg.id);
+                                break;
+                            case TRACE_COL_FORMAT:
+                                cmp = ThreeWayCompare(GetFrameFormatRank(a->msg), GetFrameFormatRank(b->msg));
+                                break;
+                            case TRACE_COL_DLC:
+                                cmp = ThreeWayCompare(a->msg.dlc, b->msg.dlc);
+                                break;
+                            case TRACE_COL_DATA:
+                                cmp = ComparePayloads(a->msg.payload, b->msg.payload);
+                                break;
+                            default:
+                                break;
+                        }
+                        if (cmp == 0) {
+                            cmp = ThreeWayCompare(a->timestamp_sec, b->timestamp_sec);
+                        }
+                        return ascending ? (cmp < 0) : (cmp > 0);
+                    });
+                }
+            }
+            sort_specs->SpecsDirty = false;
+        }
+
+        for (const TraceEntry* item_ptr : visible_trace) {
+            const TraceEntry& item = *item_ptr;
+            const CanMessage& m = item.msg;
 
             ImGui::TableNextRow();
 
@@ -631,7 +798,7 @@ void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
 }
 
 // ============================================================================
-// Window 4: Dedicated Transmit Window & Active Periodic Jobs
+// Window 4: Dedicated Transmit Window & Active Periodic Jobs (Sortable)
 // ============================================================================
 void AppUI::RenderTransmitWindow(double now_ms, float x, float y, float w, float h) {
     ImGuiCond cond = auto_tile_layout_ ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
@@ -719,22 +886,64 @@ void AppUI::RenderTransmitWindow(double now_ms, float x, float y, float w, float
         ImGuiTableFlags_Borders |
         ImGuiTableFlags_RowBg |
         ImGuiTableFlags_ScrollY |
+        ImGuiTableFlags_Sortable |
         ImGuiTableFlags_SizingStretchProp;
 
     if (ImGui::BeginTable("PeriodicJobsTable", 6, flags)) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("On", ImGuiTableColumnFlags_WidthFixed, 30.0f);
-        ImGui::TableSetupColumn("ID", ImGuiTableColumnFlags_WidthFixed, 75.0f);
-        ImGui::TableSetupColumn("Cycle", ImGuiTableColumnFlags_WidthFixed, 65.0f);
-        ImGui::TableSetupColumn("Sent", ImGuiTableColumnFlags_WidthFixed, 55.0f);
-        ImGui::TableSetupColumn("Data (HEX)", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 105.0f);
+        ImGui::TableSetupColumn("On",         ImGuiTableColumnFlags_WidthFixed,                                     30.0f,  JOB_COL_ENABLED);
+        ImGui::TableSetupColumn("ID",         ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthFixed, 75.0f,  JOB_COL_CAN_ID);
+        ImGui::TableSetupColumn("Cycle",      ImGuiTableColumnFlags_WidthFixed,                                     65.0f,  JOB_COL_CYCLE);
+        ImGui::TableSetupColumn("Sent",       ImGuiTableColumnFlags_WidthFixed,                                     55.0f,  JOB_COL_SENT);
+        ImGui::TableSetupColumn("Data (HEX)", ImGuiTableColumnFlags_WidthStretch,                                   0.0f,   JOB_COL_DATA);
+        ImGui::TableSetupColumn("Actions",    ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthFixed,      105.0f, JOB_COL_ACTIONS);
         ImGui::TableHeadersRow();
 
-        int delete_idx = -1;
+        // Indirect index sorting over periodic_jobs_ so "Del" button indices remain valid
+        std::vector<size_t> job_indices(periodic_jobs_.size());
         for (size_t i = 0; i < periodic_jobs_.size(); ++i) {
-            PeriodicTxJob& job = periodic_jobs_[i];
-            ImGui::PushID(static_cast<int>(i));
+            job_indices[i] = i;
+        }
+
+        if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs()) {
+            if (sort_specs->SpecsCount > 0 && job_indices.size() > 1) {
+                const ImGuiTableColumnSortSpecs& spec = sort_specs->Specs[0];
+                const bool ascending = (spec.SortDirection == ImGuiSortDirection_Ascending);
+
+                std::sort(job_indices.begin(), job_indices.end(), [&](size_t ia, size_t ib) {
+                    const PeriodicTxJob& a = periodic_jobs_[ia];
+                    const PeriodicTxJob& b = periodic_jobs_[ib];
+                    int cmp = 0;
+                    switch (spec.ColumnUserID) {
+                        case JOB_COL_ENABLED:
+                            cmp = ThreeWayCompare(a.enabled ? 1 : 0, b.enabled ? 1 : 0);
+                            break;
+                        case JOB_COL_CAN_ID:
+                            cmp = ThreeWayCompare(a.msg.id, b.msg.id);
+                            break;
+                        case JOB_COL_CYCLE:
+                            cmp = ThreeWayCompare(a.cycle_ms, b.cycle_ms);
+                            break;
+                        case JOB_COL_SENT:
+                            cmp = ThreeWayCompare(a.tx_count, b.tx_count);
+                            break;
+                        case JOB_COL_DATA:
+                            cmp = ComparePayloads(a.msg.payload, b.msg.payload);
+                            break;
+                        default:
+                            break;
+                    }
+                    if (cmp == 0) cmp = ThreeWayCompare(ia, ib);
+                    return ascending ? (cmp < 0) : (cmp > 0);
+                });
+            }
+            sort_specs->SpecsDirty = false;
+        }
+
+        int delete_idx = -1;
+        for (size_t real_idx : job_indices) {
+            PeriodicTxJob& job = periodic_jobs_[real_idx];
+            ImGui::PushID(static_cast<int>(real_idx));
             ImGui::TableNextRow();
 
             ImGui::TableSetColumnIndex(0);
@@ -760,7 +969,7 @@ void AppUI::RenderTransmitWindow(double now_ms, float x, float y, float w, float
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Del")) {
-                delete_idx = static_cast<int>(i);
+                delete_idx = static_cast<int>(real_idx);
             }
 
             ImGui::PopID();
@@ -777,7 +986,7 @@ void AppUI::RenderTransmitWindow(double now_ms, float x, float y, float w, float
 }
 
 // ============================================================================
-// Window 5: Sent Messages History (Select, Load to Composer, or Quick Resend)
+// Window 5: Sent Messages History (Indirect Index Sorting)
 // ============================================================================
 void AppUI::RenderSentHistoryWindow(float x, float y, float w, float h) {
     ImGuiCond cond = auto_tile_layout_ ? ImGuiCond_Always : ImGuiCond_FirstUseEver;
@@ -789,7 +998,7 @@ void AppUI::RenderSentHistoryWindow(float x, float y, float w, float h) {
         return;
     }
 
-    ImGui::Text("History Entries: %zu (Click 'Load' to edit in Composer, or 'Resend' for immediate transmission)", tx_history_.size());
+    ImGui::Text("History Entries: %zu (Click column headers to sort, 'Load' to edit, or 'Resend' to transmit)", tx_history_.size());
     ImGui::SameLine(ImGui::GetWindowWidth() - 120);
     if (ImGui::SmallButton("Clear History")) {
         tx_history_.clear();
@@ -800,23 +1009,69 @@ void AppUI::RenderSentHistoryWindow(float x, float y, float w, float h) {
         ImGuiTableFlags_Borders |
         ImGuiTableFlags_RowBg |
         ImGuiTableFlags_ScrollY |
+        ImGuiTableFlags_Sortable |
         ImGuiTableFlags_SizingStretchProp;
 
     if (ImGui::BeginTable("SentHistoryTable", 7, flags)) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Last Sent", ImGuiTableColumnFlags_WidthFixed, 75.0f);
-        ImGui::TableSetupColumn("CAN ID", ImGuiTableColumnFlags_WidthFixed, 85.0f);
-        ImGui::TableSetupColumn("Format", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableSetupColumn("DLC", ImGuiTableColumnFlags_WidthFixed, 45.0f);
-        ImGui::TableSetupColumn("Count", ImGuiTableColumnFlags_WidthFixed, 55.0f);
-        ImGui::TableSetupColumn("Data (HEX) & Comment", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Operations", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+        ImGui::TableSetupColumn("Last Sent",            ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending | ImGuiTableColumnFlags_WidthFixed, 75.0f,  HIST_COL_LAST_SENT);
+        ImGui::TableSetupColumn("CAN ID",               ImGuiTableColumnFlags_WidthFixed,                                                                                  85.0f,  HIST_COL_CAN_ID);
+        ImGui::TableSetupColumn("Format",               ImGuiTableColumnFlags_WidthFixed,                                                                                  90.0f,  HIST_COL_FORMAT);
+        ImGui::TableSetupColumn("DLC",                  ImGuiTableColumnFlags_WidthFixed,                                                                                  45.0f,  HIST_COL_DLC);
+        ImGui::TableSetupColumn("Count",                ImGuiTableColumnFlags_WidthFixed,                                                                                  55.0f,  HIST_COL_COUNT);
+        ImGui::TableSetupColumn("Data (HEX) & Comment", ImGuiTableColumnFlags_WidthStretch,                                                                                0.0f,   HIST_COL_DATA);
+        ImGui::TableSetupColumn("Operations",           ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthFixed,                                                   130.0f, HIST_COL_OPS);
         ImGui::TableHeadersRow();
 
+        // Indirect index sorting over tx_history_
+        std::vector<size_t> hist_indices(tx_history_.size());
         for (size_t i = 0; i < tx_history_.size(); ++i) {
-            TxHistoryEntry& item = tx_history_[i];
+            hist_indices[i] = i;
+        }
+
+        if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs()) {
+            if (sort_specs->SpecsCount > 0 && hist_indices.size() > 1) {
+                const ImGuiTableColumnSortSpecs& spec = sort_specs->Specs[0];
+                const bool ascending = (spec.SortDirection == ImGuiSortDirection_Ascending);
+
+                std::sort(hist_indices.begin(), hist_indices.end(), [&](size_t ia, size_t ib) {
+                    const TxHistoryEntry& a = tx_history_[ia];
+                    const TxHistoryEntry& b = tx_history_[ib];
+                    int cmp = 0;
+                    switch (spec.ColumnUserID) {
+                        case HIST_COL_LAST_SENT:
+                            cmp = ThreeWayCompare(a.last_sent_sec, b.last_sent_sec);
+                            break;
+                        case HIST_COL_CAN_ID:
+                            cmp = ThreeWayCompare(a.msg.id, b.msg.id);
+                            break;
+                        case HIST_COL_FORMAT:
+                            cmp = ThreeWayCompare(GetFrameFormatRank(a.msg), GetFrameFormatRank(b.msg));
+                            break;
+                        case HIST_COL_DLC:
+                            cmp = ThreeWayCompare(a.msg.dlc, b.msg.dlc);
+                            break;
+                        case HIST_COL_COUNT:
+                            cmp = ThreeWayCompare(a.sent_count, b.sent_count);
+                            break;
+                        case HIST_COL_DATA:
+                            cmp = ComparePayloads(a.msg.payload, b.msg.payload);
+                            if (cmp == 0) cmp = ThreeWayCompare(a.comment, b.comment);
+                            break;
+                        default:
+                            break;
+                    }
+                    if (cmp == 0) cmp = ThreeWayCompare(ia, ib);
+                    return ascending ? (cmp < 0) : (cmp > 0);
+                });
+            }
+            sort_specs->SpecsDirty = false;
+        }
+
+        for (size_t real_idx : hist_indices) {
+            TxHistoryEntry& item = tx_history_[real_idx];
             const CanMessage& m = item.msg;
-            ImGui::PushID(static_cast<int>(i));
+            ImGui::PushID(static_cast<int>(real_idx));
 
             ImGui::TableNextRow();
 
@@ -852,7 +1107,7 @@ void AppUI::RenderSentHistoryWindow(float x, float y, float w, float h) {
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("Load")) {
-                selected_history_index_ = static_cast<int>(i);
+                selected_history_index_ = static_cast<int>(real_idx);
                 LoadMessageIntoComposer(item.msg, item.cycle_time_ms, item.comment);
             }
 

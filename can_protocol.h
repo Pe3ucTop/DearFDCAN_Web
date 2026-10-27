@@ -17,10 +17,10 @@ enum GsUsbBreq : uint8_t {
 
 // Feature flags in GsDeviceBtConst::feature and GsDeviceMode::flags
 enum GsCanFeature : uint32_t {
-    GS_CAN_FEATURE_LISTEN_ONLY = (1 << 0),
-    GS_CAN_FEATURE_LOOP_BACK   = (1 << 1),
-    GS_CAN_FEATURE_HW_TIMESTAMP= (1 << 4),
-    GS_CAN_FEATURE_FD          = (1 << 8)
+    GS_CAN_FEATURE_LISTEN_ONLY  = (1 << 0),
+    GS_CAN_FEATURE_LOOP_BACK    = (1 << 1),
+    GS_CAN_FEATURE_HW_TIMESTAMP = (1 << 4),
+    GS_CAN_FEATURE_FD           = (1 << 8)
 };
 
 enum GsCanMode : uint32_t {
@@ -79,14 +79,17 @@ struct CanTimingMetrics {
     double sample_point_pct; // Sample point position in %
 };
 
-// Structure representing a parsed CAN message
+// Structure representing a parsed CAN / CAN FD message
 struct CanMessage {
-    uint32_t id;
-    bool is_extended;
-    bool is_fd;
-    bool is_brs;
-    bool is_tx_echo;
-    uint8_t dlc;
+    uint32_t id = 0;
+    bool is_extended = false;
+    bool is_rtr = false;
+    bool is_fd = false;
+    bool is_brs = false;
+    bool is_esi = false;
+    bool is_tx_echo = false;
+    uint8_t dlc = 0;
+    uint32_t hw_timestamp_us = 0;
     std::vector<uint8_t> payload;
 };
 
@@ -95,10 +98,7 @@ public:
     std::vector<CanMessage> ParseRxBuffer(const uint8_t* buffer, int length);
     std::vector<uint8_t> BuildTxBuffer(const CanMessage& msg);
 
-    // Compute exact timing metrics from fclk_can and GsDeviceBittiming
     static CanTimingMetrics ComputeTimingMetrics(uint32_t fclk_hz, const GsDeviceBittiming& bt);
-
-    // Automatically calculate prescaler, tq segments, and sjw from target bitrate and sample point
     static bool AutoCalculateBittiming(uint32_t fclk_hz, uint32_t target_bitrate_bps, float sample_point_pct, GsDeviceBittiming& out_bt);
 
     static uint8_t DlcToBytes(uint8_t dlc);

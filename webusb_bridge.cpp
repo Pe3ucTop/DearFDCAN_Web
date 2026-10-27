@@ -100,7 +100,7 @@ EM_JS(void, js_webusb_transfer_out, (int ep, const uint8_t* data, int len), {
 });
 
 // Send Vendor Control OUT transfer on EP0
-EM_JS(void, js_webusb_control_out, (int req_type, int request, int value, int index, const uint8_t* data, int len), {
+EM_JS(void, js_webusb_control_out, (int request, int value, int index, const uint8_t* data, int len), {
     if (!Module.usbDevice) return;
     const payload = (len > 0 && data) ? HEAPU8.slice(data, data + len) : new Uint8Array(0);
     Module.usbDevice.controlTransferOut({
@@ -110,6 +110,27 @@ EM_JS(void, js_webusb_control_out, (int req_type, int request, int value, int in
         value: value,
         index: index
     }, payload).catch(console.error);
+});
+
+// Send Vendor Control IN transfer on EP0
+EM_JS(void, js_webusb_control_in, (int request, int value, int index, int length), {
+    if (!Module.usbDevice) return;
+    Module.usbDevice.controlTransferIn({
+        requestType: 'vendor',
+        recipient: 'interface',
+        request: request,
+        value: value,
+        index: index
+    }, length).then(result => {
+        if (result.status === "ok" && result.data && result.data.byteLength > 0) {
+            const byteLen = result.data.byteLength;
+            const buf = _malloc(byteLen);
+            const view = new Uint8Array(result.data.buffer, result.data.byteOffset, byteLen);
+            HEAPU8.set(view, buf);
+            _webusb_cb_ctrl_in(request, buf, byteLen);
+            _free(buf);
+        }
+    }).catch(console.error);
 });
 
 // Extern C callbacks invoked from JS
@@ -124,6 +145,10 @@ extern "C" {
 
     EMSCRIPTEN_KEEPALIVE void webusb_cb_rx(int ep, const uint8_t* data, int len) {
         WebUsbBridge::GetInstance().InternalOnDataReceived(ep, data, len);
+    }
+
+    EMSCRIPTEN_KEEPALIVE void webusb_cb_ctrl_in(int request, const uint8_t* data, int len) {
+        WebUsbBridge::GetInstance().InternalOnControlIn(static_cast<uint8_t>(request), data, len);
     }
 }
 
@@ -156,8 +181,12 @@ void WebUsbBridge::TransferOut(int endpoint, const uint8_t* data, int length) {
     js_webusb_transfer_out(endpoint, data, length);
 }
 
-void WebUsbBridge::ControlTransferOut(uint8_t request_type, uint8_t request, uint16_t value, uint16_t index, const uint8_t* data, int length) {
-    js_webusb_control_out(request_type, request, value, index, data, length);
+void WebUsbBridge::ControlTransferOut(uint8_t request, uint16_t value, uint16_t index, const uint8_t* data, int length) {
+    js_webusb_control_out(request, value, index, data, length);
+}
+
+void WebUsbBridge::ControlTransferIn(uint8_t request, uint16_t value, uint16_t index, uint16_t length) {
+    js_webusb_control_in(request, value, index, length);
 }
 
 void WebUsbBridge::InternalOnConnected(uint16_t vid, uint16_t pid, const char* mfg, const char* prod) {
@@ -173,4 +202,8 @@ void WebUsbBridge::InternalOnDisconnected() {
 
 void WebUsbBridge::InternalOnDataReceived(int ep, const uint8_t* data, int length) {
     if (on_data_received_) on_data_received_(ep, data, length);
+}
+
+void WebUsbBridge::InternalOnControlIn(uint8_t request, const uint8_t* data, int length) {
+    if (on_control_in_) on_control_in_(request, data, length);
 }

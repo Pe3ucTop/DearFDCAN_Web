@@ -3,12 +3,17 @@
 #include <cmath>
 #include <algorithm>
 
-constexpr uint32_t CAN_EFF_FLAG = 0x80000000U;
+// Standard SocketCAN / gs_usb CAN ID flags
+constexpr uint32_t CAN_EFF_FLAG = 0x80000000U; // Extended Frame Format (29-bit)
+constexpr uint32_t CAN_RTR_FLAG = 0x40000000U; // Remote Transmission Request
+constexpr uint32_t CAN_ERR_FLAG = 0x20000000U; // Error Frame
 constexpr uint32_t CAN_EFF_MASK = 0x1FFFFFFFU;
 constexpr uint32_t CAN_SFF_MASK = 0x000007FFU;
 
+// gs_host_frame flags
 constexpr uint8_t GS_CAN_FLAG_FD  = (1 << 1);
 constexpr uint8_t GS_CAN_FLAG_BRS = (1 << 2);
+constexpr uint8_t GS_CAN_FLAG_ESI = (1 << 3);
 
 uint8_t CanProtocolHandler::DlcToBytes(uint8_t dlc) {
     static const uint8_t lookup[16] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64};
@@ -30,44 +35,30 @@ CanTimingMetrics CanProtocolHandler::ComputeTimingMetrics(uint32_t fclk_hz, cons
     CanTimingMetrics m = {0.0, 0, 0, 0.0, 0.0};
     if (fclk_hz == 0 || bt.brp == 0) return m;
 
-    // 1 Sync_Seg + Prop_Seg + Phase_Seg1 + Phase_Seg2
     m.tseg1_total = bt.prop_seg + bt.phase_seg1;
     m.total_tq = 1U + m.tseg1_total + bt.phase_seg2;
     if (m.total_tq == 0) return m;
 
-    // Time Quantum duration in nanoseconds: (BRP / fclk) * 1e9
     m.tq_ns = (static_cast<double>(bt.brp) * 1e9) / static_cast<double>(fclk_hz);
-
-    // Resulting bitrate in bps
     m.actual_bitrate = static_cast<double>(fclk_hz) / (static_cast<double>(bt.brp) * static_cast<double>(m.total_tq));
-
-    // Sample point percentage: (1 + Prop_Seg + Phase_Seg1) / Total_TQ * 100
     m.sample_point_pct = (static_cast<double>(1U + m.tseg1_total) / static_cast<double>(m.total_tq)) * 100.0;
 
     return m;
 }
 
-bool CanProtocolHandler::AutoCalculateBittiming(
-		uint32_t fclk_hz,
-		uint32_t target_bitrate_bps,
-		float sample_point_pct,
-		GsDeviceBittiming& out_bt	)
-{
+bool CanProtocolHandler::AutoCalculateBittiming(uint32_t fclk_hz, uint32_t target_bitrate_bps, float sample_point_pct, GsDeviceBittiming& out_bt) {
     if (fclk_hz == 0 || target_bitrate_bps == 0) return false;
 
     double best_error = 1e18;
     uint32_t best_brp = 1;
     uint32_t best_total_tq = 16;
 
-    // Search for optimal Prescaler (BRP) and Total TQ (between 8 and 80 tq)
     for (uint32_t total_tq = 8; total_tq <= 80; ++total_tq) {
         uint32_t brp = static_cast<uint32_t>(std::round(static_cast<double>(fclk_hz) / (static_cast<double>(target_bitrate_bps) * total_tq)));
         if (brp < 1 || brp > 1024) continue;
 
         double actual_bps = static_cast<double>(fclk_hz) / (static_cast<double>(brp) * total_tq);
         double rate_err = std::abs(actual_bps - static_cast<double>(target_bitrate_bps));
-
-        // Prefer standard TQ counts around 16..20 if bitrate error is identical
         double tq_penalty = std::abs(static_cast<int>(total_tq) - 16) * 0.1;
         double score = rate_err + tq_penalty;
 
@@ -78,12 +69,11 @@ bool CanProtocolHandler::AutoCalculateBittiming(
         }
     }
 
-    // Split Total TQ into TSEG1 (prop + seg1) and TSEG2 according to target Sample Point
-    uint32_t sync_Plus_tseg1 = static_cast<uint32_t>(std::round((sample_point_pct / 100.0f) * best_total_tq));
-    if (sync_Plus_tseg1 < 2) sync_Plus_tseg1 = 2;
-    if (sync_Plus_tseg1 >= best_total_tq) sync_Plus_tseg1 = best_total_tq - 1;
+    uint32_t sync_plus_tseg1 = static_cast<uint32_t>(std::round((sample_point_pct / 100.0f) * best_total_tq));
+    if (sync_plus_tseg1 < 2) sync_plus_tseg1 = 2;
+    if (sync_plus_tseg1 >= best_total_tq) sync_plus_tseg1 = best_total_tq - 1;
 
-    uint32_t tseg1 = sync_Plus_tseg1 - 1;
+    uint32_t tseg1 = sync_plus_tseg1 - 1;
     uint32_t tseg2 = best_total_tq - 1 - tseg1;
 
     out_bt.brp        = best_brp;
@@ -104,13 +94,24 @@ std::vector<CanMessage> CanProtocolHandler::ParseRxBuffer(const uint8_t* buffer,
     CanMessage msg;
     msg.is_tx_echo  = (frame->echo_id != 0xFFFFFFFFU);
     msg.is_extended = (frame->can_id & CAN_EFF_FLAG) != 0;
+    msg.is_rtr      = (frame->can_id & CAN_RTR_FLAG) != 0;
     msg.id          = frame->can_id & (msg.is_extended ? CAN_EFF_MASK : CAN_SFF_MASK);
     msg.is_fd       = (frame->flags & GS_CAN_FLAG_FD) != 0;
     msg.is_brs      = (frame->flags & GS_CAN_FLAG_BRS) != 0;
+    msg.is_esi      = (frame->flags & GS_CAN_FLAG_ESI) != 0;
     msg.dlc         = frame->can_dlc & 0x0F;
 
     uint8_t data_len = msg.is_fd ? DlcToBytes(msg.dlc) : std::min<uint8_t>(msg.dlc, 8);
-    msg.payload.assign(frame->data, frame->data + data_len);
+    if (!msg.is_rtr) {
+        msg.payload.assign(frame->data, frame->data + data_len);
+    }
+
+    // Extract hardware timestamp if present (offset 20 for Classic CAN, offset 76 for CAN FD)
+    if (length == 24) {
+        std::memcpy(&msg.hw_timestamp_us, buffer + 20, sizeof(uint32_t));
+    } else if (length >= 80) {
+        std::memcpy(&msg.hw_timestamp_us, buffer + 76, sizeof(uint32_t));
+    }
 
     messages.push_back(msg);
     return messages;
@@ -118,19 +119,23 @@ std::vector<CanMessage> CanProtocolHandler::ParseRxBuffer(const uint8_t* buffer,
 
 std::vector<uint8_t> CanProtocolHandler::BuildTxBuffer(const CanMessage& msg) {
     GsHostFrame frame = {0};
-    frame.echo_id = 0;
+    frame.echo_id = 0; // Request TX echo from adapter
 
     frame.can_id = msg.id & (msg.is_extended ? CAN_EFF_MASK : CAN_SFF_MASK);
     if (msg.is_extended) frame.can_id |= CAN_EFF_FLAG;
+    if (msg.is_rtr && !msg.is_fd) frame.can_id |= CAN_RTR_FLAG;
 
     if (msg.is_fd) {
         frame.flags |= GS_CAN_FLAG_FD;
         if (msg.is_brs) frame.flags |= GS_CAN_FLAG_BRS;
     }
 
-    frame.can_dlc = msg.dlc;
-    uint8_t data_len = DlcToBytes(msg.dlc);
-    std::memcpy(frame.data, msg.payload.data(), std::min((size_t)data_len, msg.payload.size()));
+    frame.can_dlc = msg.dlc & 0x0F;
+    uint8_t data_len = msg.is_fd ? DlcToBytes(frame.can_dlc) : std::min<uint8_t>(frame.can_dlc, 8);
+
+    if (!msg.is_rtr && !msg.payload.empty()) {
+        std::memcpy(frame.data, msg.payload.data(), std::min<size_t>(data_len, msg.payload.size()));
+    }
 
     size_t transfer_size = msg.is_fd ? sizeof(GsHostFrame) : 20;
     std::vector<uint8_t> out_buffer(transfer_size);

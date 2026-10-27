@@ -59,6 +59,9 @@ private:
     void StartCanChannel();
     void StopCanChannel();
 
+    // High-resolution monotonic time in milliseconds via GLFW
+    double GetNowMs() const;
+
     // Transmit helpers
     void TransmitSingleMessage(const CanMessage& msg, bool record_in_history, int associated_cycle_ms = 0, const std::string& comment = "");
     void ProcessPeriodicJobs(double now_ms);
@@ -66,18 +69,21 @@ private:
     void LoadMessageIntoComposer(const CanMessage& msg, int cycle_ms, const std::string& comment);
 
     // Individual window rendering methods
-    void RenderMenuBar();
-    void RenderHardwareSetupWindow();
-    void RenderTransmitWindow(double now_ms);
-    void RenderSentHistoryWindow();
-    void RenderIdTableWindow(double now_ms);
-    void RenderTraceWindow();
+    float RenderMenuBar();
+    void RenderHardwareSetupWindow(float x, float y, float w, float h);
+    void RenderTransmitWindow(double now_ms, float x, float y, float w, float h);
+    void RenderSentHistoryWindow(float x, float y, float w, float h);
+    void RenderIdTableWindow(double now_ms, float x, float y, float w, float h);
+    void RenderTraceWindow(float x, float y, float w, float h);
 
     // Connection and channel states
     bool is_connected_;
     bool is_channel_open_;
     std::string device_name_;
     double start_time_ms_;
+
+    // Layout mode: when true, windows automatically tile and resize with the browser window
+    bool auto_tile_layout_;
 
     // Window visibility toggles
     bool show_hw_window_;
@@ -108,7 +114,7 @@ private:
     int tx_dlc_;
     int tx_cycle_ms_;
     int tx_burst_count_;
-    int tx_auto_inc_byte_; // -1 for Off, 0..63 for byte index
+    int tx_auto_inc_byte_;
     char tx_payload_[256];
     char tx_comment_[64];
 
@@ -116,13 +122,10 @@ private:
     std::deque<TraceEntry> rx_trace_;
     bool trace_paused_;
     bool trace_autoscroll_;
-    int trace_filter_id_; // -1 = show all
+    int trace_filter_id_;
 
-    // Key: (uint64_t(is_extended) << 32) | id
     std::map<uint64_t, IdTableEntry> id_table_;
-
     std::vector<TxHistoryEntry> tx_history_;
     int selected_history_index_;
-
     std::vector<PeriodicTxJob> periodic_jobs_;
 };
