@@ -165,6 +165,9 @@ int main(int, char**) {
 
     webusb.Initialize();
 
+    // Initial bit rates / sample points may be passed in the URL query string
+    g_AppUI.ApplyUrlParameters();
+
     std::printf("[SYS] Starting main render loop (%dx%d)...\n", initial_w, initial_h);
 
     // 5. Start the browser rendering loop.

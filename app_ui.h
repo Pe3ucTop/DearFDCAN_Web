@@ -34,6 +34,10 @@ public:
     // Render all workspace windows and process periodic transmit timers
     void Render();
 
+    // Presets the nominal/data bit rate and sample point from the page URL query string
+    // (baudrate, sample_point, data_baudrate, data_sample_point); formats are in url_params.h
+    void ApplyUrlParameters();
+
     void OnDeviceConnected(const std::string& name);
     void OnDeviceDisconnected();
     // Applies a snapshot from the worker core: changed ID table rows and new trace entries

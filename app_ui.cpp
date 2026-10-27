@@ -1,6 +1,7 @@
 #include "app_ui.h"
 #include "webusb_bridge.h"
 #include "imgui.h"
+#include "url_params.h"
 #include <GLFW/glfw3.h>
 #include <emscripten.h>
 #include <cstdio>
@@ -107,6 +108,28 @@ static int ThreeWayCompare(const T& a, const T& b) {
     return 0;
 }
 
+// Reads one query parameter of the page URL. `which` indexes the name table in the JS body (a numeric
+// index keeps the string marshalling out of it). Returns 0 if the parameter is absent.
+enum UrlParam : int {
+    URL_BAUDRATE = 0,
+    URL_SAMPLE_POINT,
+    URL_DATA_BAUDRATE,
+    URL_DATA_SAMPLE_POINT
+};
+
+EM_JS(int, js_get_query_param, (int which, char* out, int out_size), {
+    const names = ["baudrate", "sample_point", "data_baudrate", "data_sample_point"]; // order of UrlParam
+    const value = new URLSearchParams(window.location.search).get(names[which]);
+    if (value === null) return 0;
+    stringToUTF8(value, out, out_size);
+    return 1;
+});
+
+static bool GetUrlParam(UrlParam which, char* out, int out_size) {
+    out[0] = '\0';
+    return js_get_query_param(static_cast<int>(which), out, out_size) != 0;
+}
+
 AppUI::AppUI()
     : is_connected_(false),
       is_channel_open_(false),
@@ -158,6 +181,42 @@ AppUI::AppUI()
 
     std::strncpy(tx_comment_, "Engine Status", sizeof(tx_comment_) - 1);
     tx_comment_[sizeof(tx_comment_) - 1] = '\0';
+}
+
+void AppUI::ApplyUrlParameters() {
+    char text[64];
+
+    auto apply_bitrate = [&](UrlParam which, const char* label, int& target_kbps) {
+        if (!GetUrlParam(which, text, sizeof(text))) return;
+        int kbps = 0;
+        if (ParseBitrateKbps(text, kbps)) {
+            target_kbps = kbps;
+            std::printf("[URL] %s bit rate: %d kbit/s\n", label, kbps);
+        } else {
+            std::printf("[URL] ignored invalid %s bit rate '%s' (use e.g. 500k, 2M or 500000; %d..%d kbit/s)\n",
+                        label, text, kMinBitrateKbps, kMaxBitrateKbps);
+        }
+    };
+    auto apply_sample_point = [&](UrlParam which, const char* label, float& target_pct) {
+        if (!GetUrlParam(which, text, sizeof(text))) return;
+        float pct = 0.0f;
+        if (ParseSamplePointPct(text, pct)) {
+            target_pct = pct;
+            std::printf("[URL] %s sample point: %.1f%%\n", label, pct);
+        } else {
+            std::printf("[URL] ignored invalid %s sample point '%s' (use e.g. 87.5 or 0.875; %.0f..%.0f %%)\n",
+                        label, text, kMinSamplePointPct, kMaxSamplePointPct);
+        }
+    };
+
+    apply_bitrate(URL_BAUDRATE, "nominal", target_nom_kbps_);
+    apply_sample_point(URL_SAMPLE_POINT, "nominal", target_nom_sp_);
+    apply_bitrate(URL_DATA_BAUDRATE, "data", target_data_kbps_);
+    apply_sample_point(URL_DATA_SAMPLE_POINT, "data", target_data_sp_);
+
+    // Recalculate with the clock known so far; done again once the adapter reports its real clock
+    CanProtocolHandler::AutoCalculateBittiming(bt_const_.fclk_can, target_nom_kbps_ * 1000U, target_nom_sp_, nom_bt_);
+    CanProtocolHandler::AutoCalculateBittiming(bt_const_.fclk_can, target_data_kbps_ * 1000U, target_data_sp_, data_bt_);
 }
 
 double AppUI::GetNowMs() const {
