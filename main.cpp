@@ -16,39 +16,16 @@ GLFWwindow* g_Window = nullptr;
 AppUI g_AppUI;
 CanProtocolHandler g_Protocol;
 
-// Inject CSS rules into the DOM so the WebGL canvas occupies 100% of the browser viewport
-// and hides default Emscripten shell decorations (status bar, console, margins)
+// Inject CSS rules into the DOM so the WebGL canvas occupies 100% of the browser viewport.
+// Note: Avoid starting a new line with '#' inside EM_JS because the C preprocessor
+// treats leading '#' characters as preprocessor directives.
 EM_JS(void, js_setup_fullscreen_canvas_styles, (), {
     const style = document.createElement('style');
-    style.innerHTML = `
-        html, body {
-            margin: 0 !important;
-            padding: 0 !important;
-            width: 100vw !important;
-            height: 100vh !important;
-            overflow: hidden !important;
-            background-color: #19191f !important;
-        }
-        #canvas {
-            position: fixed !important;
-            top: 0 !important;
-            left: 0 !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            width: 100vw !important;
-            height: 100vh !important;
-            border: none !important;
-            display: block !important;
-        }
-        /* Hide standard Emscripten HTML shell elements if default shell is used */
-        #status, #controls, #output, .emscripten, .emscripten_border, #emscripten_logo {
-            display: none !important;
-        }
-        /* Make sure canvas itself stays visible even if it has the .emscripten class */
-        canvas.emscripten {
-            display: block !important;
-        }
-    `;
+    style.textContent =
+        "html, body { margin: 0 !important; padding: 0 !important; width: 100vw !important; height: 100vh !important; overflow: hidden !important; background-color: #19191f !important; }" +
+        "#canvas { position: fixed !important; top: 0 !important; left: 0 !important; margin: 0 !important; padding: 0 !important; width: 100vw !important; height: 100vh !important; border: none !important; display: block !important; }" +
+        "#status, #controls, #output, .emscripten, .emscripten_border, #emscripten_logo { display: none !important; }" +
+        "canvas.emscripten { display: block !important; }";
     document.head.appendChild(style);
 });
 
@@ -136,6 +113,85 @@ int main(int, char**) {
     }
 
     glfwMakeContextCurrent(g_Window);
+    // Note: Do NOT call glfwSwapInterval(1) here before emscripten_set_main_loop(),
+    // because Emscripten's GLFW port translates it into emscripten_set_main_loop_timing(),
+    // which fails if the main loop has not been registered yet.
+
+    // 3. Register HTML5 window resize callback for dynamic full-window resizing
+    emscripten_set_resize_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_FALSE, OnBrowserWindowResize);
+
+    // 4. Initialize Dear ImGui context and GLFW + OpenGL3 backends
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ImGui::StyleColorsDark();
+
+    // Install GLFW callbacks for mouse, scroll, and keyboard input
+    ImGui_ImplGlfw_InitForOpenGL(g_Window, true);
+    ImGui_ImplOpenGL3_Init("#version 300 es");
+
+    // 5. Connect WebUSB transport callbacks to UI and CAN protocol handlers
+    auto& webusb = WebUsbBridge::GetInstance();
+
+    webusb.SetOnConnected([](const UsbDeviceInfo& info) {
+        g_AppUI.OnDeviceConnected(info.manufacturer + " " + info.product);
+    });
+
+    webusb.SetOnDisconnected([]() {
+        g_AppUI.OnDeviceDisconnected();
+    });
+
+    webusb.SetOnControlIn([](uint8_t request, const uint8_t* data, int length) {
+        g_AppUI.OnControlDataReceived(request, data, length);
+    });
+
+    webusb.SetOnDataReceived([](int ep, const uint8_t* data, int length) {
+        if (ep == 0x81) {
+            auto messages = g_Protocol.ParseRxBuffer(data, length);
+            for (const auto& msg : messages) {
+                g_AppUI.OnCanMessageReceived(msg);
+            }
+        }
+    });
+
+    webusb.Initialize();
+
+    // 6. Start the browser rendering loop (fps = 0 automatically uses requestAnimationFrame / VSync)
+    emscripten_set_main_loop(MainLoopStep, 0, true);
+
+    return 0;
+}
+
+/*
+int main(int, char**) {
+    // 1. Apply full-viewport CSS rules before creating the WebGL context
+    js_setup_fullscreen_canvas_styles();
+
+    // 2. Initialize GLFW library
+    if (!glfwInit()) {
+        return -1;
+    }
+
+    // Configure OpenGL ES 3.0 (WebGL 2.0) context hints
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    glfwWindowHint(GLFW_SCALE_TO_MONITOR, GLFW_TRUE);
+
+    int initial_w = js_get_window_width();
+    int initial_h = js_get_window_height();
+    if (initial_w <= 0) initial_w = 1280;
+    if (initial_h <= 0) initial_h = 900;
+
+    g_Window = glfwCreateWindow(initial_w, initial_h, "PCAN-View WebUSB Edition (GLFW)", nullptr, nullptr);
+    if (!g_Window) {
+        glfwTerminate();
+        return -1;
+    }
+
+    glfwMakeContextCurrent(g_Window);
     glfwSwapInterval(1); // Enable VSync
 
     // 3. Register HTML5 window resize callback for dynamic full-window resizing
@@ -190,3 +246,4 @@ int main(int, char**) {
 
     return 0;
 }
+*/
