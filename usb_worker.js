@@ -71,10 +71,12 @@ let pool = [];
 const stageHdr = new DataView(new ArrayBuffer(STAGE_REC_HEADER));
 const stageHdrBytes = new Uint8Array(stageHdr.buffer);
 
-// Loaded once per worker. importScripts() is available in classic workers; MODULARIZE'd Emscripten
-// output defines the createCanCore factory. If loading fails, open requests are answered with 'closed'.
+// Loaded once per worker. MODULARIZE'd Emscripten output defines the createCanCore factory. In a
+// multi-file deployment it is fetched with importScripts(); the single-file bundle made by
+// pack_worker.py already contains it in front of this script. If loading fails, open requests are
+// answered with 'closed'.
 const coreReady = (async () => {
-    importScripts('can_core.js');
+    if (typeof createCanCore === 'undefined') importScripts('can_core.js');
     const m = await createCanCore();
     core = m;
     stagePtr = m._core_stage_ptr();

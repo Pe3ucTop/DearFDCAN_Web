@@ -20,11 +20,16 @@ EM_JS(void, js_webusb_init, (), {
 
     const usb = Module.usb = { worker: null, epoch: 0, staging: 0, stagingCap: 0 };
 
+    // Single-file build: the worker source (can_core + usb_worker.js) is embedded in this page as
+    // Module.usbWorkerSource (--pre-js made by pack_worker.py) and started from a Blob URL.
+    // Multi-file build: the worker is loaded from usb_worker.js next to the page.
     let w;
     try {
-        w = new Worker('usb_worker.js');
+        const src = Module.usbWorkerSource;
+        w = src ? new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })))
+                : new Worker('usb_worker.js');
     } catch (err) {
-        console.error("Cannot start usb_worker.js:", err);
+        console.error("Cannot start the USB worker:", err);
         Module.usb = null;
         return;
     }
