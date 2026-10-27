@@ -110,9 +110,11 @@ EM_JS(void, js_webusb_init, (), {
         switch (m.type) {
         case 'opened': {
             slot.state = 'open';
-            const p = usb.cstr(m.eps);
-            _webusb_cb_device_opened(m.dev, p);
-            _free(p);
+            const eps = usb.cstr(m.eps);
+            const info = usb.cstr(m.info);
+            _webusb_cb_device_opened(m.dev, eps, m.protocol | 0, info);
+            _free(eps);
+            _free(info);
             break;
         }
         case 'closed': {
@@ -231,6 +233,14 @@ EM_JS(void, js_webusb_control_out, (int dev, int request, int value, int index, 
     usb.worker.postMessage({ type: 'ctrl_out', dev: dev, request: request, value: value, index: index, data: ab }, [ab]);
 });
 
+// Queue a bulk OUT transfer to the command endpoint (PEAK uCAN); acknowledged as 'ctrl_ack' with `id`
+EM_JS(void, js_webusb_cmd_out, (int dev, int id, const uint8_t* data, int len), {
+    const usb = Module.usb;
+    if (!usb || !usb.worker) return;
+    const ab = HEAPU8.slice(data, data + len).buffer;
+    usb.worker.postMessage({ type: 'cmd_out', dev: dev, id: id, ep: 0, data: ab }, [ab]);
+});
+
 // Queue a Vendor Control IN transfer on EP0 (result arrives as 'ctrl_in')
 EM_JS(void, js_webusb_control_in, (int dev, int request, int value, int index, int length), {
     const usb = Module.usb;
@@ -253,8 +263,8 @@ extern "C" {
         WebUsbBridge::GetInstance().InternalOnDeviceAdded(dev, info);
     }
 
-    EMSCRIPTEN_KEEPALIVE void webusb_cb_device_opened(int dev, const char* endpoints) {
-        WebUsbBridge::GetInstance().InternalOnDeviceOpened(dev, endpoints);
+    EMSCRIPTEN_KEEPALIVE void webusb_cb_device_opened(int dev, const char* endpoints, int protocol, const char* info) {
+        WebUsbBridge::GetInstance().InternalOnDeviceOpened(dev, endpoints, protocol, info);
     }
 
     EMSCRIPTEN_KEEPALIVE void webusb_cb_device_closed(int dev, const char* reason) {
@@ -274,7 +284,7 @@ extern "C" {
     }
 
     EMSCRIPTEN_KEEPALIVE void webusb_cb_ctrl_ack(int dev, int request, int ok) {
-        WebUsbBridge::GetInstance().InternalOnControlOutDone(dev, static_cast<uint8_t>(request), ok != 0);
+        WebUsbBridge::GetInstance().InternalOnControlOutDone(dev, request, ok != 0);
     }
 
     EMSCRIPTEN_KEEPALIVE void webusb_cb_stats(int dev, int rx_per_sec, int tx_dropped, int recoveries,
@@ -337,6 +347,10 @@ void WebUsbBridge::ControlTransferIn(int dev, uint8_t request, uint16_t value, u
     if (ValidDevice(dev)) js_webusb_control_in(dev, request, value, index, length);
 }
 
+void WebUsbBridge::CommandOut(int dev, int id, const uint8_t* data, int length) {
+    if (ValidDevice(dev)) js_webusb_cmd_out(dev, id, data, length);
+}
+
 void WebUsbBridge::ClearIdTable() {
     ++table_clear_sent_;
     js_webusb_core_cmd(1, 0);
@@ -356,9 +370,13 @@ void WebUsbBridge::InternalOnDeviceAdded(int dev, const UsbDeviceInfo& info) {
     if (on_device_added_) on_device_added_(dev, info);
 }
 
-void WebUsbBridge::InternalOnDeviceOpened(int dev, const char* endpoints) {
+void WebUsbBridge::InternalOnDeviceOpened(int dev, const char* endpoints, int protocol, const char* info) {
     if (!ValidDevice(dev)) return;
-    if (on_device_opened_) on_device_opened_(dev, endpoints ? endpoints : "");
+    DeviceOpenInfo open;
+    open.endpoints = endpoints ? endpoints : "";
+    open.protocol = (protocol == PROTOCOL_PEAK_PCAN_FD) ? PROTOCOL_PEAK_PCAN_FD : PROTOCOL_GS_USB_CANDLELIGHT;
+    open.info = info ? info : "";
+    if (on_device_opened_) on_device_opened_(dev, open);
 }
 
 void WebUsbBridge::InternalOnDeviceClosed(int dev, const char* reason) {
@@ -415,7 +433,7 @@ void WebUsbBridge::InternalOnControlIn(int dev, uint8_t request, const uint8_t* 
     if (on_control_in_) on_control_in_(dev, request, data, length);
 }
 
-void WebUsbBridge::InternalOnControlOutDone(int dev, uint8_t request, bool ok) {
+void WebUsbBridge::InternalOnControlOutDone(int dev, int request, bool ok) {
     if (!ValidDevice(dev)) return;
     if (on_control_out_done_) on_control_out_done_(dev, request, ok);
 }

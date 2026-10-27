@@ -254,6 +254,28 @@ double AppUI::GetNowMs() const {
 // Device slots
 // ============================================================================
 
+// Ids of the command transfers of PEAK start/stop sequences; their acknowledgements come back through
+// OnControlOutDone() and are told apart from gs_usb request codes by being >= 0x100
+static constexpr int kPcanCmdIdStart = 0x100;
+static constexpr int kPcanCmdIdStop  = 0x200;
+
+// Register limits of an adapter's bit timing: what the editors may enter and the automatic calculation may use
+static const CanBitTimingLimits kGsLimits = {512, 128, 128, 1024};   // as wide as the editor always allowed
+static CanBitTimingLimits NominalLimitsOf(const DeviceSlot& d) {
+    return d.protocol == PROTOCOL_PEAK_PCAN_FD ? PcanNominalLimits() : kGsLimits;
+}
+static CanBitTimingLimits DataLimitsOf(const DeviceSlot& d) {
+    return d.protocol == PROTOCOL_PEAK_PCAN_FD ? PcanDataLimits() : kGsLimits;
+}
+
+// Automatic calculation within the limits; if nothing fits gs_usb keeps the old search (it always produced
+// some value), other protocols leave the previous values
+static void CalculateTiming(CanProtocolType protocol, uint32_t fclk_hz, uint32_t bps, float sample_point,
+                            const CanBitTimingLimits& limits, GsDeviceBittiming& bt) {
+    if (CanProtocolHandler::AutoCalculateBittiming(fclk_hz, bps, sample_point, limits, bt)) return;
+    if (protocol == PROTOCOL_GS_USB_CANDLELIGHT) CanProtocolHandler::AutoCalculateBittiming(fclk_hz, bps, sample_point, bt);
+}
+
 void AppUI::InitDeviceDefaults(DeviceSlot& d) const {
     d.target_nom_kbps = defaults_.target_nom_kbps;
     d.target_nom_sp = defaults_.target_nom_sp;
@@ -281,8 +303,22 @@ void AppUI::InitDeviceDefaults(DeviceSlot& d) const {
 }
 
 void AppUI::RecalculateTimings(DeviceSlot& d) {
-    CanProtocolHandler::AutoCalculateBittiming(d.bt_const.fclk_can, d.target_nom_kbps * 1000U, d.target_nom_sp, d.nom_bt);
-    CanProtocolHandler::AutoCalculateBittiming(d.bt_const.fclk_can, d.target_data_kbps * 1000U, d.target_data_sp, d.data_bt);
+    CalculateTiming(d.protocol, d.bt_const.fclk_can, d.target_nom_kbps * 1000U, d.target_nom_sp, NominalLimitsOf(d), d.nom_bt);
+    CalculateTiming(d.protocol, d.bt_const.fclk_can, d.target_data_kbps * 1000U, d.target_data_sp, DataLimitsOf(d), d.data_bt);
+}
+
+// Fixed properties of the adapter's protocol. A PEAK adapter has no bit-timing constants request: it runs
+// its CAN cores from an 80 MHz domain and supports CAN FD, hardware timestamps and listen-only mode.
+void AppUI::ApplyProtocol(DeviceSlot& d, CanProtocolType protocol) {
+    d.protocol = protocol;
+    if (protocol == PROTOCOL_PEAK_PCAN_FD) {
+        std::memset(&d.bt_const, 0, sizeof(d.bt_const));
+        d.bt_const.feature = GS_CAN_FEATURE_FD | GS_CAN_FEATURE_HW_TIMESTAMP | GS_CAN_FEATURE_LISTEN_ONLY;
+        d.bt_const.fclk_can = PCAN_CAN_CLOCK_HZ;
+        d.has_bt_const = true;
+        d.enable_loopback = false;   // no internal loopback mode in this protocol
+    }
+    RecalculateTimings(d);
 }
 
 bool AppUI::IsBusOn(int dev) const {
@@ -356,14 +392,26 @@ void AppUI::OnDeviceAdded(int dev, const UsbDeviceInfo& info) {
     if (selected_dev_ < 0 || !devices_[selected_dev_].used) selected_dev_ = dev;
 }
 
-void AppUI::OnDeviceOpened(int dev, const std::string& endpoints) {
+void AppUI::OnDeviceOpened(int dev, const DeviceOpenInfo& open) {
     if (!ValidDevice(dev) || !devices_[dev].used) return;
     DeviceSlot& d = devices_[dev];
     d.connecting = false;
     d.connected = true;
-    d.endpoints = endpoints;
+    d.endpoints = open.endpoints;
+    ApplyProtocol(d, open.protocol);
 
-    // Query bit-timing constants and the adapter description from EP0
+    if (open.protocol == PROTOCOL_PEAK_PCAN_FD) {
+        // The worker already read the firmware info while opening: no requests to send
+        d.pcan_fw = open.Get("fw");
+        d.pcan_bl = open.Get("bl");
+        d.pcan_hw = open.Get("hw");
+        d.pcan_mcu = open.Get("mcu");
+        d.pcan_serial = open.Get("ser");
+        d.pcan_channels = open.Get("ch");
+        return;
+    }
+
+    // gs_usb: query bit-timing constants and the adapter description from EP0
     auto& usb = WebUsbBridge::GetInstance();
     usb.ControlTransferIn(dev, GS_USB_BREQ_BT_CONST, 0, 0, sizeof(GsDeviceBtConst));
     usb.ControlTransferIn(dev, GS_USB_BREQ_DEVICE_CONFIG, 0, 0, sizeof(GsDeviceConfig));
@@ -400,10 +448,23 @@ void AppUI::OnControlDataReceived(int dev, uint8_t request, const uint8_t* data,
 
 // Control OUT results arrive in submission order per adapter. The channel counts as open only after the
 // MODE_START request was acknowledged; any failure of the start sequence rolls it back.
-void AppUI::OnControlOutDone(int dev, uint8_t request, bool ok) {
+void AppUI::OnControlOutDone(int dev, int request, bool ok) {
     if (!ValidDevice(dev) || !devices_[dev].used) return;
     DeviceSlot& d = devices_[dev];
     if (!d.channel_opening) return;
+
+    if (d.protocol == PROTOCOL_PEAK_PCAN_FD) {
+        // The start sequence is a few command transfers; the channel is open after the last one was written
+        if (request < kPcanCmdIdStart) return;
+        if (!ok) {
+            StopCanChannel(dev);
+        } else if (request == d.pcan_start_last_id) {
+            d.channel_opening = false;
+            d.channel_open = true;
+        }
+        return;
+    }
+
     if (!ok) {
         // Firmware may legitimately reject HOST_FORMAT (it is optional); everything else is fatal
         if (request != GS_USB_BREQ_HOST_FORMAT) StopCanChannel(dev);
@@ -444,6 +505,19 @@ void AppUI::StartCanChannel(int dev) {
     if (!d.used || !d.connected || d.channel_opening || d.channel_open) return;
     auto& usb = WebUsbBridge::GetInstance();
 
+    if (d.protocol == PROTOCOL_PEAK_PCAN_FD) {
+        // Command transfers (clock, options, bit timing, acceptance filter, bus on), written in order; the
+        // channel is open when the last one is done (see OnControlOutDone)
+        const auto transfers = CanProtocolPcan::BuildStartCommands(0, d.enable_fd, d.enable_listen_only, d.nom_bt, d.data_bt);
+        for (size_t i = 0; i < transfers.size(); ++i) {
+            usb.CommandOut(dev, kPcanCmdIdStart + static_cast<int>(i), transfers[i].data(), static_cast<int>(transfers[i].size()));
+        }
+        d.pcan_start_last_id = kPcanCmdIdStart + static_cast<int>(transfers.size()) - 1;
+        usb.StartRxPump(dev, 0, 0);
+        d.channel_opening = true;
+        return;
+    }
+
     uint32_t host_format = 0x0000BEEFU;
     usb.ControlTransferOut(dev, GS_USB_BREQ_HOST_FORMAT, 1, 0, reinterpret_cast<const uint8_t*>(&host_format), sizeof(host_format));
     usb.ControlTransferOut(dev, GS_USB_BREQ_BITTIMING, 0, 0, reinterpret_cast<const uint8_t*>(&d.nom_bt), sizeof(d.nom_bt));
@@ -474,8 +548,15 @@ void AppUI::StopCanChannel(int dev) {
     auto& usb = WebUsbBridge::GetInstance();
     usb.StopRxPump(dev);
 
-    GsDeviceMode mode_cmd = {GS_CAN_MODE_RESET, 0};
-    usb.ControlTransferOut(dev, GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd));
+    if (d.protocol == PROTOCOL_PEAK_PCAN_FD) {
+        const auto transfers = CanProtocolPcan::BuildStopCommands(0);
+        for (size_t i = 0; i < transfers.size(); ++i) {
+            usb.CommandOut(dev, kPcanCmdIdStop + static_cast<int>(i), transfers[i].data(), static_cast<int>(transfers[i].size()));
+        }
+    } else {
+        GsDeviceMode mode_cmd = {GS_CAN_MODE_RESET, 0};
+        usb.ControlTransferOut(dev, GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd));
+    }
     d.channel_opening = false;
     d.channel_open = false;
 }
@@ -554,16 +635,20 @@ bool AppUI::TargetHasOpenChannel(int target) const {
 
 // Sends one frame to one adapter, or to every adapter that is BUS ON. Returns the number of adapters.
 int AppUI::SendFrame(const CanMessage& msg, int target) {
-    std::vector<uint8_t> usb_bytes;
+    // The transfer format depends on the adapter's protocol: build it once per protocol in use
+    std::vector<uint8_t> usb_bytes[2];
+    bool built[2] = {false, false};
     int sent = 0;
     for (int dev = 0; dev < kMaxDevices; ++dev) {
         if (target != kTargetAllDevices && target != dev) continue;
         if (!IsBusOn(dev)) continue;
-        if (usb_bytes.empty()) {
-            CanProtocolHandler protocol;
-            usb_bytes = protocol.BuildTxBuffer(msg);
+        const CanProtocolType protocol = devices_[dev].protocol;
+        const int slot = (protocol == PROTOCOL_PEAK_PCAN_FD) ? 1 : 0;
+        if (!built[slot]) {
+            usb_bytes[slot] = CanProtocolHandler::BuildTx(protocol, msg, 0);
+            built[slot] = true;
         }
-        WebUsbBridge::GetInstance().TransferOut(dev, 0, usb_bytes.data(), static_cast<int>(usb_bytes.size()));
+        WebUsbBridge::GetInstance().TransferOut(dev, 0, usb_bytes[slot].data(), static_cast<int>(usb_bytes[slot].size()));
         ++sent;
     }
     return sent;
@@ -668,7 +753,9 @@ float AppUI::RenderMenuBar() {
 // Helper for Bit-Timing configuration UI
 static void RenderBittimingEditor(
     const char* label_prefix,
+    CanProtocolType protocol,
     uint32_t fclk_hz,
+    const CanBitTimingLimits& limits,
     GsDeviceBittiming& bt,
     int& target_kbps,
     float& target_sp)
@@ -683,7 +770,7 @@ static void RenderBittimingEditor(
     ImGui::PopItemWidth();
     ImGui::SameLine();
     if (ImGui::Button("Auto-Calc")) {
-        CanProtocolHandler::AutoCalculateBittiming(fclk_hz, static_cast<uint32_t>(target_kbps) * 1000U, target_sp, bt);
+        CalculateTiming(protocol, fclk_hz, static_cast<uint32_t>(target_kbps) * 1000U, target_sp, limits, bt);
     }
 
     int brp  = static_cast<int>(bt.brp);
@@ -692,16 +779,18 @@ static void RenderBittimingEditor(
     int seg2 = static_cast<int>(bt.phase_seg2);
     int sjw  = static_cast<int>(bt.sjw);
 
+    // The fields are limited by the controller registers: prop_seg + phase_seg1 share TSEG1
+    const int tseg1_max = static_cast<int>(limits.tseg1_max);
     ImGui::PushItemWidth(70);
-    if (ImGui::InputInt("BRP", &brp, 1, 5))   bt.brp = std::clamp(brp, 1, 1024);
+    if (ImGui::InputInt("BRP", &brp, 1, 5))   bt.brp = std::clamp(brp, 1, static_cast<int>(limits.brp_max));
     ImGui::SameLine();
-    if (ImGui::InputInt("Prop", &prop, 1, 2)) bt.prop_seg = std::clamp(prop, 0, 256);
+    if (ImGui::InputInt("Prop", &prop, 1, 2)) bt.prop_seg = std::clamp(prop, 0, std::max(0, std::min(256, tseg1_max - seg1)));
     ImGui::SameLine();
-    if (ImGui::InputInt("Seg1", &seg1, 1, 2)) bt.phase_seg1 = std::clamp(seg1, 1, 256);
+    if (ImGui::InputInt("Seg1", &seg1, 1, 2)) bt.phase_seg1 = std::clamp(seg1, 1, std::max(1, std::min(256, tseg1_max - prop)));
     ImGui::SameLine();
-    if (ImGui::InputInt("Seg2", &seg2, 1, 2)) bt.phase_seg2 = std::clamp(seg2, 1, 128);
+    if (ImGui::InputInt("Seg2", &seg2, 1, 2)) bt.phase_seg2 = std::clamp(seg2, 1, static_cast<int>(limits.tseg2_max));
     ImGui::SameLine();
-    if (ImGui::InputInt("SJW", &sjw, 1, 1))   bt.sjw = std::clamp(sjw, 1, 128);
+    if (ImGui::InputInt("SJW", &sjw, 1, 1))   bt.sjw = std::clamp(sjw, 1, static_cast<int>(limits.sjw_max));
     ImGui::PopItemWidth();
 
     CanTimingMetrics m = CanProtocolHandler::ComputeTimingMetrics(fclk_hz, bt);
@@ -908,13 +997,18 @@ void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
         label_cell("Last event");
         cell(d.status.empty() ? "-" : d.status.c_str());
 
+        const bool pcan = d.protocol == PROTOCOL_PEAK_PCAN_FD;
+        row("Protocol", d.connected ? std::string(CanProtocolName(d.protocol)) : std::string(),
+            "Bootloader", d.pcan_bl);
         row("Adapter",  d.info.product,      "Manufacturer", d.info.manufacturer);
-        row("Serial",   d.info.serial,       "VID:PID",      fmt("%04X:%04X", d.info.vid, d.info.pid));
+        row("Serial",   d.info.serial.empty() ? d.pcan_serial : d.info.serial,
+            "VID:PID",  fmt("%04X:%04X", d.info.vid, d.info.pid));
         row("USB",      d.info.usb_version,  "Device rev.",  d.info.device_version);
-        row("Firmware", d.has_config ? fmt("v%u", d.config.sw_version) : std::string(),
-            "Hardware", d.has_config ? fmt("v%u", d.config.hw_version) : std::string());
+        row("Firmware", pcan ? d.pcan_fw : (d.has_config ? fmt("v%u", d.config.sw_version) : std::string()),
+            "Hardware", pcan ? (d.pcan_hw.empty() ? std::string() : "PCB " + d.pcan_hw + (d.pcan_mcu.empty() ? "" : ", MCU " + d.pcan_mcu))
+                             : (d.has_config ? fmt("v%u", d.config.hw_version) : std::string()));
         row("CAN clock", d.has_bt_const ? fmt("%.1f MHz", d.bt_const.fclk_can / 1e6) : std::string("(not read yet)"),
-            "CAN channels", d.has_config ? fmt("%u", static_cast<unsigned>(d.config.icount) + 1u) : std::string());
+            "CAN channels", pcan ? d.pcan_channels : (d.has_config ? fmt("%u", static_cast<unsigned>(d.config.icount) + 1u) : std::string()));
         row("Endpoints", d.endpoints, "Features", d.has_bt_const ? FeatureList(d.bt_const.feature) : std::string());
         row("USB/s",    d.connected ? fmt("%u transfers/s", ds.rx_per_sec) : std::string(),
             "Frames",   d.connected ? fmt("%u", ds.frames) : std::string());
@@ -929,25 +1023,33 @@ void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
     if (ImGui::CollapsingHeader(title, ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::BeginDisabled(d.channel_open || d.channel_opening);
 
+        // A PEAK adapter runs its CAN cores from a fixed 80 MHz domain and has no internal loopback mode
+        const bool fixed_clock = d.protocol == PROTOCOL_PEAK_PCAN_FD;
         int clk_mhz = static_cast<int>(d.bt_const.fclk_can / 1000000U);
+        ImGui::BeginDisabled(fixed_clock);
         ImGui::PushItemWidth(80);
         if (ImGui::InputInt("CAN Clock (MHz)", &clk_mhz, 1, 10)) {
             d.bt_const.fclk_can = static_cast<uint32_t>(std::clamp(clk_mhz, 1, 400)) * 1000000U;
         }
         ImGui::PopItemWidth();
+        ImGui::EndDisabled();
+        if (fixed_clock && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Fixed by the adapter");
         ImGui::SameLine();
         ImGui::Checkbox("CAN FD", &d.enable_fd);
         ImGui::SameLine();
+        ImGui::BeginDisabled(fixed_clock);
         ImGui::Checkbox("Loopback", &d.enable_loopback);
+        ImGui::EndDisabled();
+        if (fixed_clock && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Not available for this adapter");
         ImGui::SameLine();
         ImGui::Checkbox("Listen-Only", &d.enable_listen_only);
 
         ImGui::SeparatorText("Nominal Arbitration Timing");
-        RenderBittimingEditor("Nom", d.bt_const.fclk_can, d.nom_bt, d.target_nom_kbps, d.target_nom_sp);
+        RenderBittimingEditor("Nom", d.protocol, d.bt_const.fclk_can, NominalLimitsOf(d), d.nom_bt, d.target_nom_kbps, d.target_nom_sp);
 
         if (d.enable_fd) {
             ImGui::SeparatorText("CAN FD Data Phase Timing");
-            RenderBittimingEditor("Data", d.bt_const.fclk_can, d.data_bt, d.target_data_kbps, d.target_data_sp);
+            RenderBittimingEditor("Data", d.protocol, d.bt_const.fclk_can, DataLimitsOf(d), d.data_bt, d.target_data_kbps, d.target_data_sp);
         }
 
         ImGui::EndDisabled();

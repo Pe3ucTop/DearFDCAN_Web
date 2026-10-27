@@ -14,8 +14,21 @@ constexpr int kMaxDevices = 8;
 
 // Supported USB-CAN hardware protocol backends
 enum CanProtocolType : int {
-    PROTOCOL_GS_USB_CANDLELIGHT = 0
+    PROTOCOL_GS_USB_CANDLELIGHT = 0,
+    PROTOCOL_PEAK_PCAN_FD       = 1   // PEAK PCAN-USB FD family (uCAN firmware protocol)
 };
+
+inline const char* CanProtocolName(CanProtocolType type) {
+    return type == PROTOCOL_PEAK_PCAN_FD ? "PEAK PCAN-USB FD (uCAN)" : "gs_usb (candleLight / CANable)";
+}
+
+// Chooses the protocol of an adapter from its USB ids. PEAK-System (0x0C72): PCAN-USB Pro FD 0x0011,
+// PCAN-USB FD 0x0012, PCAN-Chip USB 0x0013, PCAN-USB X6 0x0014. Everything else is treated as gs_usb.
+// (usb_worker.js keeps the same table: it opens the device and has to know the endpoint layout.)
+inline CanProtocolType CanDetectProtocol(uint16_t vid, uint16_t pid) {
+    if (vid == 0x0C72 && pid >= 0x0011 && pid <= 0x0014) return PROTOCOL_PEAK_PCAN_FD;
+    return PROTOCOL_GS_USB_CANDLELIGHT;
+}
 
 // SocketCAN style identifier masks
 constexpr uint32_t CAN_ID_EFF_MASK = 0x1FFFFFFFU;
@@ -34,6 +47,15 @@ struct CanBittiming {
 
 static_assert(sizeof(CanBittiming) == 20, "CanBittiming is a wire format");
 
+// Hardware limits of one bit-timing register set (all values in time quanta / prescaler steps).
+// tseg1 is prop_seg + phase_seg1; every maximum is the largest value the controller can take.
+struct CanBitTimingLimits {
+    uint32_t tseg1_max;
+    uint32_t tseg2_max;
+    uint32_t sjw_max;
+    uint32_t brp_max;
+};
+
 // Computed timing metrics for UI display
 struct CanTimingMetrics {
     double tq_ns;            // Duration of 1 Time Quantum in nanoseconds
@@ -41,6 +63,16 @@ struct CanTimingMetrics {
     uint32_t tseg1_total;    // Combined TSEG1 (prop_seg + phase_seg1)
     double actual_bitrate;   // Resulting bitrate in bps
     double sample_point_pct; // Sample point position in %
+};
+
+// Reassembly state of a receive stream whose records can be split across two USB transfers (PEAK uCAN:
+// a record that does not fit at the end of one transfer continues at the start of the next one).
+// One instance per adapter, owned by the caller; protocols that do not need it ignore it.
+struct CanRxStreamState {
+    static constexpr size_t kMaxRecord = 128;
+    uint8_t frag[kMaxRecord] = {};
+    uint16_t frag_len = 0;               // bytes of the unfinished record held in `frag`
+    void Reset() { frag_len = 0; }
 };
 
 // Fixed-capacity payload (CAN FD maximum is 64 bytes) with a std::vector-like surface.
@@ -194,6 +226,47 @@ namespace CanProtocolUtils {
         out_bt.sjw        = std::min<uint32_t>(tseg2, 4U);
 
         return true;
+    }
+
+    // Same search, but only time-quanta counts whose segments fit the controller's registers are
+    // considered (needed e.g. for the narrow data-phase registers of PEAK adapters). Returns false, leaving
+    // out_bt untouched, if no combination fits.
+    inline bool AutoCalculateBittiming(uint32_t fclk_hz, uint32_t target_bitrate_bps, float sample_point_pct,
+                                       const CanBitTimingLimits& limits, CanBittiming& out_bt) {
+        if (fclk_hz == 0 || target_bitrate_bps == 0) return false;
+
+        bool found = false;
+        double best_error = 1e18;
+        CanBittiming best = {};
+
+        for (uint32_t total_tq = 8; total_tq <= 80; ++total_tq) {
+            uint32_t brp = static_cast<uint32_t>(std::round(static_cast<double>(fclk_hz) / (static_cast<double>(target_bitrate_bps) * total_tq)));
+            if (brp < 1 || brp > limits.brp_max) continue;
+
+            uint32_t sync_plus_tseg1 = static_cast<uint32_t>(std::round((sample_point_pct / 100.0f) * total_tq));
+            if (sync_plus_tseg1 < 2) sync_plus_tseg1 = 2;
+            if (sync_plus_tseg1 >= total_tq) sync_plus_tseg1 = total_tq - 1;
+            const uint32_t tseg1 = sync_plus_tseg1 - 1;
+            const uint32_t tseg2 = total_tq - 1 - tseg1;
+            if (tseg1 > limits.tseg1_max || tseg2 > limits.tseg2_max) continue;
+
+            const double actual_bps = static_cast<double>(fclk_hz) / (static_cast<double>(brp) * total_tq);
+            const double rate_err = std::abs(actual_bps - static_cast<double>(target_bitrate_bps));
+            const double tq_penalty = std::abs(static_cast<int>(total_tq) - 16) * 0.1;
+            const double score = rate_err + tq_penalty;
+            if (score >= best_error) continue;
+
+            best_error = score;
+            found = true;
+            best.brp        = brp;
+            best.prop_seg   = tseg1 / 2;
+            best.phase_seg1 = tseg1 - best.prop_seg;
+            best.phase_seg2 = tseg2;
+            best.sjw        = std::min<uint32_t>(std::min<uint32_t>(tseg2, 4U), limits.sjw_max);
+        }
+
+        if (found) out_bt = best;
+        return found;
     }
 
 } // namespace CanProtocolUtils

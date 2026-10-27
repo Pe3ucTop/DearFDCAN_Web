@@ -147,8 +147,8 @@ int main(int, char**) {
         g_AppUI.OnDeviceAdded(dev, info);
     });
 
-    webusb.SetOnDeviceOpened([](int dev, const std::string& endpoints) {
-        g_AppUI.OnDeviceOpened(dev, endpoints);
+    webusb.SetOnDeviceOpened([](int dev, const DeviceOpenInfo& open) {
+        g_AppUI.OnDeviceOpened(dev, open);
     });
 
     webusb.SetOnDeviceClosed([](int dev, const std::string& reason) {
@@ -163,7 +163,7 @@ int main(int, char**) {
         g_AppUI.OnControlDataReceived(dev, request, data, length);
     });
 
-    webusb.SetOnControlOutDone([](int dev, uint8_t request, bool ok) {
+    webusb.SetOnControlOutDone([](int dev, int request, bool ok) {
         g_AppUI.OnControlOutDone(dev, request, ok);
     });
 

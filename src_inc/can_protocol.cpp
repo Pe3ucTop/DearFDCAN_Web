@@ -1,7 +1,35 @@
 #include "can_protocol.h"
 
-// Facade over the protocol backends. Only gs_usb exists so far, so every call is forwarded to it;
-// the backend will be selected per adapter once more protocols are available.
+// Facade over the protocol backends: the protocol-aware calls pick the backend of an adapter, the
+// shortcuts without a protocol argument go to gs_usb.
+
+void CanProtocolHandler::ParseRx(CanProtocolType type, const uint8_t* buffer, int length, std::vector<CanMessage>& out,
+                                 CanRxStreamState& state) {
+    switch (type) {
+        case PROTOCOL_PEAK_PCAN_FD:
+            CanProtocolPcan::ParseRxStream(buffer, length, out, state);
+            break;
+        case PROTOCOL_GS_USB_CANDLELIGHT:
+        default:
+            CanProtocolGsUsb::ParseRxBuffer(buffer, length, out);
+            break;
+    }
+}
+
+std::vector<uint8_t> CanProtocolHandler::BuildTx(CanProtocolType type, const CanMessage& msg, uint8_t channel) {
+    switch (type) {
+        case PROTOCOL_PEAK_PCAN_FD:
+            return CanProtocolPcan::BuildTxBuffer(msg, channel);
+        case PROTOCOL_GS_USB_CANDLELIGHT:
+        default:
+            return CanProtocolGsUsb::BuildTxBuffer(msg, channel);
+    }
+}
+
+bool CanProtocolHandler::AutoCalculateBittiming(uint32_t fclk_hz, uint32_t target_bitrate_bps, float sample_point_pct,
+                                                const CanBitTimingLimits& limits, CanBittiming& out_bt) {
+    return CanProtocolUtils::AutoCalculateBittiming(fclk_hz, target_bitrate_bps, sample_point_pct, limits, out_bt);
+}
 
 std::vector<CanMessage> CanProtocolHandler::ParseRxBuffer(const uint8_t* buffer, int length) {
     return CanProtocolGsUsb::ParseRxBuffer(buffer, length);

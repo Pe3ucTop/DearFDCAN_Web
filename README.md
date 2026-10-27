@@ -1,13 +1,15 @@
 # DearFDCAN_Web
 
 FDCAN viewer for the web, in the spirit of PCAN-View: Dear ImGui user interface, WebUSB transport and the
-GS-USB (candleLight / CANable style) protocol, compiled to WebAssembly with Emscripten. It runs in a
+GS-USB (candleLight / CANable style) and PEAK PCAN-USB FD protocols, compiled to WebAssembly with Emscripten. It runs in a
 Chromium-based browser (WebUSB is not available in Firefox/Safari) and talks to the adapter directly, no
 driver or native application needed.
 
 ## Features
 
 - Classic CAN and CAN FD (BRS, ESI), standard and extended IDs, remote frames.
+- **Two adapter families**: gs_usb (candleLight / CANable and compatible) and PEAK PCAN-USB FD (VID 0C72, PID 0011..0014, one CAN port);
+  the protocol is chosen from the USB ids and adapters of both families can be used side by side.
 - **Several adapters at once** (up to 8). Every adapter gets a device number (1..8) and its own bit timing, mode and statistics;
   frames of all adapters are received simultaneously.
 - **Devices window**: add / connect / disconnect / remove adapters, state of each one (Connecting, Connected, BUS ON, Disconnected),
@@ -62,9 +64,11 @@ driver or native application needed.
 | GNU make | 4.3 |
 | Python 3 | 3.12 (standard library only, used by `pack_worker.py`) |
 | Browser | Chromium-based (Chrome/Edge) with WebUSB, served over `https://` or `http://localhost` |
-| Adapter | GS-USB compatible firmware (candleLight FD style); hardware timestamps need the `HW_TIMESTAMP` feature |
+| Adapter | GS-USB compatible firmware (candleLight FD style; hardware timestamps need the `HW_TIMESTAMP` feature), or a PEAK PCAN-USB FD family adapter (not tested on real hardware, see the change history) |
 
-On Linux the adapter usually needs a udev rule that grants your user access to the USB device.
+On Linux the adapter usually needs a udev rule that grants your user access to the USB device. PEAK adapters are claimed by the
+`peak_usb` / `pcanfd` kernel driver (Linux) or the PEAK driver (Windows) as soon as they are plugged in; WebUSB can use them only when that
+driver is not bound to the device (unbind it, or use WinUSB/Zadig on Windows).
 
 ## Build
 
@@ -139,6 +143,7 @@ All sources and headers are in `src_inc/`:
 | `src_inc/can_core.cpp` | Worker wasm module: frame parsing, ID table keyed by (device, ID), trace queue, per-adapter clock mapping |
 | `src_inc/can_protocol_common.h` | Protocol independent definitions: `CanMessage`/`CanPayload`, `CanBittiming`, `CanProtocolType`, DLC helpers, bit-timing calculation, `kMaxDevices` |
 | `src_inc/can_protocol_gsusb.cpp/.h` | gs_usb (candleLight / CANable): control requests, structures, bulk frame parsing and building |
+| `src_inc/can_protocol_pcan.cpp/.h` | PEAK PCAN-USB FD (uCAN): packed command/record structures, command transfers (clock, options, bit timing, filter, bus on/off), record stream parsing with reassembly across transfers, frame building, bit-timing limits |
 | `src_inc/can_protocol.cpp/.h` | Umbrella header and the `CanProtocolHandler` facade: the single entry point the UI and the core use, forwards to the protocol backend |
 | `src_inc/can_wire.h` | Snapshot format shared by the page and the worker core |
 
@@ -157,7 +162,10 @@ Tunables: `RX_SLOTS`, `TX_INFLIGHT`, `PUBLISH_MS`, `BATCH_CREDITS` at the top of
 
 - Chromium only. An adapter is matched by VID/PID/serial. Identical adapters without serial numbers can be told apart only by
   "not yet in use", so after replugging them their device numbers may be swapped.
-- Only CAN channel 0 of an adapter is used; multi-channel gs_usb adapters show their channel count but are driven as one channel.
+- Only CAN channel 0 of an adapter is used; multi-channel adapters (gs_usb with several channels, PCAN-USB X6 / Pro FD with two ports) show their
+  channel count but are driven as one channel.
+- PEAK specifics: the protocol is picked from the USB ids only (no manual override); every transmitted frame requests a TX echo, calibration,
+  status and error records are ignored, there is no hardware loopback switch and the CAN clock is fixed at 80 MHz.
 - At most 8 adapters (`kMaxDevices` in `can_protocol.h`, `MAX_DEVICES` in `usb_worker.js`, `MAX_DEVICES` in `webusb_bridge.cpp`). The limits
   of the ID table (65536 rows) and the trace are shared by all adapters.
 - `TX_INFLIGHT = 4` keeps several bulk OUT transfers in flight; WebUSB does not guarantee their order. Set it to `1` if strict frame order matters.
@@ -245,6 +253,24 @@ worker, one connection and channel state and one bit-timing configuration in the
   and its layout by rendering the ImGui draw lists to an image. Not verified: operation with real, simultaneously connected adapters, and the
   JS code of the bridge (chooser, slot table, reconnect) in a real browser: it was only checked statically (it parses and its identifiers are defined).
 
+**2026-10-27, PEAK PCAN-USB FD protocol (stage 2).** The adapter family is selected by the USB ids (`CanDetectProtocol` in C++,
+`detectProtocol` in the worker). New `can_protocol_pcan.*` contains the uCAN structures, taken from PEAK's own Linux driver sources
+(`pcanfd_usb_fw.h`, `pcanfd_usb.c`, `pcanfd_core_user.h` of peak-linux-driver 9.3.1), not from the draft in `to_merge/`: 28-byte receive and
+20-byte transmit records, command opcodes, option bits, frame flags, timing register widths, 64-row acceptance filter, command transfers of at
+most 512 bytes (terminated by eight 0xFF bytes unless full). Because a record can be split between two USB transfers, the core keeps a receive-stream
+state per adapter (`CanRxStreamState`, reset on open, when the receive gate is toggled and on recovery). The worker performs the open handshake
+(vendor requests "driver loaded" and "firmware info" with recipient *other*), takes the endpoint numbers from the firmware info, sends command
+transfers in order (`cmd_out`, acknowledged with the command id) and probes liveness with the firmware-info read. The UI starts a PEAK channel by
+writing the command transfers (clock, options, nominal and data timing, filter, bus on) and treats the channel as open when the last one was
+written; bit timing is calculated from the fixed 80 MHz clock within PEAK's limits (`CanBitTimingLimits`). gs_usb behaviour is unchanged (digests
+of about 400 000 receive transfers and all timing/DLC cases are identical to the pre-stage-2 code). Verified without hardware: structure sizes and
+field offsets against the PEAK headers, command byte streams, record parsing including fragmentation and a fuzzer under ASan/UBSan (one defect found
+and fixed there: a negative `memcpy` size on an inconsistent stream state), the core with a PEAK adapter next to a gs_usb one, the worker against
+mock `USBDevice`s (handshake, endpoints from the info record, command order and failure ack, fragmented stream, stream reset, handshake failure,
+liveness probe), also with the packed single-file worker, the UI sequences (start/stop/rollback, TX bytes, timing limits) headless, and both build
+modes without warnings. **Not verified: any real PEAK adapter.** Timestamps are treated as microseconds as in PEAK's driver. Adapters with
+several CAN ports are the next stage.
+
 **2026-10-27, protocol layer split (stage 1 of adding a second protocol).** `can_protocol.h/.cpp` held both the protocol independent types
 and everything gs_usb specific. They were split into `can_protocol_common.h` (types, bit-timing and DLC helpers) and `can_protocol_gsusb.h/.cpp`
 (gs_usb requests, structures, frame parsing/building), following the structure of the proposal in `to_merge/`, but based on the current code
@@ -255,7 +281,7 @@ keeps its API and forwards to the gs_usb backend, so the UI and the core did not
 One defect was fixed on the way: a frame announcing more data than it holds (for example a 24-byte transfer with the FD flag and DLC 15, or such
 a frame inside a multi-frame transfer) made the parser read up to 64 bytes beyond the frame (AddressSanitizer: heap-buffer-overflow). The parser
 now copies what is there and pads the payload with zeros; frames that are well formed are not affected. The next stages are the PCAN-USB FD protocol
-and adapters with several CAN ports.
+and adapters with several CAN ports (the first is done, see above).
 
 What was and was not verified overall: the CAN core, frame parser and URL parsing were unit-tested natively (ASan/UBSan) and the worker was exercised
 against a mock `USBDevice` with the real core module in Node; the single-file Blob-Worker and the `-O2` page were confirmed on hardware with one adapter.

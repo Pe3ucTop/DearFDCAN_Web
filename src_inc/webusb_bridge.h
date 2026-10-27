@@ -17,6 +17,26 @@ struct UsbDeviceInfo {
     std::string device_version;  // bcdDevice, e.g. "1.0.0"
 };
 
+// What the worker learned when it opened an adapter
+struct DeviceOpenInfo {
+    std::string endpoints;                                   // endpoint list of the data interface
+    CanProtocolType protocol = PROTOCOL_GS_USB_CANDLELIGHT;  // detected from the USB ids
+    std::string info;                                        // protocol specific details as "key=value;key=value"
+
+    // Value of a key of `info`, empty if it is not there (PCAN: fw, bl, hw, mcu, ser, ch, fwtype)
+    std::string Get(const std::string& key) const {
+        size_t pos = 0;
+        while (pos < info.size()) {
+            size_t end = info.find(';', pos);
+            if (end == std::string::npos) end = info.size();
+            const size_t eq = info.find('=', pos);
+            if (eq != std::string::npos && eq < end && info.compare(pos, eq - pos, key) == 0) return info.substr(eq + 1, end - eq - 1);
+            pos = end + 1;
+        }
+        return std::string();
+    }
+};
+
 // Transport counters of one adapter: worker stats (once per second) plus the frame count from the snapshots
 struct UsbDeviceStats {
     uint32_t rx_per_sec = 0;       // USB transfers completed per second
@@ -46,12 +66,12 @@ struct UsbStats {
 class WebUsbBridge {
 public:
     using DeviceAddedCallback = std::function<void(int dev, const UsbDeviceInfo&)>;     // picked / reconnecting
-    using DeviceOpenedCallback = std::function<void(int dev, const std::string& endpoints)>;
+    using DeviceOpenedCallback = std::function<void(int dev, const DeviceOpenInfo&)>;
     using DeviceClosedCallback = std::function<void(int dev, const std::string& reason)>;
     using MessageCallback = std::function<void(const std::string& text)>;               // user-facing notice
     using SnapshotCallback = std::function<void(const SnapshotView&)>;
     using ControlInCallback = std::function<void(int dev, uint8_t request, const uint8_t* data, int length)>;
-    using ControlOutDoneCallback = std::function<void(int dev, uint8_t request, bool ok)>;
+    using ControlOutDoneCallback = std::function<void(int dev, int request, bool ok)>;
 
     static WebUsbBridge& GetInstance();
 
@@ -80,6 +100,10 @@ public:
     // Send a Control IN transfer (Device -> Host on EP0)
     void ControlTransferIn(int dev, uint8_t request, uint16_t value, uint16_t index, uint16_t length);
 
+    // Send a command transfer to the adapter's command endpoint (PEAK uCAN). It runs in the same order as
+    // the control transfers and is acknowledged through the control-OUT-done callback with `id` as request.
+    void CommandOut(int dev, int id, const uint8_t* data, int length);
+
     // Core state commands (all adapters). Snapshot parts produced before a clear are discarded by
     // sequence number, so cleared rows cannot reappear from snapshots that were already in flight.
     void ClearIdTable();
@@ -99,12 +123,12 @@ public:
 
     // Internal handlers invoked by extern "C" functions
     void InternalOnDeviceAdded(int dev, const UsbDeviceInfo& info);
-    void InternalOnDeviceOpened(int dev, const char* endpoints);
+    void InternalOnDeviceOpened(int dev, const char* endpoints, int protocol, const char* info);
     void InternalOnDeviceClosed(int dev, const char* reason);
     void InternalOnMessage(const char* text);
     void InternalOnSnapshot(const uint8_t* data, int length);
     void InternalOnControlIn(int dev, uint8_t request, const uint8_t* data, int length);
-    void InternalOnControlOutDone(int dev, uint8_t request, bool ok);
+    void InternalOnControlOutDone(int dev, int request, bool ok);
     void InternalOnStats(int dev, uint32_t rx_per_sec, uint32_t tx_dropped, uint32_t recoveries,
                          uint32_t rx_errors, uint32_t tx_errors);
 

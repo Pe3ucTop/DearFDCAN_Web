@@ -43,7 +43,7 @@ OBJ := $(BUILD)/obj
 # ---------------------------------------------------------------------------------------------
 # Page: Dear ImGui user interface + WebUSB bridge
 # ---------------------------------------------------------------------------------------------
-APP_SRCS   := main.cpp webusb_bridge.cpp can_protocol.cpp can_protocol_gsusb.cpp app_ui.cpp
+APP_SRCS   := main.cpp webusb_bridge.cpp can_protocol.cpp can_protocol_gsusb.cpp can_protocol_pcan.cpp app_ui.cpp
 IMGUI_SRCS := imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp \
               backends/imgui_impl_glfw.cpp backends/imgui_impl_opengl3.cpp
 
@@ -60,11 +60,11 @@ PAGE_LDFLAGS := $(OPT) -sUSE_GLFW=3 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 
 # ---------------------------------------------------------------------------------------------
 # CAN core: separate wasm module that runs inside the USB worker
 # ---------------------------------------------------------------------------------------------
-CORE_OBJS := $(OBJ)/core/can_core.o $(OBJ)/core/can_protocol.o $(OBJ)/core/can_protocol_gsusb.o
+CORE_OBJS := $(OBJ)/core/can_core.o $(OBJ)/core/can_protocol.o $(OBJ)/core/can_protocol_gsusb.o $(OBJ)/core/can_protocol_pcan.o
 
 CORE_COMMON := -std=c++17 $(OPT) -I$(SRC)
 
-CORE_EXPORTS := ["_core_stage_ptr","_core_stage_cap","_core_out_ptr","_core_out_cap","_core_process","_core_publish","_core_clear_table","_core_clear_trace","_core_set_trace_enabled","_core_reset_clock"]
+CORE_EXPORTS := ["_core_stage_ptr","_core_stage_cap","_core_out_ptr","_core_out_cap","_core_process","_core_publish","_core_clear_table","_core_clear_trace","_core_set_trace_enabled","_core_reset_clock","_core_set_protocol","_core_reset_stream"]
 CORE_LDFLAGS := $(OPT) -sMODULARIZE=1 -sEXPORT_NAME=createCanCore -sENVIRONMENT=worker \
                 -sALLOW_MEMORY_GROWTH=1 -sEXPORTED_RUNTIME_METHODS='["HEAPU8"]' \
                 -sEXPORTED_FUNCTIONS='$(CORE_EXPORTS)'

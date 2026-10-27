@@ -43,8 +43,13 @@ struct DeviceSlot {
     bool channel_opening = false; // control sequence sent, waiting for the MODE_START acknowledgement
     bool channel_open = false;    // BUS ON
     UsbDeviceInfo info;
+    CanProtocolType protocol = PROTOCOL_GS_USB_CANDLELIGHT;   // known once the worker opened the adapter
     std::string endpoints;        // data interface endpoints as read from the descriptor
     std::string status;           // reason of the last disconnect
+
+    // PEAK adapters report these in their firmware info (empty for gs_usb)
+    std::string pcan_fw, pcan_bl, pcan_hw, pcan_mcu, pcan_serial, pcan_channels;
+    int pcan_start_last_id = 0;   // id of the last command transfer of a pending start sequence
 
     bool has_bt_const = false;    // GS_USB_BREQ_BT_CONST answered
     bool has_config = false;      // GS_USB_BREQ_DEVICE_CONFIG answered
@@ -77,13 +82,13 @@ public:
 
     // Device events from the bridge (dev = device number / slot)
     void OnDeviceAdded(int dev, const UsbDeviceInfo& info);
-    void OnDeviceOpened(int dev, const std::string& endpoints);
+    void OnDeviceOpened(int dev, const DeviceOpenInfo& open);
     void OnDeviceClosed(int dev, const std::string& reason);
     void OnNotice(const std::string& text);
     // Applies a snapshot from the worker core: changed ID table rows and new trace entries
     void OnSnapshot(const SnapshotView& snapshot);
     void OnControlDataReceived(int dev, uint8_t request, const uint8_t* data, int length);
-    void OnControlOutDone(int dev, uint8_t request, bool ok);
+    void OnControlOutDone(int dev, int request, bool ok);
 
 private:
     void StartCanChannel(int dev);
@@ -94,6 +99,7 @@ private:
     static bool ValidDevice(int dev) { return dev >= 0 && dev < kMaxDevices; }
     void InitDeviceDefaults(DeviceSlot& d) const;
     static void RecalculateTimings(DeviceSlot& d);
+    static void ApplyProtocol(DeviceSlot& d, CanProtocolType protocol);
     bool IsBusOn(int dev) const;
     int ConnectedDeviceCount() const;
     int BusOnDeviceCount() const;

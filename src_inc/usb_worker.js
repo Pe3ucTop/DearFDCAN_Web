@@ -14,12 +14,20 @@
 // number), keeps the "Table by ID" aggregates and the trace queue, and publishes compact snapshots of
 // what changed. The page only applies snapshots; it never sees individual frames of a busy bus.
 //
+// Two protocols are supported (chosen per adapter from its USB ids, or forced by `protocol` of `open`):
+//   0  gs_usb (candleLight / CANable): vendor control requests configure the adapter, one frame per bulk transfer
+//   1  PEAK PCAN-USB FD (uCAN): commands are bulk OUT transfers to a command endpoint, frames are records on a
+//      shared bulk IN endpoint (a record can span two transfers) and on one bulk OUT endpoint per CAN channel.
+//      The open handshake reads the firmware info (vendor request, recipient "other") for the endpoint numbers.
+//
 // Main -> worker messages ("dev" selects the adapter)
 //   init     {timeOrigin}                          performance.timeOrigin of the page (clock alignment)
-//   open     {dev, epoch, vid, pid, serial}        open the (already permitted) device, start RX slots
+//   open     {dev, epoch, vid, pid, serial, protocol?}  open the (already permitted) device, start RX slots
 //   close    {dev}
-//   ctrl_out {dev, request, value, index, data}    vendor control OUT, executed strictly in order per device
-//   ctrl_in  {dev, request, value, index, length}  vendor control IN, executed strictly in order per device
+//   ctrl_out {dev, request, value, index, data, reqType?, recipient?}   control OUT, executed strictly in order per device
+//   ctrl_in  {dev, request, value, index, length, reqType?, recipient?} control IN, executed strictly in order per device
+//   cmd_out  {dev, id, ep, data}                   bulk OUT command transfer (ep 0 = command endpoint), executed in
+//                                                  the same order as the control transfers, acknowledged as ctrl_ack {request: id}
 //   tx       {dev, ep, data}                       bulk OUT frame (bounded queue, limited in-flight); ep 0 = detected
 //   rx       {dev, enable, ep, size}               gate processing of received frames (+ endpoint config)
 //   core     {op, arg}                             op 1 = clear ID table, 2 = clear trace, 3 = trace on/off (all devices)
@@ -27,7 +35,7 @@
 //
 // Worker -> main messages (`dev` + `epoch` = connection the message belongs to; snapshots are global and
 // valid in any session because the table and trace live across connections)
-//   opened   {dev, epoch, eps, rxEp, txEp}
+//   opened   {dev, epoch, eps, rxEp, txEp, protocol, info}   info = "key=value;..." (PCAN: fw, bl, hw, mcu, ser, ch)
 //   closed   {dev, epoch, reason}
 //   snapshot {buf, used}                           SnapshotHeader + records, see can_wire.h
 //   ctrl_in  {dev, epoch, request, data}
@@ -52,6 +60,19 @@ const PING_TIMEOUT_MS = 1500;
 const PING_FAILS_MAX = 2;
 const RX_ERRORS_BEFORE_RECOVER = 5;
 const GS_USB_BREQ_BT_CONST = 4;     // harmless read used as liveness probe
+
+// Protocols (CanProtocolType in can_protocol_common.h)
+const PROTO_GS = 0;
+const PROTO_PCAN = 1;
+
+// PEAK PCAN-USB FD (values from PEAK's Linux driver)
+const PCAN_VID = 0x0C72;            // PIDs 0x0011 Pro FD, 0x0012 FD, 0x0013 Chip, 0x0014 X6
+const PCAN_RX_SIZE = 2048;          // like the vendor driver: larger transfers split fewer records
+const PCAN_EP_CMD_OUT = 1, PCAN_EP_CMD_IN = 1, PCAN_EP_MSG_IN = 2, PCAN_EP_MSG_OUT0 = 2;   // defaults, numbers without direction
+const PCAN_VREQ_INFO = 0, PCAN_VREQ_FKT = 2;
+const PCAN_VREQ_INFO_FIRMWARE = 1, PCAN_VREQ_FKT_DRIVER_LOADED = 5;
+const PCAN_FWINFO_TYPE_EXT = 2;     // from this record type on the firmware info lists the endpoint numbers
+const PCAN_FWINFO_SIZE = 84;
 
 let mainOrigin = 0;
 const devices = new Array(MAX_DEVICES).fill(null);
@@ -107,7 +128,70 @@ function sameDevice(a, b) {
                        a.serialNumber === b.serialNumber);
 }
 
-// Bulk endpoints of the data interface, from the descriptor if the browser exposes it
+// Same table as CanDetectProtocol() in can_protocol_common.h
+function detectProtocol(vid, pid) {
+    return (vid === PCAN_VID && pid >= 0x0011 && pid <= 0x0014) ? PROTO_PCAN : PROTO_GS;
+}
+
+// Text list of the bulk/interrupt endpoints of the data interface (for the information pane)
+function describeEndpoints(usb) {
+    try {
+        const iface = usb.configuration && usb.configuration.interfaces.find(i => i.interfaceNumber === IFACE);
+        const alt = iface && iface.alternate;
+        if (!alt) return '';
+        return alt.endpoints.map(e => e.direction.toUpperCase() + ' ' + e.endpointNumber + ' ' + e.type + ' ' + e.packetSize + 'B').join(', ');
+    } catch (e) { return ''; }
+}
+
+// Firmware info record of a PCAN-USB FD adapter (layout of struct pcan_usbfd_fw_info; the fields after the
+// first 28 bytes exist only in newer records, the record says how long it is)
+function parsePcanFwInfo(dv) {
+    const len = dv.byteLength;
+    if (len < 28) return null;
+    const u8 = (o) => dv.getUint8(o);
+    const size = dv.getUint16(0, true);
+    const fw = { size: size, type: dv.getUint16(2, true), hwType: u8(4), bl: [u8(5), u8(6), u8(7)], hwVersion: u8(8),
+                 fwVersion: [u8(9), u8(10), u8(11)], devId: [dv.getUint32(12, true), dv.getUint32(16, true)],
+                 serial: dv.getUint32(20, true), flags: dv.getUint32(24, true), endpoints: null, canCount: 0 };
+    if (fw.type >= PCAN_FWINFO_TYPE_EXT && len >= 33 && size >= 33) {
+        fw.endpoints = { cmdOut: u8(28) & 0x7F, cmdIn: u8(29) & 0x7F, msgOut: [u8(30) & 0x7F, u8(31) & 0x7F], msgIn: u8(32) & 0x7F };
+    }
+    if (len >= 34 && size >= 34) fw.canCount = u8(33);
+    return fw;
+}
+
+// Open handshake of a PCAN-USB FD adapter: tell the module a driver is using it, read the firmware info
+// and derive the endpoint layout. Both requests are best effort: without them the default layout is used.
+async function pcanHandshake(usb) {
+    const vendorOther = (request, value) => ({ requestType: 'vendor', recipient: 'other', request: request, value: value, index: 0 });
+    try {
+        await withTimeout(usb.controlTransferOut(vendorOther(PCAN_VREQ_FKT, PCAN_VREQ_FKT_DRIVER_LOADED), new Uint8Array([0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])),
+                          CTRL_TIMEOUT_MS, 'PCAN driver-loaded notification timeout');
+    } catch (e) { console.warn('[usb_worker] PCAN driver-loaded notification failed:', errText(e)); }
+
+    let fw = null;
+    try {
+        const r = await withTimeout(usb.controlTransferIn(vendorOther(PCAN_VREQ_INFO, PCAN_VREQ_INFO_FIRMWARE), PCAN_FWINFO_SIZE),
+                                    CTRL_TIMEOUT_MS, 'PCAN firmware info timeout');
+        if (r.status === 'ok' && r.data) fw = parsePcanFwInfo(r.data);
+    } catch (e) { console.warn('[usb_worker] PCAN firmware info failed:', errText(e)); }
+
+    const ep = fw && fw.endpoints;
+    const layout = {
+        cmdOut: ep ? ep.cmdOut : PCAN_EP_CMD_OUT, cmdIn: ep ? ep.cmdIn : PCAN_EP_CMD_IN,
+        rxEp: ep ? ep.msgIn : PCAN_EP_MSG_IN, txEp: ep ? ep.msgOut[0] : PCAN_EP_MSG_OUT0
+    };
+    // "key=value;..." for the page
+    let info = '';
+    if (fw) {
+        const ver = (a) => a[0] + '.' + a[1] + '.' + a[2];
+        info = 'fw=' + ver(fw.fwVersion) + ';bl=' + ver(fw.bl) + ';hw=' + fw.hwVersion + ';mcu=' + fw.hwType + ';ser=' + fw.serial +
+               ';ch=' + fw.canCount + ';fwtype=' + fw.type;
+    }
+    return { layout: layout, info: info };
+}
+
+// Bulk endpoints of the data interface, from the descriptor if the browser exposes it (gs_usb)
 function inspectEndpoints(usb) {
     const info = { rxEp: DEFAULT_EP_IN, txEp: DEFAULT_EP_OUT, rxSize: DEFAULT_RX_SIZE, text: '' };
     try {
@@ -151,7 +235,9 @@ class Device {
         this.rxEnabled = false;
         this.rxEp = DEFAULT_EP_IN;
         this.txEp = DEFAULT_EP_OUT;
+        this.cmdEp = 0;                 // command endpoint (PCAN); gs_usb configures through control requests
         this.rxSize = DEFAULT_RX_SIZE;
+        this.protocol = PROTO_GS;
         this.slotErr = new Array(RX_SLOTS).fill(0);
         this.recovering = false;
 
@@ -223,20 +309,36 @@ class Device {
             return;
         }
 
-        const ep = inspectEndpoints(d);
+        // Protocol: forced by the page or chosen from the USB ids; the endpoint layout depends on it
+        const protocol = (m.protocol === PROTO_GS || m.protocol === PROTO_PCAN) ? m.protocol : detectProtocol(d.vendorId, d.productId);
+        let layout, info = '', text;
+        if (protocol === PROTO_PCAN) {
+            const hs = await pcanHandshake(d);
+            layout = { rxEp: hs.layout.rxEp, txEp: hs.layout.txEp, cmdEp: hs.layout.cmdOut, rxSize: PCAN_RX_SIZE };
+            info = hs.info;
+            text = describeEndpoints(d) || ('CMD OUT ' + hs.layout.cmdOut + ', CMD IN ' + hs.layout.cmdIn + ', MSG IN ' + hs.layout.rxEp + ', MSG OUT ' + hs.layout.txEp);
+        } else {
+            const ep = inspectEndpoints(d);
+            layout = { rxEp: ep.rxEp, txEp: ep.txEp, cmdEp: 0, rxSize: ep.rxSize };
+            text = ep.text;
+        }
+
+        this.protocol = protocol;
         this.usb = d;
-        this.rxEp = ep.rxEp;
-        this.txEp = ep.txEp;
-        this.rxSize = ep.rxSize;
+        this.rxEp = layout.rxEp;
+        this.txEp = layout.txEp;
+        this.cmdEp = layout.cmdEp;
+        this.rxSize = layout.rxSize;
         this.txQueue = [];
         this.txHead = 0;
+        core._core_set_protocol(this.dev, protocol);     // also starts a fresh receive stream
         this.startRx();
         this.lastPingOk = performance.now();
         this.pingFails = 0;
         this.pingBusy = false;
         this.st.rxPrev = this.st.rx;
         updateTimers();
-        this.post('opened', { eps: ep.text, rxEp: ep.rxEp, txEp: ep.txEp });
+        this.post('opened', { eps: text, rxEp: layout.rxEp, txEp: layout.txEp, protocol: protocol, info: info });
     }
 
     async close(reason, silent) {
@@ -283,7 +385,7 @@ class Device {
             return;
         }
         const setup = {
-            requestType: 'vendor', recipient: 'interface',
+            requestType: m.reqType || 'vendor', recipient: m.recipient || 'interface',
             request: m.request, value: m.value, index: m.index
         };
         try {
@@ -302,6 +404,25 @@ class Device {
         } catch (err) {
             console.error('[usb_worker] dev ' + this.dev + ' control transfer failed:', err);
             if (isOut) this.post('ctrl_ack', { request: m.request, ok: false });
+            if (this.usb === d && isGone(err)) this.lost(errText(err));
+        }
+    }
+
+    // Bulk OUT command transfer (PCAN): same queue and timeout as the control transfers, acknowledged
+    // with the id the page gave it (reported as ctrl_ack {request: id})
+    async cmdOut(m) {
+        const d = this.usb;
+        if (!d) {
+            this.post('ctrl_ack', { request: m.id, ok: false });
+            return;
+        }
+        const ep = m.ep ? (m.ep & 0x7F) : this.cmdEp;
+        try {
+            const r = await withTimeout(d.transferOut(ep, m.data), CTRL_TIMEOUT_MS, 'command OUT timeout (id ' + m.id + ')');
+            this.post('ctrl_ack', { request: m.id, ok: r.status === 'ok' });
+        } catch (err) {
+            console.error('[usb_worker] dev ' + this.dev + ' command transfer failed:', err);
+            this.post('ctrl_ack', { request: m.id, ok: false });
             if (this.usb === d && isGone(err)) this.lost(errText(err));
         }
     }
@@ -381,6 +502,7 @@ class Device {
             this.slotErr.fill(0);
             this.pingFails = 0;
             this.lastRxDone = performance.now();
+            core._core_reset_stream(this.dev);      // the aborted transfers may have cut a record in two
             for (let i = 0; i < RX_SLOTS; i++) this.submitRx(i, gen);
         } catch (err) {
             if (this.usb === d) this.lost('recovery failed: ' + errText(err));
@@ -396,7 +518,10 @@ class Device {
             this.rxEnabled = false;
             return;
         }
-        if (!this.rxEnabled && core) core._core_reset_clock(this.dev);   // new channel start: adapter clock may restart
+        if (!this.rxEnabled && core) {
+            core._core_reset_clock(this.dev);       // new channel start: adapter clock may restart
+            core._core_reset_stream(this.dev);      // and the record stream starts at a record boundary
+        }
         this.rxEnabled = true;
         if (!this.usb) return;
         const ep = m.ep ? (m.ep & 0x7F) : this.rxEp;
@@ -480,10 +605,11 @@ class Device {
         const d = this.usb;
         this.pingBusy = true;
         try {
-            const r = await withTimeout(d.controlTransferIn({
-                requestType: 'vendor', recipient: 'interface',
-                request: GS_USB_BREQ_BT_CONST, value: 0, index: IFACE
-            }, 40), PING_TIMEOUT_MS, 'liveness probe timeout');
+            // A harmless read the adapter has to answer: gs_usb bit-timing constants, PCAN firmware info
+            const probe = this.protocol === PROTO_PCAN
+                ? [{ requestType: 'vendor', recipient: 'other', request: PCAN_VREQ_INFO, value: PCAN_VREQ_INFO_FIRMWARE, index: 0 }, 36]
+                : [{ requestType: 'vendor', recipient: 'interface', request: GS_USB_BREQ_BT_CONST, value: 0, index: IFACE }, 40];
+            const r = await withTimeout(d.controlTransferIn(probe[0], probe[1]), PING_TIMEOUT_MS, 'liveness probe timeout');
             if (r.status !== 'ok') throw new Error('liveness probe status ' + r.status);
             this.pingFails = 0;
             this.lastPingOk = performance.now();
@@ -590,6 +716,7 @@ self.onmessage = (ev) => {
         case 'close':    d.enqueue(() => d.close('closed by host', false)); break;
         case 'ctrl_out':
         case 'ctrl_in':  d.enqueue(() => d.control(m)); break;
+        case 'cmd_out':  d.enqueue(() => d.cmdOut(m)); break;
         case 'tx':       d.enqueueTx(m.data, m.ep); break;
         case 'rx':       d.setRx(m); break;
     }

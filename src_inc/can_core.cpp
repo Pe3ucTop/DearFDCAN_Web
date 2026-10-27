@@ -88,7 +88,8 @@ std::unordered_map<uint64_t, Slot> g_table;
 std::vector<uint64_t> g_dirty;
 std::deque<TraceEntry> g_trace;
 std::vector<CanMessage> g_parsed;
-CanProtocolHandler g_parser;
+CanProtocolType g_protocol[kMaxDevices] = {};   // protocol of every adapter (default gs_usb)
+CanRxStreamState g_stream[kMaxDevices];         // records split across two transfers (PEAK uCAN)
 ClockSync g_clock[kMaxDevices];          // every adapter has its own clock
 uint32_t g_dev_frames[kMaxDevices] = {};
 
@@ -192,7 +193,7 @@ EMSCRIPTEN_KEEPALIVE void core_process(int used) {
 
         if (dev < kMaxDevices) {
             g_parsed.clear();
-            g_parser.ParseRxBuffer(g_stage + off, len, g_parsed);
+            CanProtocolHandler::ParseRx(g_protocol[dev], g_stage + off, len, g_parsed, g_stream[dev]);
             for (CanMessage& m : g_parsed) {
                 m.dev = dev;
                 OnFrame(m, host_ms);
@@ -281,6 +282,20 @@ EMSCRIPTEN_KEEPALIVE void core_set_trace_enabled(int enable) {
 // Forget the clock correlation of one adapter (call when its CAN channel is (re)started)
 EMSCRIPTEN_KEEPALIVE void core_reset_clock(int dev) {
     if (dev >= 0 && dev < kMaxDevices) g_clock[dev].Reset();
+}
+
+// Tell the core which protocol an adapter speaks (call before its first transfer is staged). Also starts
+// a fresh receive stream.
+EMSCRIPTEN_KEEPALIVE void core_set_protocol(int dev, int protocol) {
+    if (dev < 0 || dev >= kMaxDevices) return;
+    g_protocol[dev] = (protocol == PROTOCOL_PEAK_PCAN_FD) ? PROTOCOL_PEAK_PCAN_FD : PROTOCOL_GS_USB_CANDLELIGHT;
+    g_stream[dev].Reset();
+}
+
+// Drop the half-received record of an adapter's stream (call when its transfers were interrupted: the
+// next transfer then starts at a record boundary again)
+EMSCRIPTEN_KEEPALIVE void core_reset_stream(int dev) {
+    if (dev >= 0 && dev < kMaxDevices) g_stream[dev].Reset();
 }
 
 } // extern "C"
