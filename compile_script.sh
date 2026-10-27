@@ -10,10 +10,10 @@ em++ main.cpp webusb_bridge.cpp can_protocol.cpp app_ui.cpp \
   ./$IMGUI_DIR/imgui_tables.cpp \
   ./$IMGUI_DIR/imgui_widgets.cpp \
   ./$IMGUI_DIR/backends/imgui_impl_glfw.cpp \
-  ./$IMGUI_DIR/backends/imgui_impl_opengl3.cpp \
+  ./$IMGUI_DIR/backends/imgui_impl_sdl2.cpp \
   -I./$IMGUI_DIR \
   -I./$IMGUI_DIR/backends \
-  -sUSE_GLFW=3 \
+  -sUSE_SDL=2 \
   -sMIN_WEBGL_VERSION=2 \
   -sMAX_WEBGL_VERSION=2 \
   -sEXPORTED_RUNTIME_METHODS='["stringToUTF8","lengthBytesUTF8"]' \
