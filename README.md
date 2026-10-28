@@ -1,5 +1,7 @@
 # DearFDCAN_Web
 
+**▶ Run it online: <https://pe3uctop.github.io/DearFDCAN_Web/>** (Chrome/Edge, adapter plugged in, nothing to install)
+
 FDCAN viewer for the web, in the spirit of PCAN-View: Dear ImGui user interface, WebUSB transport and the
 GS-USB (candleLight / CANable style) and PEAK PCAN-USB FD protocols over WebUSB, plus SLCAN (Lawicel / CANable slcan firmware)
 over Web Serial, compiled to WebAssembly with Emscripten. It runs in a Chromium-based browser (WebUSB and Web Serial are not
