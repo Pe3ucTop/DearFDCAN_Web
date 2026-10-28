@@ -4,10 +4,13 @@
 // shortcuts without a protocol argument go to gs_usb.
 
 void CanProtocolHandler::ParseRx(CanProtocolType type, const uint8_t* buffer, int length, std::vector<CanMessage>& out,
-                                 CanRxStreamState& state) {
+                                 CanRxStreamState& state, std::string* replies) {
     switch (type) {
         case PROTOCOL_PEAK_PCAN_FD:
             CanProtocolPcan::ParseRxStream(buffer, length, out, state);
+            break;
+        case PROTOCOL_SLCAN:
+            CanProtocolSlcan::ParseRxStream(buffer, length, out, state, replies);
             break;
         case PROTOCOL_GS_USB_CANDLELIGHT:
         default:
@@ -20,6 +23,8 @@ std::vector<uint8_t> CanProtocolHandler::BuildTx(CanProtocolType type, const Can
     switch (type) {
         case PROTOCOL_PEAK_PCAN_FD:
             return CanProtocolPcan::BuildTxBuffer(msg, channel);
+        case PROTOCOL_SLCAN:
+            return CanProtocolSlcan::BuildTxBuffer(msg, channel == SLCAN_DIALECT_LAWICEL ? SLCAN_DIALECT_LAWICEL : SLCAN_DIALECT_CANABLE);
         case PROTOCOL_GS_USB_CANDLELIGHT:
         default:
             return CanProtocolGsUsb::BuildTxBuffer(msg, channel);

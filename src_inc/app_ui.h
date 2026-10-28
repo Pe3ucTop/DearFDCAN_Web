@@ -51,6 +51,15 @@ struct DeviceSlot {
     std::string pcan_fw, pcan_bl, pcan_hw, pcan_mcu, pcan_serial, pcan_channels;
     int pcan_start_last_id = 0;   // id of the last command transfer of a pending start sequence
 
+    // Serial (SLCAN) adapters: the port settings and what the 'V' request told about the adapter
+    bool is_serial = false;       // a Web Serial port instead of a USB device
+    int serial_baud = 115200;     // matters for real UARTs only
+    int slcan_dialect_choice = 0; // 0 = detect with 'V', 1 = CANable firmware (CAN FD), 2 = Lawicel (classic CAN)
+    bool slcan_probed = false;    // the 'V' request was answered (or failed) since the port was opened
+    SlcanDialect slcan_dialect = SLCAN_DIALECT_LAWICEL;   // dialect found by the probe (used for "detect")
+    SlcanVersionInfo slcan_info;
+    int slcan_start_last_id = 0;  // id of the last command of a pending start sequence
+
     bool has_bt_const = false;    // GS_USB_BREQ_BT_CONST answered
     bool has_config = false;      // GS_USB_BREQ_DEVICE_CONFIG answered
     GsDeviceBtConst bt_const = {};
@@ -100,6 +109,8 @@ private:
     void InitDeviceDefaults(DeviceSlot& d) const;
     static void RecalculateTimings(DeviceSlot& d);
     static void ApplyProtocol(DeviceSlot& d, CanProtocolType protocol);
+    // Dialect an SLCAN adapter is driven in (the user's choice, else what the probe found, else classic)
+    static SlcanDialect EffectiveDialect(const DeviceSlot& d);
     bool IsBusOn(int dev) const;
     int ConnectedDeviceCount() const;
     int BusOnDeviceCount() const;
@@ -134,6 +145,7 @@ private:
     std::array<DeviceSlot, kMaxDevices> devices_;
     DeviceSlot defaults_;          // template for a newly added adapter (URL parameters applied here)
     int selected_dev_;             // adapter shown in the details / settings pane, -1 = none
+    int new_serial_baud_ = 115200; // baud rate for the next "Add Serial Port"
     std::string notice_;           // last user-facing message from the bridge
     double notice_time_ms_;
 

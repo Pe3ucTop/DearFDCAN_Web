@@ -258,15 +258,21 @@ double AppUI::GetNowMs() const {
 // OnControlOutDone() and are told apart from gs_usb request codes by being >= 0x100
 static constexpr int kPcanCmdIdStart = 0x100;
 static constexpr int kPcanCmdIdStop  = 0x200;
+// SLCAN command ids are SLCAN_CMD_ID_START / SLCAN_CMD_ID_STOP / SLCAN_CMD_VERSION (can_protocol_slcan.h)
 
 // Register limits of an adapter's bit timing: what the editors may enter and the automatic calculation may use
 static const CanBitTimingLimits kGsLimits = {512, 128, 128, 1024};   // as wide as the editor always allowed
 static CanBitTimingLimits NominalLimitsOf(const DeviceSlot& d) {
+    if (d.protocol == PROTOCOL_SLCAN) return d.slcan_info.valid && d.slcan_info.nominal.brp_max ? d.slcan_info.nominal : CanProtocolSlcan::DefaultNominalLimits();
     return d.protocol == PROTOCOL_PEAK_PCAN_FD ? PcanNominalLimits() : kGsLimits;
 }
 static CanBitTimingLimits DataLimitsOf(const DeviceSlot& d) {
+    if (d.protocol == PROTOCOL_SLCAN) return d.slcan_info.valid && d.slcan_info.data.brp_max ? d.slcan_info.data : CanProtocolSlcan::DefaultDataLimits();
     return d.protocol == PROTOCOL_PEAK_PCAN_FD ? PcanDataLimits() : kGsLimits;
 }
+
+// Bit rates of the Lawicel "S" command, in kbit/s
+static const int kClassicRatesKbps[] = {10, 20, 50, 100, 125, 250, 500, 800, 1000};
 
 // Automatic calculation within the limits; if nothing fits gs_usb keeps the old search (it always produced
 // some value), other protocols leave the previous values
@@ -317,8 +323,22 @@ void AppUI::ApplyProtocol(DeviceSlot& d, CanProtocolType protocol) {
         d.bt_const.fclk_can = PCAN_CAN_CLOCK_HZ;
         d.has_bt_const = true;
         d.enable_loopback = false;   // no internal loopback mode in this protocol
+    } else if (protocol == PROTOCOL_SLCAN) {
+        // The clock and the limits come from the 'V' answer of a CANable adapter (see OnControlDataReceived);
+        // until then the usual 160 MHz of the STM32G4 firmware and its default limits are assumed
+        d.is_serial = true;
+        d.bt_const.feature = GS_CAN_FEATURE_FD | GS_CAN_FEATURE_LISTEN_ONLY | GS_CAN_FEATURE_LOOP_BACK;
+        if (d.slcan_info.valid && d.slcan_info.clock_mhz) d.bt_const.fclk_can = d.slcan_info.clock_mhz * 1000000U;
+        else if (!d.has_bt_const) d.bt_const.fclk_can = 160000000U;      // first time: replaces the 80 MHz placeholder
+        d.has_bt_const = true;
     }
     RecalculateTimings(d);
+}
+
+SlcanDialect AppUI::EffectiveDialect(const DeviceSlot& d) {
+    if (d.slcan_dialect_choice == 1) return SLCAN_DIALECT_CANABLE;
+    if (d.slcan_dialect_choice == 2) return SLCAN_DIALECT_LAWICEL;
+    return d.slcan_probed ? d.slcan_dialect : SLCAN_DIALECT_LAWICEL;
 }
 
 bool AppUI::IsBusOn(int dev) const {
@@ -378,10 +398,16 @@ void AppUI::DeviceCombo(const char* label, int& value, const char* all_label, fl
 void AppUI::OnDeviceAdded(int dev, const UsbDeviceInfo& info) {
     if (!ValidDevice(dev)) return;
     DeviceSlot& d = devices_[dev];
-    if (!d.used) InitDeviceDefaults(d);
+    if (!d.used) {
+        InitDeviceDefaults(d);
+        d.serial_baud = new_serial_baud_;
+        if (info.is_serial) ApplyProtocol(d, PROTOCOL_SLCAN);
+    }
 
     d.used = true;
     d.info = info;
+    d.is_serial = info.is_serial;
+    d.slcan_probed = false;
     d.connecting = true;
     d.connected = false;
     d.channel_opening = false;
@@ -398,6 +424,17 @@ void AppUI::OnDeviceOpened(int dev, const DeviceOpenInfo& open) {
     d.connecting = false;
     d.connected = true;
     d.endpoints = open.endpoints;
+
+    if (open.protocol == PROTOCOL_SLCAN) {
+        // Serial adapter: ask which firmware it runs. The answer sets the dialect, clock and bit-timing limits;
+        // if there is none (or it is not understood) the adapter is treated as a classic Lawicel one.
+        d.protocol = PROTOCOL_SLCAN;
+        d.slcan_probed = false;
+        d.slcan_info = SlcanVersionInfo();
+        static const uint8_t kVersionCmd[] = {'V', '\r'};
+        WebUsbBridge::GetInstance().CommandOut(dev, SLCAN_CMD_VERSION, kVersionCmd, sizeof(kVersionCmd));
+        return;
+    }
     ApplyProtocol(d, open.protocol);
 
     if (open.protocol == PROTOCOL_PEAK_PCAN_FD) {
@@ -436,6 +473,26 @@ void AppUI::OnControlDataReceived(int dev, uint8_t request, const uint8_t* data,
     if (!ValidDevice(dev) || !devices_[dev].used) return;
     DeviceSlot& d = devices_[dev];
 
+    if (d.protocol == PROTOCOL_SLCAN) {
+        // Answer to 'V'. CANable firmware: clock and limits for the bit-timing calculation; classic: just a version.
+        if (request != SLCAN_CMD_VERSION || length <= 0) return;
+        SlcanVersionInfo v;
+        if (!CanProtocolSlcan::ParseVersionLine(std::string(reinterpret_cast<const char*>(data), static_cast<size_t>(length)), v)) {
+            d.slcan_probed = true;
+            d.slcan_dialect = SLCAN_DIALECT_LAWICEL;
+            return;
+        }
+        d.slcan_info = v;
+        d.slcan_dialect = v.dialect;
+        d.slcan_probed = true;
+        if (v.dialect == SLCAN_DIALECT_CANABLE) {
+            d.bt_const.fclk_can = v.clock_mhz * 1000000U;
+            d.has_bt_const = true;
+            RecalculateTimings(d);
+        }
+        return;
+    }
+
     if (request == GS_USB_BREQ_BT_CONST && length >= static_cast<int>(sizeof(GsDeviceBtConst))) {
         std::memcpy(&d.bt_const, data, sizeof(GsDeviceBtConst));
         d.has_bt_const = true;
@@ -451,7 +508,28 @@ void AppUI::OnControlDataReceived(int dev, uint8_t request, const uint8_t* data,
 void AppUI::OnControlOutDone(int dev, int request, bool ok) {
     if (!ValidDevice(dev) || !devices_[dev].used) return;
     DeviceSlot& d = devices_[dev];
+
+    if (d.protocol == PROTOCOL_SLCAN && request == SLCAN_CMD_VERSION) {
+        if (!ok) {              // no answer to 'V': not a CANable firmware
+            d.slcan_probed = true;
+            d.slcan_dialect = SLCAN_DIALECT_LAWICEL;
+        }
+        return;
+    }
     if (!d.channel_opening) return;
+
+    if (d.protocol == PROTOCOL_SLCAN) {
+        // The start sequence is a few command lines; every one is answered by the adapter
+        if (request < SLCAN_CMD_ID_START) return;
+        if (!ok) {
+            OnNotice("Device " + std::to_string(dev + 1) + ": the adapter rejected a start command");
+            StopCanChannel(dev);
+        } else if (request == d.slcan_start_last_id) {
+            d.channel_opening = false;
+            d.channel_open = true;
+        }
+        return;
+    }
 
     if (d.protocol == PROTOCOL_PEAK_PCAN_FD) {
         // The start sequence is a few command transfers; the channel is open after the last one was written
@@ -518,6 +596,26 @@ void AppUI::StartCanChannel(int dev) {
         return;
     }
 
+    if (d.protocol == PROTOCOL_SLCAN) {
+        // Command lines (reset, flags, bit timing, open), each answered by the adapter; the channel is open when
+        // the last one was acknowledged (see OnControlOutDone)
+        const SlcanDialect dialect = EffectiveDialect(d);
+        const bool fd = d.enable_fd && dialect == SLCAN_DIALECT_CANABLE;
+        const auto cmds = CanProtocolSlcan::BuildStartCommands(dialect, fd, d.enable_listen_only, d.enable_loopback,
+                                                               d.nom_bt, d.data_bt, static_cast<uint32_t>(d.target_nom_kbps) * 1000U);
+        if (cmds.empty()) {
+            OnNotice("Device " + std::to_string(dev + 1) + ": this adapter supports only the bit rates 10, 20, 50, 100, 125, 250, 500, 800 and 1000 kbps");
+            return;
+        }
+        for (size_t i = 0; i < cmds.size(); ++i) {
+            usb.CommandOut(dev, SLCAN_CMD_ID_START + static_cast<int>(i), reinterpret_cast<const uint8_t*>(cmds[i].data()), static_cast<int>(cmds[i].size()));
+        }
+        d.slcan_start_last_id = SLCAN_CMD_ID_START + static_cast<int>(cmds.size()) - 1;
+        usb.StartRxPump(dev, 0, 0);
+        d.channel_opening = true;
+        return;
+    }
+
     uint32_t host_format = 0x0000BEEFU;
     usb.ControlTransferOut(dev, GS_USB_BREQ_HOST_FORMAT, 1, 0, reinterpret_cast<const uint8_t*>(&host_format), sizeof(host_format));
     usb.ControlTransferOut(dev, GS_USB_BREQ_BITTIMING, 0, 0, reinterpret_cast<const uint8_t*>(&d.nom_bt), sizeof(d.nom_bt));
@@ -552,6 +650,11 @@ void AppUI::StopCanChannel(int dev) {
         const auto transfers = CanProtocolPcan::BuildStopCommands(0);
         for (size_t i = 0; i < transfers.size(); ++i) {
             usb.CommandOut(dev, kPcanCmdIdStop + static_cast<int>(i), transfers[i].data(), static_cast<int>(transfers[i].size()));
+        }
+    } else if (d.protocol == PROTOCOL_SLCAN) {
+        const auto cmds = CanProtocolSlcan::BuildStopCommands();
+        for (size_t i = 0; i < cmds.size(); ++i) {
+            usb.CommandOut(dev, SLCAN_CMD_ID_STOP + static_cast<int>(i), reinterpret_cast<const uint8_t*>(cmds[i].data()), static_cast<int>(cmds[i].size()));
         }
     } else {
         GsDeviceMode mode_cmd = {GS_CAN_MODE_RESET, 0};
@@ -643,6 +746,17 @@ int AppUI::SendFrame(const CanMessage& msg, int target) {
         if (target != kTargetAllDevices && target != dev) continue;
         if (!IsBusOn(dev)) continue;
         const CanProtocolType protocol = devices_[dev].protocol;
+        if (protocol == PROTOCOL_SLCAN) {
+            // The line depends on the dialect of the adapter; a classic one cannot send CAN FD frames
+            const std::vector<uint8_t> line = CanProtocolHandler::BuildTx(protocol, msg, static_cast<uint8_t>(EffectiveDialect(devices_[dev])));
+            if (line.empty()) {
+                OnNotice("Device " + std::to_string(dev + 1) + ": CAN FD frames cannot be sent through a classic (Lawicel) adapter");
+                continue;
+            }
+            WebUsbBridge::GetInstance().TransferOut(dev, 0, line.data(), static_cast<int>(line.size()));
+            ++sent;
+            continue;
+        }
         const int slot = (protocol == PROTOCOL_PEAK_PCAN_FD) ? 1 : 0;
         if (!built[slot]) {
             usb_bytes[slot] = CanProtocolHandler::BuildTx(protocol, msg, 0);
@@ -820,7 +934,18 @@ void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
     if (ImGui::Button("Add Device", ImVec2(110, 26))) {
         usb.RequestDevice();
     }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pick a USB adapter (gs_usb / candleLight, PEAK PCAN-USB FD)");
     ImGui::SameLine();
+    if (ImGui::Button("Add Serial Port", ImVec2(130, 26))) {
+        usb.RequestSerialPort(new_serial_baud_);
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Pick a serial port with an SLCAN adapter (Lawicel / CANable slcan firmware)");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(95);
+    ImGui::InputInt("baud", &new_serial_baud_, 0, 0);
+    new_serial_baud_ = std::clamp(new_serial_baud_, 300, 12000000);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Baud rate for the next serial port (USB serial adapters ignore it)");
+
     ImGui::BeginDisabled(ConnectedDeviceCount() == 0);
     if (ImGui::Button("Start All", ImVec2(85, 26))) {
         for (int dev = 0; dev < kMaxDevices; ++dev) StartCanChannel(dev);
@@ -916,7 +1041,10 @@ void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
                     ImGui::SmallButton("Connecting");
                     ImGui::EndDisabled();
                 } else if (!d.connected) {
-                    if (ImGui::SmallButton("Connect")) usb.ConnectDevice(dev);
+                    if (ImGui::SmallButton("Connect")) {
+                        if (d.is_serial) usb.SetSerialBaud(dev, d.serial_baud);
+                        usb.ConnectDevice(dev);
+                    }
                 } else {
                     if (ImGui::SmallButton("Disconnect")) {
                         if (d.channel_open || d.channel_opening) StopCanChannel(dev);
@@ -998,18 +1126,29 @@ void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
         cell(d.status.empty() ? "-" : d.status.c_str());
 
         const bool pcan = d.protocol == PROTOCOL_PEAK_PCAN_FD;
+        const bool slcan = d.protocol == PROTOCOL_SLCAN;
+        const SlcanVersionInfo& sv = d.slcan_info;
+        const std::string dialect_text = !d.connected ? std::string()
+            : (EffectiveDialect(d) == SLCAN_DIALECT_CANABLE ? "CANable FD" : "Lawicel") +
+              std::string(d.slcan_dialect_choice == 0 ? (d.slcan_probed ? " (found)" : " (probing)") : " (chosen)");
         row("Protocol", d.connected ? std::string(CanProtocolName(d.protocol)) : std::string(),
-            "Bootloader", d.pcan_bl);
-        row("Adapter",  d.info.product,      "Manufacturer", d.info.manufacturer);
-        row("Serial",   d.info.serial.empty() ? d.pcan_serial : d.info.serial,
-            "VID:PID",  fmt("%04X:%04X", d.info.vid, d.info.pid));
+            slcan ? "Dialect" : "Bootloader", slcan ? dialect_text : d.pcan_bl);
+        row("Adapter",  slcan && !sv.board.empty() ? sv.board : d.info.product, "Manufacturer", d.info.manufacturer);
+        row("Serial",   d.info.serial.empty() ? (slcan ? sv.serial : d.pcan_serial) : d.info.serial,
+            slcan && !d.info.vid ? "Port" : "VID:PID",
+            slcan && !d.info.vid ? std::string("serial (no USB ids)") : fmt("%04X:%04X", d.info.vid, d.info.pid));
         row("USB",      d.info.usb_version,  "Device rev.",  d.info.device_version);
-        row("Firmware", pcan ? d.pcan_fw : (d.has_config ? fmt("v%u", d.config.sw_version) : std::string()),
+        row("Firmware", pcan ? d.pcan_fw : (slcan ? (sv.firmware.empty() ? sv.version_text : sv.firmware + " (slcan " + sv.slcan_version + ")")
+                                                  : (d.has_config ? fmt("v%u", d.config.sw_version) : std::string())),
             "Hardware", pcan ? (d.pcan_hw.empty() ? std::string() : "PCB " + d.pcan_hw + (d.pcan_mcu.empty() ? "" : ", MCU " + d.pcan_mcu))
-                             : (d.has_config ? fmt("v%u", d.config.hw_version) : std::string()));
-        row("CAN clock", d.has_bt_const ? fmt("%.1f MHz", d.bt_const.fclk_can / 1e6) : std::string("(not read yet)"),
-            "CAN channels", pcan ? d.pcan_channels : (d.has_config ? fmt("%u", static_cast<unsigned>(d.config.icount) + 1u) : std::string()));
-        row("Endpoints", d.endpoints, "Features", d.has_bt_const ? FeatureList(d.bt_const.feature) : std::string());
+                             : (slcan ? sv.mcu : (d.has_config ? fmt("v%u", d.config.hw_version) : std::string())));
+        row("CAN clock", slcan ? (sv.clock_mhz ? fmt("%u MHz", sv.clock_mhz) : std::string())
+                               : (d.has_bt_const ? fmt("%.1f MHz", d.bt_const.fclk_can / 1e6) : std::string("(not read yet)")),
+            "CAN channels", pcan ? d.pcan_channels : (slcan ? (sv.channels ? fmt("%u", sv.channels) : std::string())
+                                                            : (d.has_config ? fmt("%u", static_cast<unsigned>(d.config.icount) + 1u) : std::string())));
+        row("Endpoints", d.endpoints, "Features",
+            slcan ? (!d.connected ? std::string() : EffectiveDialect(d) == SLCAN_DIALECT_CANABLE ? std::string("CAN FD, listen-only, loopback") : std::string("classic CAN, listen-only"))
+                  : (d.has_bt_const ? FeatureList(d.bt_const.feature) : std::string()));
         row("USB/s",    d.connected ? fmt("%u transfers/s", ds.rx_per_sec) : std::string(),
             "Frames",   d.connected ? fmt("%u", ds.frames) : std::string());
         row("Errors",   d.connected ? fmt("RX %u, TX %u", ds.rx_errors, ds.tx_errors) : std::string(),
@@ -1023,8 +1162,28 @@ void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
     if (ImGui::CollapsingHeader(title, ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::BeginDisabled(d.channel_open || d.channel_opening);
 
-        // A PEAK adapter runs its CAN cores from a fixed 80 MHz domain and has no internal loopback mode
-        const bool fixed_clock = d.protocol == PROTOCOL_PEAK_PCAN_FD;
+        // Serial adapters: port settings and the firmware dialect (a classic Lawicel adapter has fixed bit rates,
+        // no CAN FD and no loopback)
+        const bool slcan_pane = d.protocol == PROTOCOL_SLCAN;
+        const bool classic = slcan_pane && EffectiveDialect(d) == SLCAN_DIALECT_LAWICEL;
+        if (slcan_pane) {
+            ImGui::BeginDisabled(d.connected);
+            ImGui::PushItemWidth(95);
+            ImGui::InputInt("Baud rate", &d.serial_baud, 0, 0);
+            ImGui::PopItemWidth();
+            d.serial_baud = std::clamp(d.serial_baud, 300, 12000000);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Used at the next connect; USB serial adapters ignore it");
+            ImGui::SameLine();
+            static const char* kDialects[] = {"Detect (V)", "CANable (CAN FD)", "Lawicel (classic)"};
+            ImGui::SetNextItemWidth(160);
+            ImGui::Combo("Dialect", &d.slcan_dialect_choice, kDialects, 3);
+        }
+
+        // A PEAK adapter runs its CAN cores from a fixed 80 MHz domain and has no internal loopback mode; a CANable
+        // adapter reports its clock
+        const bool fixed_clock = d.protocol == PROTOCOL_PEAK_PCAN_FD || classic || (slcan_pane && d.slcan_info.valid);
+        const bool no_loopback = d.protocol == PROTOCOL_PEAK_PCAN_FD || classic;
         int clk_mhz = static_cast<int>(d.bt_const.fclk_can / 1000000U);
         ImGui::BeginDisabled(fixed_clock);
         ImGui::PushItemWidth(80);
@@ -1035,19 +1194,37 @@ void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
         ImGui::EndDisabled();
         if (fixed_clock && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Fixed by the adapter");
         ImGui::SameLine();
+        ImGui::BeginDisabled(classic);
         ImGui::Checkbox("CAN FD", &d.enable_fd);
+        ImGui::EndDisabled();
+        if (classic && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Not available for a classic (Lawicel) adapter");
         ImGui::SameLine();
-        ImGui::BeginDisabled(fixed_clock);
+        ImGui::BeginDisabled(no_loopback);
         ImGui::Checkbox("Loopback", &d.enable_loopback);
         ImGui::EndDisabled();
-        if (fixed_clock && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Not available for this adapter");
+        if (no_loopback && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("Not available for this adapter");
         ImGui::SameLine();
         ImGui::Checkbox("Listen-Only", &d.enable_listen_only);
 
         ImGui::SeparatorText("Nominal Arbitration Timing");
-        RenderBittimingEditor("Nom", d.protocol, d.bt_const.fclk_can, NominalLimitsOf(d), d.nom_bt, d.target_nom_kbps, d.target_nom_sp);
+        if (classic) {
+            // The adapter knows nine bit rates ("S0".."S8"); the sample point is not adjustable
+            char preview[32];
+            std::snprintf(preview, sizeof(preview), "%d kbps", d.target_nom_kbps);
+            ImGui::SetNextItemWidth(130);
+            if (ImGui::BeginCombo("Bit rate", preview)) {
+                for (int kbps : kClassicRatesKbps) {
+                    char item[32];
+                    std::snprintf(item, sizeof(item), "%d kbps", kbps);
+                    if (ImGui::Selectable(item, kbps == d.target_nom_kbps)) d.target_nom_kbps = kbps;
+                }
+                ImGui::EndCombo();
+            }
+        } else {
+            RenderBittimingEditor("Nom", d.protocol, d.bt_const.fclk_can, NominalLimitsOf(d), d.nom_bt, d.target_nom_kbps, d.target_nom_sp);
+        }
 
-        if (d.enable_fd) {
+        if (d.enable_fd && !classic) {
             ImGui::SeparatorText("CAN FD Data Phase Timing");
             RenderBittimingEditor("Data", d.protocol, d.bt_const.fclk_can, DataLimitsOf(d), d.data_bt, d.target_data_kbps, d.target_data_sp);
         }

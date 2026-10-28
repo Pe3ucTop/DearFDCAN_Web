@@ -15,11 +15,16 @@ constexpr int kMaxDevices = 8;
 // Supported USB-CAN hardware protocol backends
 enum CanProtocolType : int {
     PROTOCOL_GS_USB_CANDLELIGHT = 0,
-    PROTOCOL_PEAK_PCAN_FD       = 1   // PEAK PCAN-USB FD family (uCAN firmware protocol)
+    PROTOCOL_PEAK_PCAN_FD       = 1,  // PEAK PCAN-USB FD family (uCAN firmware protocol)
+    PROTOCOL_SLCAN              = 2   // ASCII serial CAN (Lawicel / CANable slcan) over WebSerial; never auto-detected
 };
 
 inline const char* CanProtocolName(CanProtocolType type) {
-    return type == PROTOCOL_PEAK_PCAN_FD ? "PEAK PCAN-USB FD (uCAN)" : "gs_usb (candleLight / CANable)";
+    switch (type) {
+        case PROTOCOL_PEAK_PCAN_FD: return "PEAK PCAN-USB FD (uCAN)";
+        case PROTOCOL_SLCAN:        return "SLCAN (serial)";
+        default:                    return "gs_usb (candleLight / CANable)";
+    }
 }
 
 // Chooses the protocol of an adapter from its USB ids. PEAK-System (0x0C72): PCAN-USB Pro FD 0x0011,
@@ -65,14 +70,18 @@ struct CanTimingMetrics {
     double sample_point_pct; // Sample point position in %
 };
 
-// Reassembly state of a receive stream whose records can be split across two USB transfers (PEAK uCAN:
-// a record that does not fit at the end of one transfer continues at the start of the next one).
+// Reassembly state of a receive stream whose records can be split across two transfers (PEAK uCAN:
+// a record that does not fit at the end of one transfer continues at the start of the next one; SLCAN: a text
+// line is cut wherever the serial port delivered its bytes).
 // One instance per adapter, owned by the caller; protocols that do not need it ignore it.
 struct CanRxStreamState {
-    static constexpr size_t kMaxRecord = 128;
+    // Longest SLCAN line: the answer to 'V' of the CANable firmware (formatted into a 200 byte buffer there),
+    // an extended FD frame is 1 + 8 + 1 + 128 + 'S' = 139 characters
+    static constexpr size_t kMaxRecord = 256;
     uint8_t frag[kMaxRecord] = {};
     uint16_t frag_len = 0;               // bytes of the unfinished record held in `frag`
-    void Reset() { frag_len = 0; }
+    bool discard = false;                // SLCAN: skipping an overlong line up to its terminator
+    void Reset() { frag_len = 0; discard = false; }
 };
 
 // Fixed-capacity payload (CAN FD maximum is 64 bytes) with a std::vector-like surface.

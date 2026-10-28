@@ -3,11 +3,13 @@
 //   can_protocol_common.h   protocol independent types (CanMessage, CanPayload, CanBittiming, ...) and helpers
 //   can_protocol_gsusb.h    gs_usb (candleLight / CANable) structures, frame parsing and building
 //   can_protocol_pcan.h     PEAK PCAN-USB FD (uCAN) structures, frame parsing/building and command sequences
+//   can_protocol_slcan.h    SLCAN (Lawicel / CANable) line protocol of serial adapters
 // and CanProtocolHandler below is the entry point the rest of the program uses for everything that
 // depends on the protocol of an adapter, so that the callers do not depend on which backend does the work.
 #include "can_protocol_common.h"
 #include "can_protocol_gsusb.h"
 #include "can_protocol_pcan.h"
+#include "can_protocol_slcan.h"
 
 class CanProtocolHandler {
 public:
@@ -15,11 +17,13 @@ public:
 
     // Parses one bulk IN transfer of the adapter's data endpoint into CAN messages, appended to `out`.
     // `state` is the adapter's stream reassembly state (used by protocols whose records can be split
-    // across transfers, ignored by gs_usb).
+    // across transfers, ignored by gs_usb). SLCAN lines that are not frames (command replies) are appended to
+    // `replies` when it is given, see CanProtocolSlcan::ParseRxStream.
     static void ParseRx(CanProtocolType type, const uint8_t* buffer, int length, std::vector<CanMessage>& out,
-                        CanRxStreamState& state);
+                        CanRxStreamState& state, std::string* replies = nullptr);
 
-    // Builds the bulk OUT transfer of one frame for a CAN channel of the adapter
+    // Builds the bulk OUT transfer of one frame for a CAN channel of the adapter. For SLCAN `channel` is the
+    // dialect (SlcanDialect) and an empty result means the frame cannot be sent in it.
     static std::vector<uint8_t> BuildTx(CanProtocolType type, const CanMessage& msg, uint8_t channel = 0);
 
     // Search limited to the registers of the controller (see CanProtocolUtils)

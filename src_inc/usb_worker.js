@@ -64,6 +64,12 @@ const GS_USB_BREQ_BT_CONST = 4;     // harmless read used as liveness probe
 // Protocols (CanProtocolType in can_protocol_common.h)
 const PROTO_GS = 0;
 const PROTO_PCAN = 1;
+const PROTO_SLCAN = 2;              // serial adapters (WebSerial), I/O is done by serial_worker.js
+
+// SLCAN command acknowledgement: replies carry no id, they come in command order
+const SLCAN_ID_VERSION = 0x56;      // the 'V' request, answered with a text line (SLCAN_CMD_VERSION in can_protocol_slcan.h)
+const REPLY_TIMEOUT_MS = 1500;
+let serialLink = null;              // MessagePort to serial_worker.js
 
 // PEAK PCAN-USB FD (values from PEAK's Linux driver)
 const PCAN_VID = 0x0C72;            // PIDs 0x0011 Pro FD, 0x0012 FD, 0x0013 Chip, 0x0014 X6
@@ -266,6 +272,8 @@ class Device {
     enqueue(fn) {
         this.chain = this.chain.then(fn).catch(err => console.error('[usb_worker] dev ' + this.dev + ' command failed:', err));
     }
+
+    get active() { return !!this.usb; }
 
     // -----------------------------------------------------------------------------------------
     // Open / close / loss
@@ -537,19 +545,7 @@ class Device {
     onPacket(dv) {
         this.st.rx++;
         if (!this.rxEnabled || !core) return;
-        const len = dv.byteLength;
-        if (len > 0xFFFF) return;
-        if (stageOff + STAGE_REC_HEADER + len > stageCap) processStage();
-
-        stageHdr.setUint16(0, len, true);
-        stageHdr.setUint8(2, this.dev);
-        stageHdr.setUint8(3, 0x80 | this.rxEp);
-        stageHdr.setFloat64(4, now(), true);
-
-        const heap = core.HEAPU8;           // re-read on every use: the heap may be replaced on growth
-        heap.set(stageHdrBytes, stagePtr + stageOff);
-        heap.set(new Uint8Array(dv.buffer, dv.byteOffset, len), stagePtr + stageOff + STAGE_REC_HEADER);
-        stageOff += STAGE_REC_HEADER + len;
+        stageBytes(this.dev, 0x80 | this.rxEp, new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength), now());
     }
 
     // -----------------------------------------------------------------------------------------
@@ -627,11 +623,221 @@ class Device {
 }
 
 // ---------------------------------------------------------------------------------------------
+// One serial (SLCAN) adapter. The port itself is owned by serial_worker.js; this context stages the bytes it
+// delivers into the shared core and turns the core's reply tokens into command acknowledgements.
+// ---------------------------------------------------------------------------------------------
+
+const utf8 = new TextDecoder();
+
+class SerialDevice {
+    constructor(dev) {
+        this.dev = dev;
+        this.epoch = 0;
+        this.isOpen = false;
+        this.opening = false;
+        this.rxEnabled = false;
+        this.chain = Promise.resolve();
+        // Commands that wait for a reply, oldest first. SLCAN replies carry no id, they come in command order.
+        this.pending = [];
+        this.st = { rx: 0, rxPrev: 0, rxErrors: 0, txDropped: 0, txErrors: 0, recoveries: 0 };
+        this.port = { rxErrors: 0, txErrors: 0, txDropped: 0 };
+    }
+
+    get active() { return this.isOpen; }
+
+    post(type, fields, transfer) {
+        const msg = fields || {};
+        msg.type = type;
+        msg.dev = this.dev;
+        msg.epoch = this.epoch;
+        self.postMessage(msg, transfer || []);
+    }
+
+    enqueue(fn) {
+        this.chain = this.chain.then(fn).catch(err => console.error('[usb_worker] dev ' + this.dev + ' command failed:', err));
+    }
+
+    async open(m) {
+        if (this.isOpen || this.opening) await this.close(null, true);
+        this.epoch = m.epoch;
+        try {
+            await coreReady;
+        } catch (err) {
+            this.post('closed', { reason: 'CAN core module failed to load: ' + errText(err) });
+            return;
+        }
+        if (!serialLink) {
+            this.post('closed', { reason: 'the serial worker is not available' });
+            return;
+        }
+        this.opening = true;
+        core._core_set_protocol(this.dev, PROTO_SLCAN);       // fresh stream, gate open until the page says otherwise
+        serialLink.postMessage({ type: 'sopen', dev: this.dev, epoch: this.epoch, baud: m.baud | 0 });
+    }
+
+    async close(reason, silent) {
+        if (!this.isOpen && !this.opening) {
+            if (!silent) this.post('closed', { reason: reason || '' });
+            return;
+        }
+        this.teardown();
+        if (serialLink) serialLink.postMessage({ type: 'sclose', dev: this.dev });
+        if (!silent) this.post('closed', { reason: reason || '' });
+    }
+
+    // Everything the serial worker reports about this port
+    onLink(m) {
+        if (m.epoch !== this.epoch) return;
+        switch (m.type) {
+            case 'sopened':
+                if (!this.opening) return;
+                this.opening = false;
+                this.isOpen = true;
+                this.st.rxPrev = this.st.rx;
+                updateTimers();
+                this.post('opened', { eps: m.eps, rxEp: 0, txEp: 0, protocol: PROTO_SLCAN, info: m.info || '' });
+                break;
+            case 'sclosed':
+                if (this.isOpen || this.opening) {
+                    this.teardown();
+                    this.post('closed', { reason: m.reason || '' });
+                }
+                break;
+            case 'srx':
+                if (!this.isOpen || !core) return;
+                this.st.rx++;
+                stageBytes(this.dev, 0x80, new Uint8Array(m.buf), m.t - mainOrigin);
+                break;
+            case 'swack': {
+                // The write finished. A reply may already have been matched (it can overtake this message).
+                const i = this.pending.findIndex(p => p.id === m.id);
+                if (i < 0) break;
+                const p = this.pending[i];
+                if (!m.ok || !p.expectReply) {
+                    this.pending.splice(i, 1);
+                    clearTimeout(p.timer);
+                    this.post('ctrl_ack', { request: p.id, ok: !!m.ok });
+                }
+                break;
+            }
+            case 'sstats':
+                this.port = { rxErrors: m.rxErrors, txErrors: m.txErrors, txDropped: m.txDropped };    // counted by the serial worker
+                break;
+        }
+    }
+
+    replyTimeout(p) {
+        const i = this.pending.indexOf(p);
+        if (i < 0) return;
+        this.pending.splice(i, 1);
+        console.warn('[usb_worker] dev ' + this.dev + ' no reply to command ' + p.id);
+        this.post('ctrl_ack', { request: p.id, ok: false });
+    }
+
+    // Reply tokens of the core: "K" ok, "E<c>" error, "L<text>" any other line, one per '\n'
+    drainReplies() {
+        const n = core._core_take_replies(this.dev);
+        if (n <= 0) return;
+        const ptr = core._core_reply_ptr();
+        const text = utf8.decode(core.HEAPU8.subarray(ptr, ptr + n));
+        for (const tok of text.split('\n')) {
+            if (!tok) continue;
+            const kind = tok[0];
+            const head = this.pending.find(p => p.expectReply);     // replies come in command order
+            if (kind === 'L') {
+                if (head && head.wantLine) {
+                    this.pending.splice(this.pending.indexOf(head), 1);
+                    clearTimeout(head.timer);
+                    const ab = new TextEncoder().encode(tok.substring(1)).buffer;
+                    this.post('ctrl_in', { request: head.id, data: ab }, [ab]);
+                }
+                continue;       // other text (debug output, TX markers): nothing waits for it
+            }
+            if (!head) {
+                if (kind === 'E') this.st.txErrors++;                // error reply to a transmitted frame
+                continue;
+            }
+            this.pending.splice(this.pending.indexOf(head), 1);
+            clearTimeout(head.timer);
+            // a line was expected but the adapter answered with a plain ack/error: the command failed
+            this.post('ctrl_ack', { request: head.id, ok: kind === 'K' && !head.wantLine });
+        }
+    }
+
+    // Text command (one line, '\r' terminated). id is given back in the acknowledgement; the version request
+    // (id SLCAN_ID_VERSION) is answered with a text line instead.
+    cmdOut(m) {
+        if (!this.isOpen || !serialLink) {
+            this.post('ctrl_ack', { request: m.id, ok: false });
+            return;
+        }
+        const bytes = new Uint8Array(m.data);
+        const noReply = bytes.length === 2 && bytes[0] === 0x43 && bytes[1] === 0x0D;    // "C\r" is never answered
+        const p = { id: m.id, expectReply: !noReply, wantLine: m.id === SLCAN_ID_VERSION, timer: 0 };
+        if (p.expectReply) p.timer = setTimeout(() => this.replyTimeout(p), REPLY_TIMEOUT_MS);   // covers the write and the reply
+        this.pending.push(p);
+        serialLink.postMessage({ type: 'swrite', dev: this.dev, epoch: this.epoch, data: m.data, id: m.id || 1 }, [m.data]);
+    }
+
+    control(m) {
+        if (m.type === 'ctrl_out') this.post('ctrl_ack', { request: m.request, ok: false });    // serial adapters have no control pipe
+    }
+
+    enqueueTx(data) {
+        if (!this.isOpen || !serialLink) { this.st.txDropped++; return; }
+        serialLink.postMessage({ type: 'swrite', dev: this.dev, epoch: this.epoch, data: data, id: 0 }, [data]);
+    }
+
+    setRx(m) {
+        const enable = !!m.enable;
+        if (!core) return;
+        if (!enable) {
+            processStage();                 // everything received before the stop still counts
+            this.rxEnabled = false;
+            core._core_set_rx_enabled(this.dev, 0);
+            return;
+        }
+        if (!this.rxEnabled) {
+            processStage();
+            core._core_reset_clock(this.dev);
+            core._core_reset_stream(this.dev);
+            core._core_set_rx_enabled(this.dev, 1);
+        }
+        this.rxEnabled = true;
+    }
+
+    teardown() {
+        if (this.isOpen || this.opening) publishTick();
+        this.isOpen = false;
+        this.opening = false;
+        this.rxEnabled = false;
+        if (core) core._core_set_rx_enabled(this.dev, 1);
+        for (const p of this.pending) {
+            clearTimeout(p.timer);
+            this.post('ctrl_ack', { request: p.id, ok: false });
+        }
+        this.pending = [];
+        updateTimers();
+    }
+
+    tick() {
+        if (!this.isOpen) return;
+        // own counters: frames the adapter refused (error reply) and writes dropped here; the port's: stream errors
+        const p = this.port;
+        this.post('stats', {
+            rxPerSec: this.st.rx - this.st.rxPrev, txDropped: this.st.txDropped + p.txDropped,
+            recoveries: 0, rxErrors: this.st.rxErrors + p.rxErrors, txErrors: this.st.txErrors + p.txErrors
+        });
+        this.st.rxPrev = this.st.rx;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Shared timers: snapshot publishing and watchdog run while at least one adapter is open
 // ---------------------------------------------------------------------------------------------
 
 function updateTimers() {
-    const open = devices.some(x => x && x.usb);
+    const open = devices.some(x => x && x.active);
     if (open) {
         if (pubTimer === null) pubTimer = setInterval(publishTick, PUBLISH_MS);
         if (wdTimer === null) wdTimer = setInterval(watchdogTick, WATCHDOG_MS);
@@ -649,10 +855,30 @@ function watchdogTick() {
 // CAN core: staging, periodic snapshots with credit-based flow control
 // ---------------------------------------------------------------------------------------------
 
+// Copies one received chunk into the core's staging buffer as [u16 len][u8 dev][u8 ep][f64 time][bytes];
+// host_ms is on the page's performance.now() timeline
+function stageBytes(dev, ep, bytes, hostMs) {
+    const len = bytes.byteLength;
+    if (len > 0xFFFF || len === 0) return;
+    if (stageOff + STAGE_REC_HEADER + len > stageCap) processStage();
+
+    stageHdr.setUint16(0, len, true);
+    stageHdr.setUint8(2, dev);
+    stageHdr.setUint8(3, ep);
+    stageHdr.setFloat64(4, hostMs, true);
+
+    const heap = core.HEAPU8;           // re-read on every use: the heap may be replaced on growth
+    heap.set(stageHdrBytes, stagePtr + stageOff);
+    heap.set(bytes, stagePtr + stageOff + STAGE_REC_HEADER);
+    stageOff += STAGE_REC_HEADER + len;
+}
+
 function processStage() {
     if (stageOff > 0 && core) {
         core._core_process(stageOff);
         stageOff = 0;
+        // serial adapters: the lines that were not frames are answers to commands
+        for (const d of devices) if (d instanceof SerialDevice && d.isOpen) d.drainReplies();
     }
 }
 
@@ -699,6 +925,10 @@ self.onmessage = (ev) => {
         case 'init': mainOrigin = m.timeOrigin; return;
         case 'ret':  returnBuffer(m.buf); return;
         case 'core': coreCommand(m); return;
+        case 'serial_link':
+            serialLink = m.port;
+            serialLink.onmessage = onSerialMessage;
+            return;
     }
 
     const n = m.dev;
@@ -706,7 +936,13 @@ self.onmessage = (ev) => {
     let d = devices[n];
 
     if (m.type === 'open') {
-        if (!d) d = devices[n] = new Device(n);
+        // A slot is either a USB adapter or a serial port; reusing it for the other kind replaces the context
+        const serial = m.transport === 'serial';
+        if (d && (d instanceof SerialDevice) !== serial) {
+            d.close(null, true);
+            d = devices[n] = null;
+        }
+        if (!d) d = devices[n] = serial ? new SerialDevice(n) : new Device(n);
         d.enqueue(() => d.open(m));
         return;
     }
@@ -721,6 +957,13 @@ self.onmessage = (ev) => {
         case 'rx':       d.setRx(m); break;
     }
 };
+
+// Messages from serial_worker.js (received bytes, open/close results, write acknowledgements)
+function onSerialMessage(ev) {
+    const m = ev.data;
+    const d = Number.isInteger(m.dev) ? devices[m.dev] : null;
+    if (d instanceof SerialDevice) d.onLink(m);
+}
 
 if (typeof navigator !== 'undefined' && navigator.usb) {
     navigator.usb.addEventListener('disconnect', (ev) => {

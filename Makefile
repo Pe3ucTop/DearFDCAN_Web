@@ -3,7 +3,7 @@
 #   make                     single-file build  -> build/single/index.html, copied to docs/index.html
 #                                                  (docs/ is the GitHub Pages folder: commit it and publish it)
 #   make MODE=multi         multi-file build   -> build/multi/index.html index.js index.wasm
-#                                                  usb_worker.js can_core.js can_core.wasm
+#                                                  usb_worker.js serial_worker.js can_core.js can_core.wasm
 #   make serve               serve the result of the selected MODE on http://localhost:8000/
 #   make clean               remove the whole build directory
 #   make help                this summary
@@ -46,7 +46,7 @@ OBJ := $(BUILD)/obj
 # ---------------------------------------------------------------------------------------------
 # Page: Dear ImGui user interface + WebUSB bridge
 # ---------------------------------------------------------------------------------------------
-APP_SRCS   := main.cpp webusb_bridge.cpp can_protocol.cpp can_protocol_gsusb.cpp can_protocol_pcan.cpp app_ui.cpp
+APP_SRCS   := main.cpp webusb_bridge.cpp can_protocol.cpp can_protocol_gsusb.cpp can_protocol_pcan.cpp can_protocol_slcan.cpp app_ui.cpp
 IMGUI_SRCS := imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp \
               backends/imgui_impl_glfw.cpp backends/imgui_impl_opengl3.cpp
 
@@ -63,11 +63,12 @@ PAGE_LDFLAGS := $(OPT) -sUSE_GLFW=3 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2 
 # ---------------------------------------------------------------------------------------------
 # CAN core: separate wasm module that runs inside the USB worker
 # ---------------------------------------------------------------------------------------------
-CORE_OBJS := $(OBJ)/core/can_core.o $(OBJ)/core/can_protocol.o $(OBJ)/core/can_protocol_gsusb.o $(OBJ)/core/can_protocol_pcan.o
+CORE_OBJS := $(OBJ)/core/can_core.o $(OBJ)/core/can_protocol.o $(OBJ)/core/can_protocol_gsusb.o $(OBJ)/core/can_protocol_pcan.o \
+             $(OBJ)/core/can_protocol_slcan.o
 
 CORE_COMMON := -std=c++17 $(OPT) -I$(SRC)
 
-CORE_EXPORTS := ["_core_stage_ptr","_core_stage_cap","_core_out_ptr","_core_out_cap","_core_process","_core_publish","_core_clear_table","_core_clear_trace","_core_set_trace_enabled","_core_reset_clock","_core_set_protocol","_core_reset_stream"]
+CORE_EXPORTS := ["_core_stage_ptr","_core_stage_cap","_core_out_ptr","_core_out_cap","_core_process","_core_publish","_core_clear_table","_core_clear_trace","_core_set_trace_enabled","_core_reset_clock","_core_set_protocol","_core_reset_stream","_core_set_rx_enabled","_core_take_replies","_core_reply_ptr"]
 CORE_LDFLAGS := $(OPT) -sMODULARIZE=1 -sEXPORT_NAME=createCanCore -sENVIRONMENT=worker \
                 -sALLOW_MEMORY_GROWTH=1 -sEXPORTED_RUNTIME_METHODS='["HEAPU8"]' \
                 -sEXPORTED_FUNCTIONS='$(CORE_EXPORTS)'
@@ -84,7 +85,7 @@ CORE_JS    := $(OUT)/can_core.js
 BUNDLE     :=
 PRE_JS     :=
 PAGE_DEPS  :=
-ARTIFACTS  := $(OUT)/index.html $(OUT)/can_core.js $(OUT)/usb_worker.js
+ARTIFACTS  := $(OUT)/index.html $(OUT)/can_core.js $(OUT)/usb_worker.js $(OUT)/serial_worker.js
 endif
 
 # ---------------------------------------------------------------------------------------------
@@ -118,14 +119,18 @@ $(CORE_JS): $(CORE_OBJS)
 
 # --- single mode: worker source (core glue + usb_worker.js) packed into a --pre-js for the page ---
 ifeq ($(MODE),single)
-$(BUNDLE): $(CORE_JS) $(SRC)/usb_worker.js pack_worker.py
+$(BUNDLE): $(CORE_JS) $(SRC)/usb_worker.js $(SRC)/serial_worker.js pack_worker.py
 	@mkdir -p $(@D)
-	python3 pack_worker.py $(CORE_JS) $(SRC)/usb_worker.js $@
+	python3 pack_worker.py $(CORE_JS) $(SRC)/usb_worker.js $(SRC)/serial_worker.js $@
 endif
 
-# --- multi mode: the page loads usb_worker.js next to itself ---
+# --- multi mode: the page loads usb_worker.js and serial_worker.js next to itself ---
 ifeq ($(MODE),multi)
 $(OUT)/usb_worker.js: $(SRC)/usb_worker.js
+	@mkdir -p $(@D)
+	cp $< $@
+
+$(OUT)/serial_worker.js: $(SRC)/serial_worker.js
 	@mkdir -p $(@D)
 	cp $< $@
 endif

@@ -8,6 +8,11 @@
 // and its can_core wasm module. The page side forwards commands with postMessage and applies the
 // snapshots (changed ID rows + new trace entries) it receives.
 //
+// Serial (SLCAN) adapters use the same worker for everything but the port I/O: that is done by a second
+// worker, serial_worker.js, started on the first use. The page connects the two with a MessageChannel, so
+// the received bytes go from the serial worker straight to the CAN worker. Only the choice of the port
+// (a user gesture, window-only API) happens here; the page then hands the port over to the serial worker.
+//
 // Several adapters are handled at once. The page-side JS keeps a table of slots (device number ->
 // USBDevice picked by the user); every command carries the device number, and every worker message
 // carries the device number and the `epoch` of that device's connection. Messages of an older
@@ -17,15 +22,17 @@
 // Create the worker and route its messages into the exported wasm callbacks
 EM_JS(void, js_webusb_init, (), {
     if (Module.usb) return;
-    if (typeof Worker === 'undefined' || !navigator.usb) {
-        console.error("WebUSB or Web Workers are not available in this browser");
+    if (typeof Worker === 'undefined' || (!navigator.usb && !navigator.serial)) {
+        console.error("WebUSB/Web Serial or Web Workers are not available in this browser");
         return;
     }
 
     const MAX_DEVICES = 8;      // kMaxDevices in can_protocol.h
-    const usb = Module.usb = { worker: null, staging: 0, stagingCap: 0, slots: [], epochs: [] };
+    const usb = Module.usb = { worker: null, serialWorker: null, staging: 0, stagingCap: 0, slots: [], epochs: [] };
     for (let i = 0; i < MAX_DEVICES; i++) {
-        usb.slots.push(null);   // { device: USBDevice, state: 'connecting' | 'open' | 'closed' }
+        // { transport: 'usb', device: USBDevice, state } or { transport: 'serial', key, info, baud, state },
+        // state: 'connecting' | 'open' | 'closed'
+        usb.slots.push(null);
         usb.epochs.push(0);     // bumped on every (re)connect and on removal, never reset
     }
 
@@ -65,12 +72,21 @@ EM_JS(void, js_webusb_init, (), {
 
     // Tell the UI which adapter occupies a slot (what the browser knows about it)
     usb.announce = (dev) => {
-        const d = usb.slots[dev].device;
-        const ver = (a, b, c) => a + "." + b + "." + c;
-        const p = [d.manufacturerName, d.productName, d.serialNumber,
-                   ver(d.usbVersionMajor, d.usbVersionMinor, d.usbVersionSubminor),
-                   ver(d.deviceVersionMajor, d.deviceVersionMinor, d.deviceVersionSubminor)].map(usb.cstr);
-        _webusb_cb_device_added(dev, d.vendorId, d.productId, p[0], p[1], p[2], p[3], p[4]);
+        const slot = usb.slots[dev];
+        let p;
+        if (slot.transport === 'serial') {
+            // A serial port tells only its USB ids, if it is a USB serial adapter
+            const i = slot.info;
+            p = ["", i.usbVendorId !== undefined ? "USB serial port" : "Serial port", "", "", ""].map(usb.cstr);
+            _webusb_cb_device_added(dev, i.usbVendorId | 0, i.usbProductId | 0, p[0], p[1], p[2], p[3], p[4], 1);
+        } else {
+            const d = slot.device;
+            const ver = (a, b, c) => a + "." + b + "." + c;
+            p = [d.manufacturerName, d.productName, d.serialNumber,
+                 ver(d.usbVersionMajor, d.usbVersionMinor, d.usbVersionSubminor),
+                 ver(d.deviceVersionMajor, d.deviceVersionMinor, d.deviceVersionSubminor)].map(usb.cstr);
+            _webusb_cb_device_added(dev, d.vendorId, d.productId, p[0], p[1], p[2], p[3], p[4], 0);
+        }
         p.forEach(ptr => _free(ptr));
     };
 
@@ -80,11 +96,39 @@ EM_JS(void, js_webusb_init, (), {
         slot.state = 'connecting';
         const epoch = ++usb.epochs[dev];
         usb.announce(dev);
+        if (slot.transport === 'serial') {
+            usb.worker.postMessage({ type: 'open', dev: dev, epoch: epoch, transport: 'serial', baud: slot.baud });
+            return;
+        }
         usb.worker.postMessage({
             type: 'open', dev: dev, epoch: epoch,
             vid: slot.device.vendorId, pid: slot.device.productId,
             serial: slot.device.serialNumber || null
         });
+    };
+
+    // Starts the serial worker (once) and connects it to the CAN worker with a MessageChannel
+    usb.ensureSerial = () => {
+        if (usb.serialWorker) return true;
+        if (!navigator.serial) {
+            usb.notify("Web Serial is not available in this browser");
+            return false;
+        }
+        try {
+            const src = Module.serialWorkerSource;
+            const sw = src ? new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })))
+                           : new Worker('serial_worker.js');
+            sw.onerror = (e) => console.error("serial_worker.js error:", e.message || e);
+            const ch = new MessageChannel();
+            usb.worker.postMessage({ type: 'serial_link', port: ch.port1 }, [ch.port1]);
+            sw.postMessage({ type: 'link', port: ch.port2 }, [ch.port2]);
+            usb.serialWorker = sw;
+            return true;
+        } catch (err) {
+            console.error("Cannot start the serial worker:", err);
+            usb.notify("Cannot start the serial worker: " + (err && err.message ? err.message : err));
+            return false;
+        }
     };
 
     w.onmessage = (ev) => {
@@ -148,11 +192,15 @@ EM_JS(void, js_webusb_init, (), {
 EM_JS(void, js_webusb_request, (), {
     const usb = Module.usb;
     if (!usb || !usb.worker) return;
+    if (!navigator.usb) {
+        usb.notify("WebUSB is not available in this browser");
+        return;
+    }
     navigator.usb.requestDevice({ filters: [] })
         .then(device => {
-            let dev = usb.slots.findIndex(s => s && s.device === device);
+            let dev = usb.slots.findIndex(s => s && s.transport === 'usb' && s.device === device);
             if (dev < 0 && device.serialNumber) {
-                dev = usb.slots.findIndex(s => s && s.device.serialNumber === device.serialNumber &&
+                dev = usb.slots.findIndex(s => s && s.transport === 'usb' && s.device.serialNumber === device.serialNumber &&
                                                s.device.vendorId === device.vendorId &&
                                                s.device.productId === device.productId);
             }
@@ -170,7 +218,7 @@ EM_JS(void, js_webusb_request, (), {
                 usb.notify("All " + usb.slots.length + " device slots are in use: remove a device first");
                 return;
             }
-            usb.slots[dev] = { device: device, state: 'closed' };
+            usb.slots[dev] = { transport: 'usb', device: device, state: 'closed' };
             usb.open(dev);
         })
         .catch(err => {
@@ -178,6 +226,64 @@ EM_JS(void, js_webusb_request, (), {
             console.error("WebUSB Request Error:", err);
             usb.notify("Cannot open the device chooser: " + (err && err.message ? err.message : err));
         });
+});
+
+// Ask the user for a serial port (window-only API, needs the user gesture of the button press) and connect it
+// in a free slot at the given baud rate. The port goes to the serial worker: as the object itself where the
+// browser can transfer SerialPort objects, otherwise as "the idx-th permitted port with these USB ids".
+EM_JS(void, js_serial_request, (int baud), {
+    const usb = Module.usb;
+    if (!usb || !usb.worker || !usb.ensureSerial()) return;
+    navigator.serial.requestPort({})
+        .then(async port => {
+            let info = {};
+            try { info = port.getInfo() || {}; } catch (e) { /* no info */ }
+            let idx = 0;
+            try {
+                const all = await navigator.serial.getPorts();
+                const same = all.filter(p => {
+                    const i = p.getInfo ? p.getInfo() : {};
+                    return i.usbVendorId === info.usbVendorId && i.usbProductId === info.usbProductId;
+                });
+                idx = Math.max(0, same.indexOf(port));
+            } catch (e) { /* getPorts() failed: the first port with these ids is used */ }
+
+            const key = (info.usbVendorId | 0) + ":" + (info.usbProductId | 0) + ":" + idx;
+            let dev = usb.slots.findIndex(s => s && s.transport === 'serial' && s.key === key);
+            if (dev >= 0) {
+                if (usb.slots[dev].state !== 'closed') {
+                    usb.notify("This port is already connected as device " + (dev + 1));
+                    return;
+                }
+                usb.slots[dev].baud = baud;
+                usb.open(dev);
+                return;
+            }
+            dev = usb.slots.findIndex(s => !s);
+            if (dev < 0) {
+                usb.notify("All " + usb.slots.length + " device slots are in use: remove a device first");
+                return;
+            }
+            const pick = { type: 'pick', dev: dev, vid: info.usbVendorId | 0, pid: info.usbProductId | 0, idx: idx };
+            try {
+                usb.serialWorker.postMessage(Object.assign({ port: port }, pick), [port]);
+            } catch (e) {
+                usb.serialWorker.postMessage(pick);          // SerialPort is not transferable here
+            }
+            usb.slots[dev] = { transport: 'serial', key: key, info: info, baud: baud, state: 'closed' };
+            usb.open(dev);
+        })
+        .catch(err => {
+            if (err && err.name === 'NotFoundError') return;   // the chooser was cancelled
+            console.error("Web Serial Request Error:", err);
+            usb.notify("Cannot open the serial port chooser: " + (err && err.message ? err.message : err));
+        });
+});
+
+// Baud rate used the next time the serial port of a slot is connected
+EM_JS(void, js_serial_set_baud, (int dev, int baud), {
+    const usb = Module.usb;
+    if (usb && usb.slots[dev] && usb.slots[dev].transport === 'serial') usb.slots[dev].baud = baud;
 });
 
 // Reconnect the adapter of a known, closed slot
@@ -199,6 +305,7 @@ EM_JS(void, js_webusb_remove, (int dev), {
     const usb = Module.usb;
     if (!usb || !usb.worker || !usb.slots[dev]) return;
     usb.worker.postMessage({ type: 'close', dev: dev });
+    if (usb.slots[dev].transport === 'serial' && usb.serialWorker) usb.serialWorker.postMessage({ type: 'forget', dev: dev });
     usb.slots[dev] = null;
     usb.epochs[dev]++;
 });
@@ -251,8 +358,10 @@ EM_JS(void, js_webusb_control_in, (int dev, int request, int value, int index, i
 // Extern C callbacks invoked from JS
 extern "C" {
     EMSCRIPTEN_KEEPALIVE void webusb_cb_device_added(int dev, int vid, int pid, const char* mfg, const char* prod,
-                                                     const char* serial, const char* usb_ver, const char* dev_ver) {
+                                                     const char* serial, const char* usb_ver, const char* dev_ver,
+                                                     int is_serial) {
         UsbDeviceInfo info;
+        info.is_serial = is_serial != 0;
         info.vid = static_cast<uint16_t>(vid);
         info.pid = static_cast<uint16_t>(pid);
         info.manufacturer = mfg ? mfg : "";
@@ -311,6 +420,14 @@ void WebUsbBridge::Initialize() {
 
 void WebUsbBridge::RequestDevice() {
     js_webusb_request();
+}
+
+void WebUsbBridge::RequestSerialPort(int baud) {
+    js_serial_request(baud);
+}
+
+void WebUsbBridge::SetSerialBaud(int dev, int baud) {
+    if (ValidDevice(dev)) js_serial_set_baud(dev, baud);
 }
 
 void WebUsbBridge::ConnectDevice(int dev) {
@@ -374,7 +491,8 @@ void WebUsbBridge::InternalOnDeviceOpened(int dev, const char* endpoints, int pr
     if (!ValidDevice(dev)) return;
     DeviceOpenInfo open;
     open.endpoints = endpoints ? endpoints : "";
-    open.protocol = (protocol == PROTOCOL_PEAK_PCAN_FD) ? PROTOCOL_PEAK_PCAN_FD : PROTOCOL_GS_USB_CANDLELIGHT;
+    open.protocol = (protocol == PROTOCOL_PEAK_PCAN_FD || protocol == PROTOCOL_SLCAN)
+                        ? static_cast<CanProtocolType>(protocol) : PROTOCOL_GS_USB_CANDLELIGHT;
     open.info = info ? info : "";
     if (on_device_opened_) on_device_opened_(dev, open);
 }

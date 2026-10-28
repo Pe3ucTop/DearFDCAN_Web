@@ -10,6 +10,7 @@
 
 #include <cstring>
 #include <deque>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -92,6 +93,16 @@ CanProtocolType g_protocol[kMaxDevices] = {};   // protocol of every adapter (de
 CanRxStreamState g_stream[kMaxDevices];         // records split across two transfers (PEAK uCAN)
 ClockSync g_clock[kMaxDevices];          // every adapter has its own clock
 uint32_t g_dev_frames[kMaxDevices] = {};
+
+// SLCAN adapters (serial): no hardware timestamps; the lines that are not frames are command replies
+std::string g_replies[kMaxDevices];             // reply tokens not yet fetched by the worker
+bool g_rx_gate[kMaxDevices];                    // false: frames of the adapter are parsed but dropped
+double g_prev_chunk_ms[kMaxDevices] = {};       // arrival time of the previous chunk of the adapter
+constexpr size_t   kRepliesMax = 4096;
+constexpr double   kSpreadMaxGapMs = 100.0;     // frames of a chunk are spread over at most this long a gap
+uint8_t g_reply_out[kRepliesMax];
+size_t g_reply_out_len = 0;
+struct GateInit { GateInit() { for (bool& g : g_rx_gate) g = true; } } g_gate_init;
 
 bool g_trace_enabled = true;
 bool g_force_publish = false;
@@ -193,10 +204,23 @@ EMSCRIPTEN_KEEPALIVE void core_process(int used) {
 
         if (dev < kMaxDevices) {
             g_parsed.clear();
-            CanProtocolHandler::ParseRx(g_protocol[dev], g_stage + off, len, g_parsed, g_stream[dev]);
+            const bool serial = g_protocol[dev] == PROTOCOL_SLCAN;
+            CanProtocolHandler::ParseRx(g_protocol[dev], g_stage + off, len, g_parsed, g_stream[dev],
+                                        serial ? &g_replies[dev] : nullptr);
+            if (g_replies[dev].size() > kRepliesMax) g_replies[dev].erase(0, g_replies[dev].size() - kRepliesMax);
+
+            // A serial chunk holds frames that arrived since the previous chunk, not all at once: spread
+            // them over that interval (in order) so cycle times are not quantized to the chunk rate
+            const double prev = g_prev_chunk_ms[dev];
+            const size_t n = g_parsed.size();
+            const bool spread = serial && n > 1 && prev > 0.0 && host_ms > prev && host_ms - prev <= kSpreadMaxGapMs;
+            if (serial) g_prev_chunk_ms[dev] = host_ms;
+            size_t k = 0;
             for (CanMessage& m : g_parsed) {
                 m.dev = dev;
-                OnFrame(m, host_ms);
+                ++k;
+                if (serial && !g_rx_gate[dev]) continue;
+                OnFrame(m, spread ? prev + (host_ms - prev) * static_cast<double>(k) / static_cast<double>(n) : host_ms);
             }
         }
         off += len;
@@ -288,9 +312,34 @@ EMSCRIPTEN_KEEPALIVE void core_reset_clock(int dev) {
 // a fresh receive stream.
 EMSCRIPTEN_KEEPALIVE void core_set_protocol(int dev, int protocol) {
     if (dev < 0 || dev >= kMaxDevices) return;
-    g_protocol[dev] = (protocol == PROTOCOL_PEAK_PCAN_FD) ? PROTOCOL_PEAK_PCAN_FD : PROTOCOL_GS_USB_CANDLELIGHT;
+    g_protocol[dev] = (protocol == PROTOCOL_PEAK_PCAN_FD || protocol == PROTOCOL_SLCAN)
+                          ? static_cast<CanProtocolType>(protocol) : PROTOCOL_GS_USB_CANDLELIGHT;
     g_stream[dev].Reset();
+    g_replies[dev].clear();
+    g_prev_chunk_ms[dev] = 0.0;
+    g_rx_gate[dev] = true;
 }
+
+// SLCAN adapters: frames are dropped while the gate is closed (the replies of commands still come through, the
+// version request is answered before the CAN channel is started). USB adapters are gated by the worker.
+EMSCRIPTEN_KEEPALIVE void core_set_rx_enabled(int dev, int enable) {
+    if (dev < 0 || dev >= kMaxDevices) return;
+    g_rx_gate[dev] = enable != 0;
+    g_prev_chunk_ms[dev] = 0.0;
+}
+
+// Moves the pending reply tokens of an adapter ("K\n", "E<c>\n", "L<text>\n") into a fixed buffer and returns
+// their length; the bytes are at core_reply_ptr() until the next call.
+EMSCRIPTEN_KEEPALIVE int core_take_replies(int dev) {
+    if (dev < 0 || dev >= kMaxDevices) return 0;
+    std::string& r = g_replies[dev];
+    g_reply_out_len = r.size() < kRepliesMax ? r.size() : kRepliesMax;
+    if (g_reply_out_len) std::memcpy(g_reply_out, r.data(), g_reply_out_len);
+    r.clear();
+    return static_cast<int>(g_reply_out_len);
+}
+
+EMSCRIPTEN_KEEPALIVE uint8_t* core_reply_ptr() { return g_reply_out; }
 
 // Drop the half-received record of an adapter's stream (call when its transfers were interrupted: the
 // next transfer then starts at a record boundary again)

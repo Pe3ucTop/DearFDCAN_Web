@@ -15,6 +15,7 @@ struct UsbDeviceInfo {
     std::string serial;
     std::string usb_version;     // bcdUSB, e.g. "2.0.0"
     std::string device_version;  // bcdDevice, e.g. "1.0.0"
+    bool is_serial = false;      // a Web Serial port (SLCAN adapter); vid/pid are 0 unless it is a USB serial adapter
 };
 
 // What the worker learned when it opened an adapter
@@ -79,6 +80,11 @@ public:
 
     // Opens the browser's device chooser and connects the picked adapter in a free slot
     void RequestDevice();
+    // Opens the browser's serial port chooser and connects the picked port in a free slot (an SLCAN adapter).
+    // The baud rate matters for real UARTs; USB CDC ports ignore it.
+    void RequestSerialPort(int baud);
+    // Baud rate used the next time the serial port of a slot is connected
+    void SetSerialBaud(int dev, int baud);
     // Reconnects the adapter of a known slot (no chooser)
     void ConnectDevice(int dev);
     // Closes the adapter but keeps its slot
@@ -100,8 +106,10 @@ public:
     // Send a Control IN transfer (Device -> Host on EP0)
     void ControlTransferIn(int dev, uint8_t request, uint16_t value, uint16_t index, uint16_t length);
 
-    // Send a command transfer to the adapter's command endpoint (PEAK uCAN). It runs in the same order as
-    // the control transfers and is acknowledged through the control-OUT-done callback with `id` as request.
+    // Send a command transfer to the adapter's command endpoint (PEAK uCAN) or a command line to a serial
+    // adapter (SLCAN, '\r' terminated). It runs in the same order as the control transfers and is acknowledged
+    // through the control-OUT-done callback with `id` as request. For SLCAN the acknowledge is the adapter's
+    // own reply; id SLCAN_CMD_VERSION ('V') is answered with its text through the control-IN callback instead.
     void CommandOut(int dev, int id, const uint8_t* data, int length);
 
     // Core state commands (all adapters). Snapshot parts produced before a clear are discarded by
