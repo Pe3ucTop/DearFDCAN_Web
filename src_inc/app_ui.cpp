@@ -127,7 +127,8 @@ static ImVec4 DeviceColor(int dev) {
 static std::string FeatureList(uint32_t features) {
     static const char* const names[] = {
         "Listen-only", "Loopback", "Triple-sample", "One-shot", "HW timestamp",
-        "Identify", "User ID", "Pad packets", "CAN FD"
+        "Identify", "User ID", "Pad packets", "CAN FD", "LPC546xx quirk", "Data timing limits", "Termination",
+        "Error reporting", "Error state", "Elmue protocol", "USB blobs"
     };
     constexpr size_t kNames = sizeof(names) / sizeof(names[0]);
 
@@ -258,17 +259,28 @@ double AppUI::GetNowMs() const {
 // OnControlOutDone() and are told apart from gs_usb request codes by being >= 0x100
 static constexpr int kPcanCmdIdStart = 0x100;
 static constexpr int kPcanCmdIdStop  = 0x200;
+// Control transfers of the gs_usb Elmue sequences are acknowledged with ids of their own, because the same request code
+// (MODE) is sent several times: a failure of a "required" one aborts the start, an "optional" one is ignored
+static constexpr int kGsIdRequired = 0x500;
+static constexpr int kGsIdOptional = 0x600;
+static constexpr int kGsIdQuiet    = 0x700;   // housekeeping outside of a start (mode reset at open, termination): acknowledgement not interesting
 // SLCAN command ids are SLCAN_CMD_ID_START / SLCAN_CMD_ID_STOP / SLCAN_CMD_VERSION (can_protocol_slcan.h)
 
 // Register limits of an adapter's bit timing: what the editors may enter and the automatic calculation may use
 static const CanBitTimingLimits kGsLimits = {512, 128, 128, 1024};   // as wide as the editor always allowed
+// gs_usb adapters that answered BT_CONST_EXT tell the real limits of both phases
+static CanBitTimingLimits GsLimitsOf(const ElmTimeLimits& t) {
+    return CanBitTimingLimits{t.seg1_max, t.seg2_max, t.sjw_max, t.brp_max};
+}
 static CanBitTimingLimits NominalLimitsOf(const DeviceSlot& d) {
     if (d.protocol == PROTOCOL_SLCAN) return d.slcan_info.valid && d.slcan_info.nominal.brp_max ? d.slcan_info.nominal : CanProtocolSlcan::DefaultNominalLimits();
-    return d.protocol == PROTOCOL_PEAK_PCAN_FD ? PcanNominalLimits() : kGsLimits;
+    if (d.protocol == PROTOCOL_PEAK_PCAN_FD) return PcanNominalLimits();
+    return d.has_bt_ext && d.bt_ext.nominal.brp_max ? GsLimitsOf(d.bt_ext.nominal) : kGsLimits;
 }
 static CanBitTimingLimits DataLimitsOf(const DeviceSlot& d) {
     if (d.protocol == PROTOCOL_SLCAN) return d.slcan_info.valid && d.slcan_info.data.brp_max ? d.slcan_info.data : CanProtocolSlcan::DefaultDataLimits();
-    return d.protocol == PROTOCOL_PEAK_PCAN_FD ? PcanDataLimits() : kGsLimits;
+    if (d.protocol == PROTOCOL_PEAK_PCAN_FD) return PcanDataLimits();
+    return d.has_bt_ext && d.bt_ext.data.brp_max ? GsLimitsOf(d.bt_ext.data) : kGsLimits;
 }
 
 // Bit rates of the Lawicel "S" command, in kbit/s
@@ -449,6 +461,13 @@ void AppUI::OnDeviceOpened(int dev, const DeviceOpenInfo& open) {
     }
 
     // gs_usb: query bit-timing constants and the adapter description from EP0
+    d.elmue_supported = false;
+    d.elmue_active = false;
+    d.hw_timestamps_active = false;
+    d.has_bt_ext = false;
+    d.has_board = false;
+    d.feedback_labels.clear();
+    ResetBusReport(d);
     auto& usb = WebUsbBridge::GetInstance();
     usb.ControlTransferIn(dev, GS_USB_BREQ_BT_CONST, 0, 0, sizeof(GsDeviceBtConst));
     usb.ControlTransferIn(dev, GS_USB_BREQ_DEVICE_CONFIG, 0, 0, sizeof(GsDeviceConfig));
@@ -461,7 +480,49 @@ void AppUI::OnDeviceClosed(int dev, const std::string& reason) {
     d.connected = false;
     d.channel_opening = false;
     d.channel_open = false;
+    d.elmue_active = false;
+    d.hw_timestamps_active = false;
     d.status = (reason == "closed by host") ? std::string() : reason;
+}
+
+void AppUI::ResetBusReport(DeviceSlot& d) {
+    d.bus_load = -1;
+    d.bus_state = ELM_BUS_ACTIVE;
+    d.bus_rx_errors = d.bus_tx_errors = 0;
+    d.error_reports = 0;
+    d.last_error_text.clear();
+    d.adapter_text.clear();
+}
+
+// Lines of the Elmue protocol that are not CAN frames: bus load, text of the firmware, error reports
+void AppUI::OnAdapterEvents(int dev, const std::string& lines) {
+    if (!ValidDevice(dev) || !devices_[dev].used) return;
+    DeviceSlot& d = devices_[dev];
+    size_t pos = 0;
+    while (pos < lines.size()) {
+        size_t end = lines.find('\n', pos);
+        if (end == std::string::npos) end = lines.size();
+        const std::string line = lines.substr(pos, end - pos);
+        pos = end + 1;
+        if (line.empty()) continue;
+
+        const std::string body = line.substr(1);
+        if (line[0] == 'U') {
+            d.bus_load = std::clamp(std::atoi(body.c_str()), 0, 100);
+        } else if (line[0] == 'T') {
+            d.adapter_text = body;
+        } else if (line[0] == 'E') {
+            uint32_t err_id = 0;
+            uint8_t data[8] = {};
+            if (!CanProtocolElmue::ParseErrorEvent(body, err_id, data)) continue;
+            const ElmErrorInfo info = CanProtocolElmue::DecodeError(err_id, data);
+            ++d.error_reports;
+            d.bus_rx_errors = info.rx_errors;
+            d.bus_tx_errors = info.tx_errors;
+            if (info.state_known) d.bus_state = info.state;
+            if (!info.text.empty()) d.last_error_text = info.text;
+        }
+    }
 }
 
 void AppUI::OnNotice(const std::string& text) {
@@ -497,9 +558,34 @@ void AppUI::OnControlDataReceived(int dev, uint8_t request, const uint8_t* data,
         std::memcpy(&d.bt_const, data, sizeof(GsDeviceBtConst));
         d.has_bt_const = true;
         if (d.bt_const.fclk_can > 0) RecalculateTimings(d);
+
+        // An Elmue (CANable 2.5) adapter: switch its extended requests on (they need the Elmue flag in the last MODE request, which a
+        // reset with the flag provides) and read what only they can tell
+        if ((d.bt_const.feature & ELM_FEATURE_PROTOCOL) && !d.elmue_supported) {
+            d.elmue_supported = true;
+            auto& usb = WebUsbBridge::GetInstance();
+            GsDeviceMode reset = {GS_CAN_MODE_RESET, ELM_FEATURE_PROTOCOL};
+            usb.ControlTransferOut(dev, GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&reset), sizeof(reset), kGsIdQuiet);
+            usb.ControlTransferIn(dev, ELM_BREQ_GET_BOARD_INFO, 0, 0, sizeof(ElmBoardInfo));
+            if (d.bt_const.feature & GS_CAN_FEATURE_BT_CONST_EXT) usb.ControlTransferIn(dev, GS_USB_BREQ_BT_CONST_EXT, 0, 0, sizeof(GsDeviceBtConstExt));
+        }
     } else if (request == GS_USB_BREQ_DEVICE_CONFIG && length >= static_cast<int>(sizeof(GsDeviceConfig))) {
         std::memcpy(&d.config, data, sizeof(GsDeviceConfig));
         d.has_config = true;
+    } else if (request == GS_USB_BREQ_BT_CONST_EXT && length >= static_cast<int>(sizeof(GsDeviceBtConstExt))) {
+        std::memcpy(&d.bt_ext, data, sizeof(GsDeviceBtConstExt));
+        d.has_bt_ext = true;
+        RecalculateTimings(d);
+    } else if (request == ELM_BREQ_GET_BOARD_INFO) {
+        d.has_board = CanProtocolElmue::ParseBoardInfo(data, length, d.board);
+    } else if (request == ELM_BREQ_GET_LAST_ERROR && length >= 1) {
+        // The adapter's verdict on the request sent before (it cannot stall the data stage to say so)
+        const std::string what = d.feedback_labels.empty() ? std::string("a command") : d.feedback_labels.front();
+        if (!d.feedback_labels.empty()) d.feedback_labels.erase(d.feedback_labels.begin());
+        if (data[0] != 2 /* success */ && (d.channel_opening || d.channel_open)) {
+            OnNotice("Device " + std::to_string(dev + 1) + ": the adapter rejected " + what + ": " + CanProtocolElmue::FeedbackText(data[0]));
+            StopCanChannel(dev);
+        }
     }
 }
 
@@ -508,6 +594,22 @@ void AppUI::OnControlDataReceived(int dev, uint8_t request, const uint8_t* data,
 void AppUI::OnControlOutDone(int dev, int request, bool ok) {
     if (!ValidDevice(dev) || !devices_[dev].used) return;
     DeviceSlot& d = devices_[dev];
+
+    if (request == kGsIdQuiet) return;
+    if (request >= kGsIdRequired && request < kGsIdQuiet) {
+        // gs_usb Elmue start sequence (see StartGsUsbElmue): the last required transfer is MODE_START
+        if (!d.channel_opening) return;
+        if (!ok) {
+            if (request < kGsIdOptional) {
+                OnNotice("Device " + std::to_string(dev + 1) + ": a start command was not accepted by the adapter");
+                StopCanChannel(dev);
+            }
+        } else if (request == d.gs_start_last_id) {
+            d.channel_opening = false;
+            d.channel_open = true;
+        }
+        return;
+    }
 
     if (d.protocol == PROTOCOL_SLCAN && request == SLCAN_CMD_VERSION) {
         if (!ok) {              // no answer to 'V': not a CANable firmware
@@ -616,6 +718,11 @@ void AppUI::StartCanChannel(int dev) {
         return;
     }
 
+    if (d.elmue_supported && d.use_elmue) {
+        StartGsUsbElmue(dev);
+        return;
+    }
+
     uint32_t host_format = 0x0000BEEFU;
     usb.ControlTransferOut(dev, GS_USB_BREQ_HOST_FORMAT, 1, 0, reinterpret_cast<const uint8_t*>(&host_format), sizeof(host_format));
     usb.ControlTransferOut(dev, GS_USB_BREQ_BITTIMING, 0, 0, reinterpret_cast<const uint8_t*>(&d.nom_bt), sizeof(d.nom_bt));
@@ -632,12 +739,85 @@ void AppUI::StartCanChannel(int dev) {
     if (d.enable_listen_only) mode_cmd.flags |= GS_CAN_FEATURE_LISTEN_ONLY;
     // Ask the adapter to append its microsecond timestamp to every frame: cycle times are then
     // computed from the adapter clock instead of the (jittery) USB/browser arrival time
-    if (d.bt_const.feature & GS_CAN_FEATURE_HW_TIMESTAMP) mode_cmd.flags |= GS_CAN_FEATURE_HW_TIMESTAMP;
+    d.hw_timestamps_active = d.use_hw_timestamps && (d.bt_const.feature & GS_CAN_FEATURE_HW_TIMESTAMP);
+    if (d.hw_timestamps_active) mode_cmd.flags |= GS_CAN_FEATURE_HW_TIMESTAMP;
 
     usb.ControlTransferOut(dev, GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd));
 
-    usb.StartRxPump(dev, 0, 0);   // endpoint and transfer size as detected by the worker
+    // endpoint and transfer size as detected by the worker; with timestamps the worker also keeps the adapter clock synchronised
+    usb.StartRxPump(dev, 0, 0, d.hw_timestamps_active ? WebUsbBridge::kRxTimestamps : 0);
     d.channel_opening = true;     // channel_open is set when MODE_START is acknowledged
+}
+
+// Start of a gs_usb channel in Elmue mode. The adapter keeps the Elmue requests (id >= 20) switched on only while the last MODE request
+// carried the Elmue flag, so the sequence starts with a mode reset that has it. Each request is followed by a read of the adapter's
+// verdict (ELM_BREQ_GET_LAST_ERROR), because a firmware that rejects a parameter cannot stall the data stage to tell.
+void AppUI::StartGsUsbElmue(int dev) {
+    DeviceSlot& d = devices_[dev];
+    auto& usb = WebUsbBridge::GetInstance();
+    d.feedback_labels.clear();
+    ResetBusReport(d);
+
+    int required = 0, optional = 0;
+    auto out = [&](uint8_t request, const void* data, int length, bool is_required, const char* label) {
+        const int id = is_required ? kGsIdRequired + required++ : kGsIdOptional + optional++;
+        usb.ControlTransferOut(dev, request, 0, 0, static_cast<const uint8_t*>(data), length, id);
+        if (is_required && label) {
+            usb.ControlTransferIn(dev, ELM_BREQ_GET_LAST_ERROR, 0, 0, 1);
+            d.feedback_labels.push_back(label);
+        }
+        return id;
+    };
+
+    const uint32_t host_format = 0x0000BEEFU;
+    out(GS_USB_BREQ_HOST_FORMAT, &host_format, sizeof(host_format), false, nullptr);
+    const GsDeviceMode reset = {GS_CAN_MODE_RESET, ELM_FEATURE_PROTOCOL};
+    out(GS_USB_BREQ_MODE, &reset, sizeof(reset), true, "the mode reset");
+    out(GS_USB_BREQ_BITTIMING, &d.nom_bt, sizeof(d.nom_bt), true, "the bit timing");
+    if (d.enable_fd) out(GS_USB_BREQ_DATA_BITTIMING, &d.data_bt, sizeof(d.data_bt), true, "the data bit timing");
+
+    if (d.use_filters) {
+        bool any = false;
+        for (const DeviceSlot::HwFilter& f : d.filters) any = any || f.enabled;
+        if (any) {
+            const auto clear = CanProtocolElmue::BuildFilter(ELM_FIL_HOST_CLEAR);
+            out(ELM_BREQ_SET_FILTER, clear.data(), static_cast<int>(clear.size()), true, "clearing the filters");
+            for (const DeviceSlot::HwFilter& f : d.filters) {
+                if (!f.enabled) continue;
+                const uint32_t id_mask = f.extended ? CAN_ID_EFF_MASK : CAN_ID_SFF_MASK;
+                const auto add = CanProtocolElmue::BuildFilter(f.extended ? ELM_FIL_HOST_PASS_29 : ELM_FIL_HOST_PASS_11, f.id & id_mask, f.mask & id_mask);
+                out(ELM_BREQ_SET_FILTER, add.data(), static_cast<int>(add.size()), true, "a filter");
+            }
+        }
+    }
+
+    const uint8_t busload = d.busload_report ? 10 : 0;               // report interval in 100 ms steps
+    out(ELM_BREQ_SET_BUSLOAD_REPORT, &busload, sizeof(busload), false, nullptr);
+    if (d.termination_on && (d.bt_const.feature & GS_CAN_FEATURE_TERMINATION)) {
+        const uint32_t on = 1;
+        out(GS_USB_BREQ_SET_TERMINATION, &on, sizeof(on), false, nullptr);
+    }
+
+    d.hw_timestamps_active = d.use_hw_timestamps && (d.bt_const.feature & GS_CAN_FEATURE_HW_TIMESTAMP);
+    GsDeviceMode start = {GS_CAN_MODE_START, CanProtocolElmue::ModeFlags(d.bt_const.feature, d.hw_timestamps_active)};
+    if (d.enable_fd)          start.flags |= GS_CAN_FEATURE_FD;
+    if (d.enable_loopback)    start.flags |= GS_CAN_FEATURE_LOOP_BACK;
+    if (d.enable_listen_only) start.flags |= GS_CAN_FEATURE_LISTEN_ONLY;
+    d.gs_start_last_id = out(GS_USB_BREQ_MODE, &start, sizeof(start), true, "the start");
+
+    d.elmue_active = true;
+    // Messages of up to 2048 bytes (blobs); the worker resolves tx echoes and, with timestamps, keeps the adapter clock synchronised
+    usb.StartRxPump(dev, 0, ELM_MAX_BLOB_SIZE, WebUsbBridge::kRxElmue | (d.hw_timestamps_active ? WebUsbBridge::kRxTimestamps : 0));
+    d.channel_opening = true;
+}
+
+// 120 ohm termination resistor of the adapter (GS_CAN_FEATURE_TERMINATION): switched at once, and again at every channel start
+void AppUI::SetTermination(int dev, bool on) {
+    DeviceSlot& d = devices_[dev];
+    d.termination_on = on;
+    if (!d.connected || !(d.bt_const.feature & GS_CAN_FEATURE_TERMINATION)) return;
+    const uint32_t value = on ? 1 : 0;
+    WebUsbBridge::GetInstance().ControlTransferOut(dev, GS_USB_BREQ_SET_TERMINATION, 0, 0, reinterpret_cast<const uint8_t*>(&value), sizeof(value), kGsIdQuiet);
 }
 
 void AppUI::StopCanChannel(int dev) {
@@ -657,11 +837,15 @@ void AppUI::StopCanChannel(int dev) {
             usb.CommandOut(dev, SLCAN_CMD_ID_STOP + static_cast<int>(i), reinterpret_cast<const uint8_t*>(cmds[i].data()), static_cast<int>(cmds[i].size()));
         }
     } else {
-        GsDeviceMode mode_cmd = {GS_CAN_MODE_RESET, 0};
-        usb.ControlTransferOut(dev, GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd));
+        // An Elmue adapter keeps its extended requests (filters, bus load, board info) available only if this MODE request has the flag
+        GsDeviceMode mode_cmd = {GS_CAN_MODE_RESET, d.elmue_supported ? ELM_FEATURE_PROTOCOL : 0u};
+        usb.ControlTransferOut(dev, GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd), d.elmue_supported ? kGsIdQuiet : -1);
     }
     d.channel_opening = false;
     d.channel_open = false;
+    d.elmue_active = false;
+    d.hw_timestamps_active = false;
+    d.feedback_labels.clear();
 }
 
 // Closes the adapter, forgets its slot and everything that referred to it
@@ -739,13 +923,13 @@ bool AppUI::TargetHasOpenChannel(int target) const {
 // Sends one frame to one adapter, or to every adapter that is BUS ON. Returns the number of adapters.
 int AppUI::SendFrame(const CanMessage& msg, int target) {
     // The transfer format depends on the adapter's protocol: build it once per protocol in use
-    std::vector<uint8_t> usb_bytes[2];
-    bool built[2] = {false, false};
+    std::vector<uint8_t> usb_bytes[3];
+    bool built[3] = {false, false, false};
     int sent = 0;
     for (int dev = 0; dev < kMaxDevices; ++dev) {
         if (target != kTargetAllDevices && target != dev) continue;
         if (!IsBusOn(dev)) continue;
-        const CanProtocolType protocol = devices_[dev].protocol;
+        const CanProtocolType protocol = EffectiveProtocol(devices_[dev]);
         if (protocol == PROTOCOL_SLCAN) {
             // The line depends on the dialect of the adapter; a classic one cannot send CAN FD frames
             const std::vector<uint8_t> line = CanProtocolHandler::BuildTx(protocol, msg, static_cast<uint8_t>(EffectiveDialect(devices_[dev])));
@@ -757,8 +941,9 @@ int AppUI::SendFrame(const CanMessage& msg, int target) {
             ++sent;
             continue;
         }
-        const int slot = (protocol == PROTOCOL_PEAK_PCAN_FD) ? 1 : 0;
-        if (!built[slot]) {
+        // The Elmue message carries a marker that identifies the frame in its echo: one message per adapter, never shared
+        const int slot = (protocol == PROTOCOL_PEAK_PCAN_FD) ? 1 : (protocol == PROTOCOL_GS_USB_ELMUE ? 2 : 0);
+        if (!built[slot] || protocol == PROTOCOL_GS_USB_ELMUE) {
             usb_bytes[slot] = CanProtocolHandler::BuildTx(protocol, msg, 0);
             built[slot] = true;
         }
@@ -1154,6 +1339,30 @@ void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
         row("Errors",   d.connected ? fmt("RX %u, TX %u", ds.rx_errors, ds.tx_errors) : std::string(),
             "TX drop / recov.", d.connected ? fmt("%u / %u", ds.tx_dropped, ds.recoveries) : std::string());
 
+        // CANable 2.5 (Elmue) adapters: the board, and while the channel runs what the adapter reports about the bus
+        if (d.elmue_supported && d.connected) {
+            row("Board", d.has_board ? std::string(d.board.board_name) + ", " + d.board.mcu_name : std::string(),
+                "Board features", d.has_board ? CanProtocolElmue::BoardFlagsText(d.board.board_flags) : std::string());
+            row("Protocol mode", d.channel_open || d.channel_opening ? std::string(d.elmue_active ? "Elmue (compact messages, USB blobs)" : "legacy gs_usb")
+                                                                      : std::string(d.use_elmue ? "Elmue at the next start" : "legacy at the next start"),
+                "Bus load", d.elmue_active && d.channel_open && d.bus_load >= 0 ? fmt("%d %%", d.bus_load) : std::string());
+            if (d.elmue_active && d.channel_open) {
+                static const char* const kBusStates[] = {"active", "warning", "passive", "BUS OFF"};
+                row("Bus state", std::string(kBusStates[d.bus_state & 3]) + fmt("  (RX errors %u, TX errors %u)", d.bus_rx_errors, d.bus_tx_errors),
+                    "Error reports", d.error_reports ? fmt("%u", d.error_reports) : std::string());
+                if (!d.last_error_text.empty() || !d.adapter_text.empty()) row("Last error", d.last_error_text, "Adapter text", d.adapter_text);
+            }
+        }
+
+        // Synchronisation of the adapter's clock with the page's (gs_usb with timestamps): the spread is how far the samples
+        // of the last minute scatter around the fitted line, i.e. the accuracy the frame times can have
+        if (d.connected && ds.sync.valid) {
+            const ClockSyncStats& s = ds.sync;
+            row("Clock sync", fmt("%u requests, %u used", s.samples, s.accepted), "Clock drift", fmt("%+.1f ppm", s.drift_ppm));
+            row("Sync spread", s.accepted >= 2 ? fmt("%.0f us rms, worst %.0f us", s.jitter_us, s.worst_us) : std::string("collecting..."),
+                "Request time", fmt("%.2f ms shortest, %.2f ms last", s.rtt_min_ms, s.rtt_last_ms));
+        }
+
         ImGui::EndTable();
     }
 
@@ -1206,6 +1415,34 @@ void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
         ImGui::SameLine();
         ImGui::Checkbox("Listen-Only", &d.enable_listen_only);
 
+        // gs_usb: adapter timestamps and the extensions of CANable 2.5 firmware (Elmue protocol)
+        if (d.protocol == PROTOCOL_GS_USB_CANDLELIGHT) {
+            ImGui::BeginDisabled(!(d.bt_const.feature & GS_CAN_FEATURE_HW_TIMESTAMP));
+            ImGui::Checkbox("HW timestamps", &d.use_hw_timestamps);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip("Frame times from the adapter's clock (exact), synchronised with the page by reading the clock once a second");
+            }
+            ImGui::BeginDisabled(!d.elmue_supported);
+            ImGui::SameLine();
+            ImGui::Checkbox("Elmue protocol", &d.use_elmue);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                ImGui::SetTooltip(d.elmue_supported
+                    ? "CANable 2.5 firmware: compact messages, several frames per USB transfer, error and bus load reports, tx echo markers"
+                    : "The adapter does not offer the Elmue protocol (ElmueSoft CANable 2.5 firmware)");
+            }
+            if (d.elmue_supported && d.use_elmue) {
+                ImGui::SameLine();
+                ImGui::Checkbox("Bus load report", &d.busload_report);
+            }
+            if (d.bt_const.feature & GS_CAN_FEATURE_TERMINATION) {
+                bool termination = d.termination_on;
+                if (ImGui::Checkbox("120 ohm termination", &termination)) SetTermination(dev, termination);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Switch the adapter's termination resistor");
+            }
+        }
+
         ImGui::SeparatorText("Nominal Arbitration Timing");
         if (classic) {
             // The adapter knows nine bit rates ("S0".."S8"); the sample point is not adjustable
@@ -1229,10 +1466,52 @@ void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
             RenderBittimingEditor("Data", d.protocol, d.bt_const.fclk_can, DataLimitsOf(d), d.data_bt, d.target_data_kbps, d.target_data_sp);
         }
 
+        if (d.protocol == PROTOCOL_GS_USB_CANDLELIGHT && d.elmue_supported && d.use_elmue) RenderHwFilters(d);
+
         ImGui::EndDisabled();
     }
 
     ImGui::End();
+}
+
+// Host acceptance filters of an Elmue adapter (ELM_BREQ_SET_FILTER): up to eight, programmed when the channel starts
+void AppUI::RenderHwFilters(DeviceSlot& d) {
+    ImGui::SeparatorText("Hardware ID filters");
+    ImGui::Checkbox("Filter in the adapter", &d.use_filters);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The adapter forwards only the frames that pass one of the filters, which saves USB bandwidth on a busy bus");
+    if (!d.use_filters) return;
+
+    ImGui::TextDisabled("A frame passes if (ID & mask) == (filter & mask). With only 11 bit filters no 29 bit frame passes, and vice versa.");
+    if (ImGui::BeginTable("HwFilters", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("On",     ImGuiTableColumnFlags_WidthFixed,   36.0f);
+        ImGui::TableSetupColumn("29 bit", ImGuiTableColumnFlags_WidthFixed,   56.0f);
+        ImGui::TableSetupColumn("Filter (hex)", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Mask (hex)",   ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableHeadersRow();
+        for (int i = 0; i < ELM_MAX_HOST_FILTERS; ++i) {
+            DeviceSlot::HwFilter& f = d.filters[i];
+            ImGui::PushID(i);
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Checkbox("##on", &f.enabled);
+            ImGui::TableNextColumn();
+            if (ImGui::Checkbox("##ext", &f.extended)) {
+                // the usual full mask of the id type, unless the user typed another one
+                if (f.mask == CAN_ID_SFF_MASK || f.mask == CAN_ID_EFF_MASK) f.mask = f.extended ? CAN_ID_EFF_MASK : CAN_ID_SFF_MASK;
+            }
+            const uint32_t limit = f.extended ? CAN_ID_EFF_MASK : CAN_ID_SFF_MASK;
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputScalar("##id", ImGuiDataType_U32, &f.id, nullptr, nullptr, "%X", ImGuiInputTextFlags_CharsHexadecimal);
+            f.id &= limit;
+            ImGui::TableNextColumn();
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::InputScalar("##mask", ImGuiDataType_U32, &f.mask, nullptr, nullptr, "%X", ImGuiInputTextFlags_CharsHexadecimal);
+            f.mask &= limit;
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
 }
 
 // ============================================================================
@@ -1348,11 +1627,15 @@ void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float 
             ImGui::Text(m.is_extended ? "0x%08X" : "0x%03X", m.id);
 
             ImGui::TableSetColumnIndex(2);
-            ImGui::Text("%s %s%s%s",
-                        m.is_extended ? "EXT" : "STD",
-                        m.is_fd ? "FD" : "2.0",
-                        m.is_brs ? " BRS" : "",
-                        m.is_rtr ? " RTR" : "");
+            if (m.is_error) {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "ERROR REPORT");
+            } else {
+                ImGui::Text("%s %s%s%s",
+                            m.is_extended ? "EXT" : "STD",
+                            m.is_fd ? "FD" : "2.0",
+                            m.is_brs ? " BRS" : "",
+                            m.is_rtr ? " RTR" : "");
+            }
 
             ImGui::TableSetColumnIndex(3);
             uint8_t byte_len = m.is_fd ? CanProtocolHandler::DlcToBytes(m.dlc) : std::min<uint8_t>(m.dlc, 8);
@@ -1520,7 +1803,9 @@ void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
             }
 
             ImGui::TableSetColumnIndex(2);
-            if (m.is_tx_echo) {
+            if (m.is_error) {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "ERR");
+            } else if (m.is_tx_echo) {
                 ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "TX");
             } else {
                 ImGui::TextColored(ImVec4(0.4f, 0.9f, 1.0f, 1.0f), "RX");
@@ -1539,7 +1824,14 @@ void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
             ImGui::Text("%u", m.dlc);
 
             ImGui::TableSetColumnIndex(6);
-            if (m.is_rtr) {
+            if (m.is_error && m.payload.size() >= 8) {
+                // error report of the adapter: what it says, then the raw bytes
+                const ElmErrorInfo info = CanProtocolElmue::DecodeError(m.id, m.payload.data());
+                const std::string hex = FormatHexPayload(m.payload);
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%s", info.text.empty() ? "error" : info.text.c_str());
+                ImGui::SameLine();
+                ImGui::TextDisabled("[%s]", hex.c_str());
+            } else if (m.is_rtr) {
                 ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1.0f), "RTR");
             } else {
                 std::string hex = FormatHexPayload(m.payload);

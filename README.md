@@ -12,6 +12,14 @@ available in Firefox/Safari) and talks to the adapter directly, no driver or nat
 - Classic CAN and CAN FD (BRS, ESI), standard and extended IDs, remote frames.
 - **Two adapter families**: gs_usb (candleLight / CANable and compatible) and PEAK PCAN-USB FD (VID 0C72, PID 0011..0014, one CAN port);
   the protocol is chosen from the USB ids and adapters of both families can be used side by side.
+- **ElmueSoft CANable 2.5 extensions of gs_usb** (used automatically when the firmware offers them, can be switched off per adapter): compact
+  messages instead of 80 byte frames, several frames per USB transfer ("blobs"), tx echoes by marker, error reports (bus state, error counters,
+  decoded error flags, shown in the trace and in the device pane), bus load in percent, text messages of the firmware, board information,
+  the real bit-timing limits of the data phase, the 120 Ω termination switch and up to eight hardware ID filters in the adapter.
+- **Clock synchronisation** of gs_usb adapters with hardware timestamps: once a second the adapter's clock is read (`GS_USB_BREQ_TIMESTAMP`),
+  the round trip of each request brackets the moment it was latched, and a line fitted through the samples with the shortest round trips gives
+  the offset and the drift of the adapter's quartz against the browser clock. The Devices window shows the drift in ppm and the **spread** of the
+  samples around the line (rms and worst case in µs), the accuracy the frame times can have.
 - **Serial SLCAN adapters** through Web Serial (**Add Serial Port**): the CANable 2.5 firmware dialect (CAN FD, exact bit timing from the
   adapter's own limits, listen-only and loopback modes) and classic Lawicel adapters (fixed bit rates, no FD); the dialect is detected with
   the `V` command or chosen by hand. USB and serial adapters can be mixed.
@@ -160,6 +168,7 @@ All sources and headers are in `src_inc/`:
 | `src_inc/can_core.cpp` | Worker wasm module: frame parsing, ID table keyed by (device, ID), trace queue, per-adapter clock mapping |
 | `src_inc/can_protocol_common.h` | Protocol independent definitions: `CanMessage`/`CanPayload`, `CanBittiming`, `CanProtocolType`, DLC helpers, bit-timing calculation, `kMaxDevices` |
 | `src_inc/can_protocol_gsusb.cpp/.h` | gs_usb (candleLight / CANable): control requests, structures, bulk frame parsing and building |
+| `src_inc/can_protocol_elmue.cpp/.h` | The ElmueSoft CANable 2.5 extension of gs_usb: message/blob parsing, frame building with echo markers, error decoding, board info, host filters, mode flags |
 | `src_inc/can_protocol_pcan.cpp/.h` | PEAK PCAN-USB FD (uCAN): packed command/record structures, command transfers (clock, options, bit timing, filter, bus on/off), record stream parsing with reassembly across transfers, frame building, bit-timing limits |
 | `src_inc/can_protocol_slcan.cpp/.h` | SLCAN (Lawicel / CANable slcan firmware): line stream parser (frames and command replies), frame lines, `V` answer parser, start/stop command sequences |
 | `src_inc/can_protocol.cpp/.h` | Umbrella header and the `CanProtocolHandler` facade: the single entry point the UI and the core use, forwards to the protocol backend |
@@ -194,7 +203,13 @@ Tunables: `RX_SLOTS`, `TX_INFLIGHT`, `PUBLISH_MS`, `BATCH_CREDITS` at the top of
 - At most 8 adapters (`kMaxDevices` in `can_protocol.h`, `MAX_DEVICES` in `usb_worker.js`, `MAX_DEVICES` in `webusb_bridge.cpp`). The limits
   of the ID table (65536 rows) and the trace are shared by all adapters.
 - `TX_INFLIGHT = 4` keeps several bulk OUT transfers in flight; WebUSB does not guarantee their order. Set it to `1` if strict frame order matters.
-- The adapter→page clock mapping is an estimate (lowest observed latency, 100 ppm drift allowance); cycle times use the raw adapter timestamps and are exact.
+- Elmue protocol specifics: frames are sent one per USB transfer (the adapter can take blobs of several transmit frames, this program does not
+  batch them); the bridge filters for multi-channel boards are not exposed; the adapter's flash, pin and error-state requests are not used. The
+  receive buffer of gs_usb adapters is 2048 bytes (the size of the largest blob).
+- The adapter→page clock mapping is an estimate. gs_usb adapters with timestamps: a line through the clock samples (see Features; needs three
+  good samples, until then and for the other protocols: lowest observed latency, 100 ppm drift allowance). Legacy candleLight firmware latches
+  the timestamp for this request only at USB start-of-frame (up to 1 ms old), so its spread is larger; the Elmue firmware reads the clock at
+  once. Cycle times use the raw adapter timestamps and are exact.
   Without hardware timestamps cycle times fall back to arrival times and show USB/browser jitter.
 - The ID table holds at most 65536 IDs, the page keeps 2000 trace rows.
 - The page wasm has Emscripten's default fixed 16 MB heap (no `ALLOW_MEMORY_GROWTH`); the ID table costs roughly 250 bytes per ID.

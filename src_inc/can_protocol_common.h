@@ -16,13 +16,15 @@ constexpr int kMaxDevices = 8;
 enum CanProtocolType : int {
     PROTOCOL_GS_USB_CANDLELIGHT = 0,
     PROTOCOL_PEAK_PCAN_FD       = 1,  // PEAK PCAN-USB FD family (uCAN firmware protocol)
-    PROTOCOL_SLCAN              = 2   // ASCII serial CAN (Lawicel / CANable slcan) over WebSerial; never auto-detected
+    PROTOCOL_SLCAN              = 2,  // ASCII serial CAN (Lawicel / CANable slcan) over WebSerial; never auto-detected
+    PROTOCOL_GS_USB_ELMUE       = 3   // a gs_usb adapter running in ElmueSoft CANable 2.5 mode (compact messages, blobs); chosen at channel start
 };
 
 inline const char* CanProtocolName(CanProtocolType type) {
     switch (type) {
         case PROTOCOL_PEAK_PCAN_FD: return "PEAK PCAN-USB FD (uCAN)";
         case PROTOCOL_SLCAN:        return "SLCAN (serial)";
+        case PROTOCOL_GS_USB_ELMUE: return "gs_usb + Elmue (CANable 2.5)";
         default:                    return "gs_usb (candleLight / CANable)";
     }
 }
@@ -137,6 +139,8 @@ struct CanMessage {
     bool is_esi = false;
     bool is_tx_echo = false;
     bool has_hw_timestamp = false;
+    bool is_error = false;          // an error report of the adapter (Elmue protocol): id = error flags, payload = the 8 error bytes
+    uint8_t tx_marker = 0;          // Elmue protocol: the marker a transmitted frame carried (tx echoes)
     uint8_t dlc = 0;
     uint8_t dev = 0;                // device number (slot) the frame was received from / is meant for
     CanPayload payload;

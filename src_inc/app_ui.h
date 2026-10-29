@@ -65,6 +65,36 @@ struct DeviceSlot {
     GsDeviceBtConst bt_const = {};
     GsDeviceConfig config = {};
 
+    // gs_usb adapter with the ElmueSoft CANable 2.5 extensions (reported by the BT_CONST feature bits)
+    struct HwFilter {             // one host acceptance filter of the adapter: passes the ids with (id & mask) == (filter & mask)
+        bool enabled = false;
+        bool extended = false;    // 29 bit ids; an 11 bit and a 29 bit filter cover different frames
+        uint32_t id = 0;
+        uint32_t mask = 0x7FF;
+    };
+    bool elmue_supported = false; // the adapter offers the Elmue protocol
+    bool use_elmue = true;        // user's choice: use it when offered (compact messages, blobs, error reports)
+    bool elmue_active = false;    // the channel was started in Elmue mode
+    bool use_hw_timestamps = true;   // gs_usb: ask for adapter timestamps (and synchronise the adapter clock with the page)
+    bool hw_timestamps_active = false;
+    bool has_bt_ext = false;      // GS_USB_BREQ_BT_CONST_EXT answered: separate limits of the nominal and the data phase
+    GsDeviceBtConstExt bt_ext = {};
+    bool has_board = false;       // ELM_BREQ_GET_BOARD_INFO answered
+    ElmBoardInfo board = {};
+    bool termination_on = false;  // 120 ohm resistor of the adapter (only if GS_CAN_FEATURE_TERMINATION)
+    bool busload_report = true;   // ask the adapter to report the bus load
+    bool use_filters = false;     // program the host filters below into the adapter at the channel start
+    HwFilter filters[ELM_MAX_HOST_FILTERS];
+    int gs_start_last_id = 0;     // id of the last control transfer of a pending Elmue start sequence
+    std::vector<std::string> feedback_labels;   // what each pending ELM_BREQ_GET_LAST_ERROR answer is about
+    // What the adapter reports while the channel runs (Elmue protocol)
+    int bus_load = -1;            // percent, -1 = not reported
+    ElmBusState bus_state = ELM_BUS_ACTIVE;
+    uint32_t bus_rx_errors = 0, bus_tx_errors = 0;
+    uint32_t error_reports = 0;   // error messages received
+    std::string last_error_text;  // decoded last error message
+    std::string adapter_text;     // last text message of the firmware
+
     GsDeviceBittiming nom_bt = {};
     int target_nom_kbps = 500;
     float target_nom_sp = 87.5f;
@@ -98,8 +128,14 @@ public:
     void OnSnapshot(const SnapshotView& snapshot);
     void OnControlDataReceived(int dev, uint8_t request, const uint8_t* data, int length);
     void OnControlOutDone(int dev, int request, bool ok);
+    // Elmue protocol: lines from the worker core ("U<percent>", "T<text>", "E<id>:<data>")
+    void OnAdapterEvents(int dev, const std::string& lines);
 
 private:
+    void StartGsUsbElmue(int dev);
+    void SetTermination(int dev, bool on);
+    void RenderHwFilters(DeviceSlot& d);
+    void ResetBusReport(DeviceSlot& d);
     void StartCanChannel(int dev);
     void StopCanChannel(int dev);
     void RemoveDevice(int dev);
@@ -111,6 +147,8 @@ private:
     static void ApplyProtocol(DeviceSlot& d, CanProtocolType protocol);
     // Dialect an SLCAN adapter is driven in (the user's choice, else what the probe found, else classic)
     static SlcanDialect EffectiveDialect(const DeviceSlot& d);
+    // Protocol of the frames an adapter exchanges right now (gs_usb in Elmue mode is a protocol of its own)
+    static CanProtocolType EffectiveProtocol(const DeviceSlot& d) { return d.elmue_active ? PROTOCOL_GS_USB_ELMUE : d.protocol; }
     bool IsBusOn(int dev) const;
     int ConnectedDeviceCount() const;
     int BusOnDeviceCount() const;

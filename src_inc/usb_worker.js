@@ -24,12 +24,15 @@
 //   init     {timeOrigin}                          performance.timeOrigin of the page (clock alignment)
 //   open     {dev, epoch, vid, pid, serial, protocol?}  open the (already permitted) device, start RX slots
 //   close    {dev}
-//   ctrl_out {dev, request, value, index, data, reqType?, recipient?}   control OUT, executed strictly in order per device
+//   ctrl_out {dev, request, value, index, data, id?, reqType?, recipient?}   control OUT, executed strictly in order per device;
+//                                                  acknowledged as ctrl_ack {request: id} (id >= 0) or {request}
 //   ctrl_in  {dev, request, value, index, length, reqType?, recipient?} control IN, executed strictly in order per device
 //   cmd_out  {dev, id, ep, data}                   bulk OUT command transfer (ep 0 = command endpoint), executed in
 //                                                  the same order as the control transfers, acknowledged as ctrl_ack {request: id}
 //   tx       {dev, ep, data}                       bulk OUT frame (bounded queue, limited in-flight); ep 0 = detected
-//   rx       {dev, enable, ep, size}               gate processing of received frames (+ endpoint config)
+//   rx       {dev, enable, ep, size, elmue?, ts?}  gate processing of received frames (+ endpoint config). gs_usb: `elmue` = the
+//                                                  channel runs in Elmue mode (compact messages), `ts` = it was started with
+//                                                  adapter timestamps (the worker then reads the adapter clock once a second)
 //   core     {op, arg}                             op 1 = clear ID table, 2 = clear trace, 3 = trace on/off (all devices)
 //   ret      {buf}                                 snapshot buffer handed back = one flow-control credit
 //
@@ -41,12 +44,15 @@
 //   ctrl_in  {dev, epoch, request, data}
 //   ctrl_ack {dev, epoch, request, ok}             completion of a control OUT
 //   stats    {dev, epoch, rxPerSec, txDropped, recoveries, rxErrors, txErrors}
+//   sync     {dev, epoch, s}                       clock synchronisation statistics (8 numbers, see postSync)
+//   events   {dev, epoch, text}                    Elmue protocol: bus load / text / error report lines (see drainEvents)
 
 const MAX_DEVICES = 8;              // must match kMaxDevices in can_protocol.h
 const IFACE = 0;
 const DEFAULT_EP_IN = 1;            // endpoint numbers without direction bit, used if no descriptor is available
 const DEFAULT_EP_OUT = 2;
 const DEFAULT_RX_SIZE = 512;
+const GS_RX_SIZE = 2048;            // gs_usb receive transfers: room for an Elmue blob (ELM_MAX_BLOB_SIZE in can_protocol_elmue.h)
 const RX_SLOTS = 6;                 // concurrent transferIn requests kept pending per adapter
 const TX_INFLIGHT = 4;              // concurrent transferOut per adapter; set to 1 for strictly serialized TX
 const TX_QUEUE_MAX = 4096;
@@ -60,6 +66,15 @@ const PING_TIMEOUT_MS = 1500;
 const PING_FAILS_MAX = 2;
 const RX_ERRORS_BEFORE_RECOVER = 5;
 const GS_USB_BREQ_BT_CONST = 4;     // harmless read used as liveness probe
+const GS_USB_BREQ_TIMESTAMP = 6;    // the adapter's microsecond clock, read periodically to synchronise it with the page
+
+// Clock synchronisation of gs_usb adapters: a burst of samples after the channel start for a quick first estimate, then
+// one per second; the core fits a line (offset + drift) through the samples with the shortest round trips
+const SYNC_FIRST_MS = 100;
+const SYNC_BURST = 8;
+const SYNC_BURST_MS = 150;
+const SYNC_MS = 1000;
+const SYNC_FAILS_MAX = 3;           // consecutive failures after which the adapter is not asked again
 
 // Protocols (CanProtocolType in can_protocol_common.h)
 const PROTO_GS = 0;
@@ -258,6 +273,15 @@ class Device {
         this.pingBusy = false;
         this.pingFails = 0;
 
+        // gs_usb in Elmue mode (compact messages): the core needs to see the transmitted frames to resolve the tx echoes
+        this.elmue = false;
+
+        // Clock synchronisation (GS_USB_BREQ_TIMESTAMP)
+        this.syncOn = false;
+        this.syncTimer = 0;
+        this.syncFails = 0;
+        this.syncCount = 0;
+
         this.st = { rx: 0, rxPrev: 0, rxErrors: 0, txDropped: 0, txErrors: 0, recoveries: 0 };
     }
 
@@ -274,6 +298,76 @@ class Device {
     }
 
     get active() { return !!this.usb; }
+
+    // -----------------------------------------------------------------------------------------
+    // Clock synchronisation: the adapter's timestamp is read with a control transfer; the round trip brackets the moment
+    // the adapter latched it, so the middle of it is the page time of the sample (the core filters by round trip)
+    // -----------------------------------------------------------------------------------------
+
+    startSync() {
+        if (this.syncOn) return;
+        this.syncOn = true;
+        this.syncFails = 0;
+        this.syncCount = 0;
+        this.scheduleSync(SYNC_FIRST_MS);
+    }
+
+    stopSync() {
+        this.syncOn = false;
+        clearTimeout(this.syncTimer);
+        this.syncTimer = 0;
+    }
+
+    scheduleSync(ms) {
+        clearTimeout(this.syncTimer);
+        // queued behind the control transfers that are still waiting (the channel start), like every control transfer
+        this.syncTimer = setTimeout(() => { if (this.syncOn && this.usb) this.enqueue(() => this.syncOnce()); }, ms);
+    }
+
+    async syncOnce() {
+        const d = this.usb;
+        if (!this.syncOn || !d || !core) return;
+        let ok = false;
+        try {
+            const setup = { requestType: 'vendor', recipient: 'interface', request: GS_USB_BREQ_TIMESTAMP, value: 0, index: IFACE };
+            const t0 = now();
+            const r = await withTimeout(d.controlTransferIn(setup, 4), PING_TIMEOUT_MS, 'clock sample timeout');
+            const t1 = now();
+            if (r.status === 'ok' && r.data && r.data.byteLength >= 4 && this.syncOn && this.usb === d) {
+                processStage();             // frames received so far are mapped with the estimate they were received under
+                core._core_clock_sample(this.dev, r.data.getUint32(0, true), (t0 + t1) / 2, t1 - t0);
+                this.lastPingOk = performance.now();     // the control pipe answered: no liveness probe needed
+                this.postSync();
+                ok = true;
+            }
+        } catch (err) {
+            if (this.usb === d && isGone(err)) { this.lost(errText(err)); return; }
+        }
+        if (!this.syncOn) return;
+        if (ok) {
+            this.syncFails = 0;
+        } else if (++this.syncFails >= SYNC_FAILS_MAX) {
+            console.warn('[usb_worker] dev ' + this.dev + ' does not answer the clock request, synchronisation stopped');
+            this.syncOn = false;
+            return;
+        }
+        this.syncCount++;
+        this.scheduleSync(this.syncCount < SYNC_BURST ? SYNC_BURST_MS : SYNC_MS);
+    }
+
+    // Statistics of the clock samples for the page: [samples, good, offset ms, drift ppm, spread µs, min rtt ms, last rtt ms, worst µs]
+    postSync() {
+        const ptr = core._core_clock_stats(this.dev);
+        this.post('sync', { s: Array.from(new Float64Array(core.HEAPU8.buffer, ptr, 8)) });
+    }
+
+    // Event lines of the Elmue protocol ("U<percent>", "T<text>", "E<id>:<data>"): bus load, firmware text, error reports
+    drainEvents() {
+        const n = core._core_take_events(this.dev);
+        if (n <= 0) return;
+        const ptr = core._core_reply_ptr();
+        this.post('events', { text: utf8.decode(core.HEAPU8.subarray(ptr, ptr + n)) });
+    }
 
     // -----------------------------------------------------------------------------------------
     // Open / close / loss
@@ -327,7 +421,9 @@ class Device {
             text = describeEndpoints(d) || ('CMD OUT ' + hs.layout.cmdOut + ', CMD IN ' + hs.layout.cmdIn + ', MSG IN ' + hs.layout.rxEp + ', MSG OUT ' + hs.layout.txEp);
         } else {
             const ep = inspectEndpoints(d);
-            layout = { rxEp: ep.rxEp, txEp: ep.txEp, cmdEp: 0, rxSize: ep.rxSize };
+            // 2048 bytes: the biggest transfer of the Elmue protocol (a blob of several frames); a legacy adapter simply
+            // ends its transfers early. The page asks for the same size when it starts an Elmue channel, so no re-claim is needed.
+            layout = { rxEp: ep.rxEp, txEp: ep.txEp, cmdEp: 0, rxSize: Math.max(GS_RX_SIZE, ep.rxSize) };
             text = ep.text;
         }
 
@@ -376,6 +472,8 @@ class Device {
         this.usb = null;
         this.rxGen++;
         this.rxEnabled = false;
+        this.elmue = false;
+        this.stopSync();
         this.txQueue = [];
         this.txHead = 0;
         updateTimers();
@@ -388,8 +486,9 @@ class Device {
     async control(m) {
         const d = this.usb;
         const isOut = m.type === 'ctrl_out';
+        const ackId = m.id >= 0 ? m.id : m.request;     // the page may tag a control OUT with an id of its own
         if (!d) {
-            if (isOut) this.post('ctrl_ack', { request: m.request, ok: false });
+            if (isOut) this.post('ctrl_ack', { request: ackId, ok: false });
             return;
         }
         const setup = {
@@ -400,7 +499,7 @@ class Device {
             if (isOut) {
                 const r = await withTimeout(d.controlTransferOut(setup, m.data), CTRL_TIMEOUT_MS,
                                             'control OUT timeout (request ' + m.request + ')');
-                this.post('ctrl_ack', { request: m.request, ok: r.status === 'ok' });
+                this.post('ctrl_ack', { request: ackId, ok: r.status === 'ok' });
             } else {
                 const r = await withTimeout(d.controlTransferIn(setup, m.length), CTRL_TIMEOUT_MS,
                                             'control IN timeout (request ' + m.request + ')');
@@ -411,7 +510,7 @@ class Device {
             }
         } catch (err) {
             console.error('[usb_worker] dev ' + this.dev + ' control transfer failed:', err);
-            if (isOut) this.post('ctrl_ack', { request: m.request, ok: false });
+            if (isOut) this.post('ctrl_ack', { request: ackId, ok: false });
             if (this.usb === d && isGone(err)) this.lost(errText(err));
         }
     }
@@ -524,14 +623,22 @@ class Device {
         if (!enable) {
             processStage();                 // everything received before the stop still counts
             this.rxEnabled = false;
+            this.stopSync();
             return;
         }
         if (!this.rxEnabled && core) {
             core._core_reset_clock(this.dev);       // new channel start: adapter clock may restart
+            if (this.protocol === PROTO_GS) {
+                // gs_usb: the page says whether the channel runs in Elmue mode (compact messages) and with timestamps
+                this.elmue = !!m.elmue;
+                if (this.elmue) core._core_set_elmue(this.dev, m.ts ? 1 : 0);
+                else core._core_set_protocol(this.dev, PROTO_GS);
+            }
             core._core_reset_stream(this.dev);      // and the record stream starts at a record boundary
         }
         this.rxEnabled = true;
         if (!this.usb) return;
+        if (this.protocol === PROTO_GS && m.ts) this.startSync();
         const ep = m.ep ? (m.ep & 0x7F) : this.rxEp;
         const size = Math.max(64, Math.min(m.size | 0 || this.rxSize, 16384));
         if (ep !== this.rxEp || size !== this.rxSize) {
@@ -554,6 +661,8 @@ class Device {
 
     enqueueTx(data, ep) {
         if (!this.usb || this.txQueue.length - this.txHead >= TX_QUEUE_MAX) { this.st.txDropped++; return; }
+        // Elmue echoes only carry a marker: the core keeps the frame until its echo arrives
+        if (this.elmue && this.rxEnabled && core) stageBytes(this.dev, ep ? (ep & 0x7F) : this.txEp, new Uint8Array(data), now());
         this.txQueue.push({ data: data, ep: ep ? (ep & 0x7F) : this.txEp });
         this.pumpTx();
     }
@@ -878,7 +987,10 @@ function processStage() {
         core._core_process(stageOff);
         stageOff = 0;
         // serial adapters: the lines that were not frames are answers to commands
-        for (const d of devices) if (d instanceof SerialDevice && d.isOpen) d.drainReplies();
+        for (const d of devices) {
+            if (d instanceof SerialDevice) { if (d.isOpen) d.drainReplies(); }
+            else if (d && d.elmue && d.usb) d.drainEvents();
+        }
     }
 }
 

@@ -126,6 +126,34 @@ sequences, rejected command, FD refused on a classic adapter, stop) headless, a 
 reopen, `getPorts()` fallback, two dialects) also with the packed single-file workers, and the library against a mock `navigator.serial`.
 **Not verified: any real SLCAN adapter, Web Serial inside a worker in a real browser, transferability of `SerialPort`, and the library in a browser.**
 
+**2026-10-29, ElmueSoft CANable 2.5 extensions of gs_usb and clock synchronisation.** Checked the gs_usb layer against the firmware's
+`candlelight_def.h`: the program spoke only the legacy protocol. New `can_protocol_elmue.*`: the compact bulk messages (`kHeader` size+type; rx
+frame 7 bytes + data, tx frame 8 bytes + data, with/without the 4 byte timestamp), blobs (`frame_count` + `MSG_RxBlob`, up to 2048 bytes), tx
+echoes by marker, error reports, bus load and text messages, plus the control requests `BT_CONST_EXT` (separate limits of the data phase, which the
+timing calculation now respects), board info, host filters, bus load report, termination and the feedback read (`GET_LAST_ERROR`). The extended
+requests only work while the last `MODE` request carried `ELM_DevFlagProtocolElmue`, so the open sequence and every stop send a mode reset with
+the flag, and the start sequence is: host format, reset, bit timing(s), filters, bus load, termination, start (flags Elmue + USB blobs + timestamps),
+each required step followed by a feedback read because the firmware cannot stall the data stage to report a rejected parameter (the UI then stops
+the channel and says what was rejected). Control OUT transfers can now be tagged with an id (acknowledged as that id), since `MODE` is sent twice.
+In the core `PROTOCOL_GS_USB_ELMUE` is selected per channel start; the worker stages every transmit message so the core can turn a tx echo (marker
+only) back into the sent frame; error reports become frames (`is_error`, own table rows, decoded in the trace) and bus load / text / error lines
+go to the page as events, which show up in the device pane (bus state, error counters, bus load, last error). UI: Elmue protocol and HW
+timestamps switches, bus load report, termination switch, up to eight hardware ID filters, board information. gs_usb receive transfers are now
+2048 bytes for every gs_usb adapter (no re-claim when an Elmue channel starts). Not implemented: transmit blobs (they need flow control from the
+echo markers), bridge filters of multi-channel boards, flash / pin requests.
+Clock synchronisation: while a gs_usb channel runs with hardware timestamps the worker reads `GS_USB_BREQ_TIMESTAMP` (a burst of 8 requests
+after the start, then one per second) and measures each round trip; the core keeps the last 64 samples (offset = page time in the middle of the
+request minus adapter time), keeps the ones with the shortest round trips, fits a line (offset and drift, slope limited to 500 ppm, fitted only over
+at least 4 s) and reports the drift, the rms spread and the worst deviation of the used samples; with three good samples the frame times follow the
+line (never later than the moment the frame was handled), before that the old latency minimum is used. The Devices window shows the numbers. A
+timestamp slightly older than the newest one seen (a frame behind a clock sample) is jitter now, not an adapter restart. Verified without hardware:
+parser, builder, blobs, echoes and a fuzzer under ASan/UBSan (10 712 checks), the core with stage records, echoes and events, the clock fit against
+a simulated clock with 80 ppm drift, noisy and sometimes long round trips and a 32 bit wrap (drift estimated 82 ppm, spread 0.26 ms, frame times
+within 0.07 ms), the worker against a mock Elmue `USBDevice` (2048 byte transfers, tx staging, blob with echo / bus load / error / frame, events,
+sync burst and stop, switch back to legacy), the UI sequences headless with real Dear ImGui (open, capabilities, Elmue start with filters,
+feedback rejection, failed required / optional transfers, legacy start byte for byte as before, TX bytes, events, rendering) and both build modes
+without warnings. **Not verified: any real CANable 2.5 or other Elmue adapter.**
+
 ## Verified overall
 
 The CAN core, frame parser and URL parsing were unit-tested natively (ASan/UBSan) and the worker was exercised against mock devices with the

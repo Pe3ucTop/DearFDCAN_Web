@@ -183,6 +183,15 @@ EM_JS(void, js_webusb_init, (), {
         case 'stats':
             _webusb_cb_stats(m.dev, m.rxPerSec, m.txDropped, m.recoveries, m.rxErrors, m.txErrors);
             break;
+        case 'sync':
+            _webusb_cb_sync(m.dev, m.s[0], m.s[1], m.s[2], m.s[3], m.s[4], m.s[5], m.s[6], m.s[7]);
+            break;
+        case 'events': {
+            const text = usb.cstr(m.text);
+            _webusb_cb_events(m.dev, text);
+            _free(text);
+            break;
+        }
         }
     };
 });
@@ -311,10 +320,11 @@ EM_JS(void, js_webusb_remove, (int dev), {
 });
 
 // Gate processing of received frames of an adapter and (re)configure its IN endpoint
-EM_JS(void, js_webusb_set_rx_pump, (int dev, int enable, int ep, int max_len), {
+EM_JS(void, js_webusb_set_rx_pump, (int dev, int enable, int ep, int max_len, int flags), {
     const usb = Module.usb;
     if (!usb || !usb.worker) return;
-    usb.worker.postMessage({ type: 'rx', dev: dev, enable: !!enable, ep: ep & 0x7F, size: max_len });
+    usb.worker.postMessage({ type: 'rx', dev: dev, enable: !!enable, ep: ep & 0x7F, size: max_len,
+                             elmue: !!(flags & 1), ts: !!(flags & 2) });
 });
 
 // Commands for the CAN core in the worker: 1 = clear ID table, 2 = clear trace, 3 = trace on/off
@@ -333,11 +343,11 @@ EM_JS(void, js_webusb_transfer_out, (int dev, int ep, const uint8_t* data, int l
 });
 
 // Queue a Vendor Control OUT transfer on EP0 (executed in order, acknowledged with 'ctrl_ack')
-EM_JS(void, js_webusb_control_out, (int dev, int request, int value, int index, const uint8_t* data, int len), {
+EM_JS(void, js_webusb_control_out, (int dev, int request, int value, int index, const uint8_t* data, int len, int id), {
     const usb = Module.usb;
     if (!usb || !usb.worker) return;
     const ab = (len > 0 && data) ? HEAPU8.slice(data, data + len).buffer : new ArrayBuffer(0);
-    usb.worker.postMessage({ type: 'ctrl_out', dev: dev, request: request, value: value, index: index, data: ab }, [ab]);
+    usb.worker.postMessage({ type: 'ctrl_out', dev: dev, request: request, value: value, index: index, data: ab, id: id }, [ab]);
 });
 
 // Queue a bulk OUT transfer to the command endpoint (PEAK uCAN); acknowledged as 'ctrl_ack' with `id`
@@ -396,6 +406,25 @@ extern "C" {
         WebUsbBridge::GetInstance().InternalOnControlOutDone(dev, request, ok != 0);
     }
 
+    EMSCRIPTEN_KEEPALIVE void webusb_cb_sync(int dev, double samples, double accepted, double offset_ms, double drift_ppm,
+                                             double jitter_us, double rtt_min_ms, double rtt_last_ms, double worst_us) {
+        ClockSyncStats s;
+        s.valid = true;
+        s.samples = static_cast<uint32_t>(samples);
+        s.accepted = static_cast<uint32_t>(accepted);
+        s.offset_ms = offset_ms;
+        s.drift_ppm = drift_ppm;
+        s.jitter_us = jitter_us;
+        s.rtt_min_ms = rtt_min_ms;
+        s.rtt_last_ms = rtt_last_ms;
+        s.worst_us = worst_us;
+        WebUsbBridge::GetInstance().InternalOnClockSync(dev, s);
+    }
+
+    EMSCRIPTEN_KEEPALIVE void webusb_cb_events(int dev, const char* text) {
+        WebUsbBridge::GetInstance().InternalOnEvents(dev, text);
+    }
+
     EMSCRIPTEN_KEEPALIVE void webusb_cb_stats(int dev, int rx_per_sec, int tx_dropped, int recoveries,
                                               int rx_errors, int tx_errors) {
         WebUsbBridge::GetInstance().InternalOnStats(dev, static_cast<uint32_t>(rx_per_sec), static_cast<uint32_t>(tx_dropped),
@@ -444,20 +473,22 @@ void WebUsbBridge::RemoveDevice(int dev) {
     dev_stats_[dev] = UsbDeviceStats();
 }
 
-void WebUsbBridge::StartRxPump(int dev, int endpoint, int max_packet_size) {
-    if (ValidDevice(dev)) js_webusb_set_rx_pump(dev, 1, endpoint, max_packet_size);
+void WebUsbBridge::StartRxPump(int dev, int endpoint, int max_packet_size, int flags) {
+    if (!ValidDevice(dev)) return;
+    dev_stats_[dev].sync = ClockSyncStats();         // the estimates of the previous run do not apply
+    js_webusb_set_rx_pump(dev, 1, endpoint, max_packet_size, flags);
 }
 
 void WebUsbBridge::StopRxPump(int dev) {
-    if (ValidDevice(dev)) js_webusb_set_rx_pump(dev, 0, 0, 0);
+    if (ValidDevice(dev)) js_webusb_set_rx_pump(dev, 0, 0, 0, 0);
 }
 
 void WebUsbBridge::TransferOut(int dev, int endpoint, const uint8_t* data, int length) {
     if (ValidDevice(dev)) js_webusb_transfer_out(dev, endpoint, data, length);
 }
 
-void WebUsbBridge::ControlTransferOut(int dev, uint8_t request, uint16_t value, uint16_t index, const uint8_t* data, int length) {
-    if (ValidDevice(dev)) js_webusb_control_out(dev, request, value, index, data, length);
+void WebUsbBridge::ControlTransferOut(int dev, uint8_t request, uint16_t value, uint16_t index, const uint8_t* data, int length, int id) {
+    if (ValidDevice(dev)) js_webusb_control_out(dev, request, value, index, data, length, id);
 }
 
 void WebUsbBridge::ControlTransferIn(int dev, uint8_t request, uint16_t value, uint16_t index, uint16_t length) {
@@ -554,6 +585,16 @@ void WebUsbBridge::InternalOnControlIn(int dev, uint8_t request, const uint8_t* 
 void WebUsbBridge::InternalOnControlOutDone(int dev, int request, bool ok) {
     if (!ValidDevice(dev)) return;
     if (on_control_out_done_) on_control_out_done_(dev, request, ok);
+}
+
+void WebUsbBridge::InternalOnClockSync(int dev, const ClockSyncStats& stats) {
+    if (!ValidDevice(dev)) return;
+    dev_stats_[dev].sync = stats;
+}
+
+void WebUsbBridge::InternalOnEvents(int dev, const char* text) {
+    if (!ValidDevice(dev) || !text) return;
+    if (on_events_) on_events_(dev, std::string(text));
 }
 
 void WebUsbBridge::InternalOnStats(int dev, uint32_t rx_per_sec, uint32_t tx_dropped, uint32_t recoveries,

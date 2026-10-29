@@ -38,8 +38,23 @@ struct DeviceOpenInfo {
     }
 };
 
+// How well the adapter's clock is synchronised with the page clock (gs_usb: the worker reads the adapter's timestamp
+// about once a second and the core fits a line through the samples with the shortest round trips)
+struct ClockSyncStats {
+    bool valid = false;            // at least one sample arrived since the channel was started
+    uint32_t samples = 0;          // timestamp requests answered
+    uint32_t accepted = 0;         // of the last 64, those with a short round trip (the ones the fit uses)
+    double offset_ms = 0.0;        // adapter time -> page time at the newest sample
+    double drift_ppm = 0.0;        // adapter clock rate against the page clock (+: the adapter runs fast)
+    double jitter_us = 0.0;        // spread (rms) of the accepted samples around the fit
+    double worst_us = 0.0;         // largest deviation of an accepted sample
+    double rtt_min_ms = 0.0;       // shortest and latest round trip of a timestamp request
+    double rtt_last_ms = 0.0;
+};
+
 // Transport counters of one adapter: worker stats (once per second) plus the frame count from the snapshots
 struct UsbDeviceStats {
+    ClockSyncStats sync;
     uint32_t rx_per_sec = 0;       // USB transfers completed per second
     uint32_t rx_errors = 0;        // failed or partial receive transfers, cumulative
     uint32_t tx_errors = 0;        // failed transmit transfers, cumulative
@@ -73,6 +88,7 @@ public:
     using SnapshotCallback = std::function<void(const SnapshotView&)>;
     using ControlInCallback = std::function<void(int dev, uint8_t request, const uint8_t* data, int length)>;
     using ControlOutDoneCallback = std::function<void(int dev, int request, bool ok)>;
+    using EventsCallback = std::function<void(int dev, const std::string& lines)>;   // Elmue bus load / text / error lines
 
     static WebUsbBridge& GetInstance();
 
@@ -94,14 +110,18 @@ public:
 
     // The worker keeps the IN transfers of a connected adapter pending for the whole connection.
     // Start/Stop only gate processing of received frames; endpoint 0 / size 0 keep the detected values.
-    void StartRxPump(int dev, int endpoint, int max_packet_size);
+    // flags (gs_usb): kRxElmue = the channel runs in Elmue mode, kRxTimestamps = it was started with adapter timestamps
+    // (the worker then keeps reading the adapter clock to synchronise it)
+    static constexpr int kRxElmue = 1, kRxTimestamps = 2;
+    void StartRxPump(int dev, int endpoint, int max_packet_size, int flags = 0);
     void StopRxPump(int dev);
 
     // endpoint 0 = the bulk OUT endpoint detected from the descriptor
     void TransferOut(int dev, int endpoint, const uint8_t* data, int length);
 
-    // Send a Control OUT transfer (Host -> Device on EP0)
-    void ControlTransferOut(int dev, uint8_t request, uint16_t value, uint16_t index, const uint8_t* data, int length);
+    // Send a Control OUT transfer (Host -> Device on EP0). The acknowledgement carries `request`, or `id` if one is given
+    // (>= 0): a start sequence that sends the same request several times tells the acknowledgements apart this way.
+    void ControlTransferOut(int dev, uint8_t request, uint16_t value, uint16_t index, const uint8_t* data, int length, int id = -1);
 
     // Send a Control IN transfer (Device -> Host on EP0)
     void ControlTransferIn(int dev, uint8_t request, uint16_t value, uint16_t index, uint16_t length);
@@ -125,6 +145,7 @@ public:
     void SetOnSnapshot(SnapshotCallback cb) { on_snapshot_ = cb; }
     void SetOnControlIn(ControlInCallback cb) { on_control_in_ = cb; }
     void SetOnControlOutDone(ControlOutDoneCallback cb) { on_control_out_done_ = cb; }
+    void SetOnEvents(EventsCallback cb) { on_events_ = cb; }
 
     const UsbStats& GetStats() const { return stats_; }
     const UsbDeviceStats& GetDeviceStats(int dev) const;
@@ -139,6 +160,8 @@ public:
     void InternalOnControlOutDone(int dev, int request, bool ok);
     void InternalOnStats(int dev, uint32_t rx_per_sec, uint32_t tx_dropped, uint32_t recoveries,
                          uint32_t rx_errors, uint32_t tx_errors);
+    void InternalOnClockSync(int dev, const ClockSyncStats& stats);
+    void InternalOnEvents(int dev, const char* text);
 
 private:
     WebUsbBridge() = default;
@@ -152,6 +175,7 @@ private:
     SnapshotCallback on_snapshot_;
     ControlInCallback on_control_in_;
     ControlOutDoneCallback on_control_out_done_;
+    EventsCallback on_events_;
 
     UsbStats stats_;
     std::array<UsbDeviceStats, kMaxDevices> dev_stats_;

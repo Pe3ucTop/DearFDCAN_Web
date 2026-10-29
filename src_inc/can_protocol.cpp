@@ -12,6 +12,10 @@ void CanProtocolHandler::ParseRx(CanProtocolType type, const uint8_t* buffer, in
         case PROTOCOL_SLCAN:
             CanProtocolSlcan::ParseRxStream(buffer, length, out, state, replies);
             break;
+        case PROTOCOL_GS_USB_ELMUE:
+            // Frames only; the core calls CanProtocolElmue itself to get the tx echoes, timestamps and event lines
+            CanProtocolElmue::ParseRx(buffer, length, false, out);
+            break;
         case PROTOCOL_GS_USB_CANDLELIGHT:
         default:
             CanProtocolGsUsb::ParseRxBuffer(buffer, length, out);
@@ -25,6 +29,8 @@ std::vector<uint8_t> CanProtocolHandler::BuildTx(CanProtocolType type, const Can
             return CanProtocolPcan::BuildTxBuffer(msg, channel);
         case PROTOCOL_SLCAN:
             return CanProtocolSlcan::BuildTxBuffer(msg, channel == SLCAN_DIALECT_LAWICEL ? SLCAN_DIALECT_LAWICEL : SLCAN_DIALECT_CANABLE);
+        case PROTOCOL_GS_USB_ELMUE:
+            return CanProtocolElmue::BuildTxBuffer(msg);
         case PROTOCOL_GS_USB_CANDLELIGHT:
         default:
             return CanProtocolGsUsb::BuildTxBuffer(msg, channel);

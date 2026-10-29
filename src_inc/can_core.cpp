@@ -40,48 +40,175 @@ struct Slot {
     bool dirty = false;
 };
 
-// Maps the free-running 32-bit microsecond adapter clock onto the page timeline.
-// The offset is the lowest (host time - adapter time) seen: host time only ever adds latency, so the
-// minimum is the best estimate of the true offset. It may rise slowly (drift allowance) so that a
-// systematic clock drift cannot pin it forever. Output never goes backwards.
+// Maps the free-running 32-bit microsecond adapter clock onto the page timeline. Two sources feed it:
+//
+//  * the frames themselves: the offset is the lowest (host time - adapter time) seen. Host time only ever adds
+//    latency, so the minimum is the best estimate of the true offset. It may rise slowly (drift allowance) so that a
+//    systematic clock drift cannot pin it forever.
+//  * clock samples (AddSample): the worker asks the adapter for its timestamp (GS_USB_BREQ_TIMESTAMP) about once a
+//    second and measures the round trip. The adapter latched its clock somewhere inside the round trip, so the
+//    middle of it is the host time of the sample, uncertain by half the round trip. Samples with a long round trip
+//    are discarded (the shortest ones are the accurate ones), a line through the rest gives the offset and the drift
+//    of the adapter's quartz against the browser clock, and the scatter of the samples around it is the spread of
+//    the synchronisation.
+//
+// Once three good samples exist the line is used for the frame times (never later than the moment the frame was
+// handled); until then, and for adapters without samples, the frame minimum is. Output never goes backwards.
 struct ClockSync {
-    bool init = false;
+    static constexpr int    kRing = 64;                 // samples kept (about a minute at one per second)
+    static constexpr double kRttSlack = 1.5;            // a sample is good if its round trip is below min * this + kRttAddMs
+    static constexpr double kRttAddMs = 0.3;
+    static constexpr double kMinFitSpanMs = 4000.0;     // the drift is only fitted over at least this long a time
+    static constexpr double kMaxDrift = 5e-4;           // 500 ppm: beyond that the fit is noise, not a quartz
+    static constexpr int32_t kBackJitterUs = 1000000;   // timestamps this much older than the newest one are jitter, not a restart
+
+    struct Sample { double x_ms, off_ms, rtt_ms; };
+
+    bool init = false;            // `unwrapped_us` holds a valid reference
+    bool frame_init = false;      // the frame minimum has its first observation
     uint32_t last_hw_us = 0;
-    uint64_t unwrapped_us = 0;
+    uint64_t unwrapped_us = 0;    // the newest timestamp seen (frame or sample), extended to 64 bit
     double offset_ms = 0.0;
     double last_host_ms = 0.0;
     double last_out_ms = 0.0;
 
+    Sample ring[kRing] = {};
+    int ring_n = 0, ring_head = 0;
+    bool fit_valid = false;
+    double fit_a = 0.0, fit_b = 0.0;                    // offset(x) = a + b * x, x = adapter time in ms
+    double st_total = 0.0, st_accepted = 0.0, st_jitter_us = 0.0, st_max_resid_us = 0.0;
+    double st_rtt_min = 0.0, st_rtt_last = 0.0, st_offset_ms = 0.0, st_drift_ppm = 0.0;
+
     void Reset() { *this = ClockSync(); }
 
-    double Map(uint32_t hw_us, double host_ms) {
+    // Extends a 32-bit timestamp to milliseconds relative to the first one. False: the clock went back by more than
+    // the jitter allowance, i.e. the adapter restarted.
+    bool Unwrap(uint32_t hw_us, double& hw_ms) {
         if (!init) {
             init = true;
             last_hw_us = hw_us;
             unwrapped_us = hw_us;
-            offset_ms = host_ms - static_cast<double>(unwrapped_us) / 1000.0;
-            last_host_ms = host_ms;
-            last_out_ms = host_ms;
-            return host_ms;
+            hw_ms = static_cast<double>(unwrapped_us) / 1000.0;
+            return true;
         }
-        const uint32_t step = hw_us - last_hw_us; // wrap-safe
-        if (step >= 0x80000000U) {                // clock went backwards: adapter restarted
+        const int32_t d = static_cast<int32_t>(hw_us - last_hw_us);     // wrap-safe
+        if (d >= 0) {
+            last_hw_us = hw_us;
+            unwrapped_us += static_cast<uint32_t>(d);
+            hw_ms = static_cast<double>(unwrapped_us) / 1000.0;
+            return true;
+        }
+        if (d > -kBackJitterUs) {                                       // a frame older than the newest sample
+            hw_ms = (static_cast<double>(unwrapped_us) + static_cast<double>(d)) / 1000.0;
+            return true;
+        }
+        return false;
+    }
+
+    double Map(uint32_t hw_us, double host_ms) {
+        double hw_ms;
+        if (!Unwrap(hw_us, hw_ms)) {            // clock went backwards: adapter restarted
             Reset();
             return Map(hw_us, host_ms);
         }
-        last_hw_us = hw_us;
-        unwrapped_us += step;
-        const double hw_ms = static_cast<double>(unwrapped_us) / 1000.0;
-        if (host_ms > last_host_ms) {
-            offset_ms += kDriftAllowance * (host_ms - last_host_ms);
+        if (!frame_init) {
+            frame_init = true;
+            offset_ms = host_ms - hw_ms;
             last_host_ms = host_ms;
+            last_out_ms = host_ms;
+            if (!fit_valid) return host_ms;
+            last_out_ms = 0.0;
+        } else {
+            if (host_ms > last_host_ms) {
+                offset_ms += kDriftAllowance * (host_ms - last_host_ms);
+                last_host_ms = host_ms;
+            }
+            const double observed = host_ms - hw_ms;
+            if (observed < offset_ms) offset_ms = observed;
         }
-        const double observed = host_ms - hw_ms;
-        if (observed < offset_ms) offset_ms = observed;
-        double t = hw_ms + offset_ms;
+        double t;
+        if (fit_valid) {
+            t = hw_ms + fit_a + fit_b * hw_ms;
+            if (t > host_ms) t = host_ms;       // a frame cannot be handled before it happened
+        } else {
+            t = hw_ms + offset_ms;
+        }
         if (t < last_out_ms) t = last_out_ms;
         last_out_ms = t;
         return t;
+    }
+
+    // One answer of GS_USB_BREQ_TIMESTAMP: the adapter clock, the page time in the middle of the request and its round trip
+    void AddSample(uint32_t hw_us, double host_mid_ms, double rtt_ms) {
+        double x;
+        if (!Unwrap(hw_us, x)) {
+            Reset();
+            Unwrap(hw_us, x);
+        }
+        if (rtt_ms < 0.0) rtt_ms = 0.0;
+        st_total += 1.0;
+        st_rtt_last = rtt_ms;
+        ring[ring_head] = Sample{x, host_mid_ms - x, rtt_ms};
+        ring_head = (ring_head + 1) % kRing;
+        if (ring_n < kRing) ++ring_n;
+        Refit();
+    }
+
+    void Refit() {
+        double rtt_min = ring[0].rtt_ms;
+        for (int i = 1; i < ring_n; ++i) rtt_min = std::min(rtt_min, ring[i].rtt_ms);
+        st_rtt_min = rtt_min;
+        // Good samples: those close to the shortest round trip, but at least the faster 40 % (a noisy host has no tight
+        // cluster) and never more than a few times the shortest
+        double sorted[kRing];
+        for (int i = 0; i < ring_n; ++i) sorted[i] = ring[i].rtt_ms;
+        const int k = (ring_n * 2) / 5;
+        std::nth_element(sorted, sorted + k, sorted + ring_n);
+        const double limit = std::max(rtt_min * kRttSlack + kRttAddMs, std::min(sorted[k], rtt_min * 4.0 + 1.0));
+
+        int m = 0;
+        double sx = 0.0, so = 0.0, xmin = 0.0, xmax = 0.0;
+        for (int i = 0; i < ring_n; ++i) {
+            const Sample& s = ring[i];
+            if (s.rtt_ms > limit) continue;
+            if (m == 0 || s.x_ms < xmin) xmin = s.x_ms;
+            if (m == 0 || s.x_ms > xmax) xmax = s.x_ms;
+            sx += s.x_ms;
+            so += s.off_ms;
+            ++m;
+        }
+        st_accepted = m;
+        fit_valid = false;
+        if (m == 0) return;
+
+        const double mx = sx / m, mo = so / m;
+        double b = 0.0;
+        if (m >= 4 && xmax - xmin >= kMinFitSpanMs) {
+            double sxx = 0.0, sxy = 0.0;
+            for (int i = 0; i < ring_n; ++i) {
+                const Sample& s = ring[i];
+                if (s.rtt_ms > limit) continue;
+                sxx += (s.x_ms - mx) * (s.x_ms - mx);
+                sxy += (s.x_ms - mx) * (s.off_ms - mo);
+            }
+            if (sxx > 0.0) b = std::max(-kMaxDrift, std::min(kMaxDrift, sxy / sxx));
+        }
+        fit_a = mo - b * mx;
+        fit_b = b;
+
+        double ss = 0.0, worst = 0.0;
+        for (int i = 0; i < ring_n; ++i) {
+            const Sample& s = ring[i];
+            if (s.rtt_ms > limit) continue;
+            const double r = s.off_ms - (fit_a + fit_b * s.x_ms);
+            ss += r * r;
+            worst = std::max(worst, std::abs(r));
+        }
+        st_jitter_us = m >= 2 ? std::sqrt(ss / m) * 1000.0 : 0.0;
+        st_max_resid_us = worst * 1000.0;
+        st_drift_ppm = -fit_b * 1e6;        // the offset (page - adapter) falls while the adapter clock runs fast
+        st_offset_ms = fit_a + fit_b * xmax;
+        fit_valid = m >= 3;
     }
 };
 
@@ -96,6 +223,13 @@ uint32_t g_dev_frames[kMaxDevices] = {};
 
 // SLCAN adapters (serial): no hardware timestamps; the lines that are not frames are command replies
 std::string g_replies[kMaxDevices];             // reply tokens not yet fetched by the worker
+
+// gs_usb adapters in Elmue mode: tx echoes carry only a marker, so the transmitted frames are remembered by marker
+// (the worker stages every transmit message); bus load, text and error messages leave as event lines
+bool g_elmue_ts[kMaxDevices] = {};              // the channel runs with GS_DevFlagTimestamp (4 extra bytes per message)
+CanMessage g_echo[kMaxDevices][256];
+std::string g_events[kMaxDevices];
+double g_sync_out[8] = {};
 bool g_rx_gate[kMaxDevices];                    // false: frames of the adapter are parsed but dropped
 double g_prev_chunk_ms[kMaxDevices] = {};       // arrival time of the previous chunk of the adapter
 constexpr size_t   kRepliesMax = 4096;
@@ -131,7 +265,8 @@ void OnFrame(CanMessage& m, double host_ms) {
         g_trace.push_back(te);
     }
 
-    const uint64_t key = MakeCanIdKey(m.dev, m.id, m.is_extended);
+    // Error reports get rows of their own: a 29 bit identifier never has bit 31 set
+    const uint64_t key = m.is_error ? MakeCanIdKey(m.dev, m.id | 0x80000000U, true) : MakeCanIdKey(m.dev, m.id, m.is_extended);
     auto it = g_table.find(key);
     if (it == g_table.end()) {
         if (g_table.size() >= kMaxIds) {
@@ -202,11 +337,24 @@ EMSCRIPTEN_KEEPALIVE void core_process(int used) {
         off += static_cast<int>(kStageRecHeader);
         if (off + len > used) break;
 
-        if (dev < kMaxDevices) {
+        const uint8_t ep = g_stage[off - kStageRecHeader + 3];
+        if (dev < kMaxDevices && !(ep & 0x80)) {
+            // A message the host sent. Only the Elmue protocol needs it: the frame waits here for its echo
+            if (g_protocol[dev] == PROTOCOL_GS_USB_ELMUE) {
+                CanMessage sent;
+                uint8_t marker = 0;
+                if (CanProtocolElmue::ParseTxFrame(g_stage + off, len, sent, marker) && marker != 0) g_echo[dev][marker] = sent;
+            }
+        } else if (dev < kMaxDevices) {
             g_parsed.clear();
             const bool serial = g_protocol[dev] == PROTOCOL_SLCAN;
-            CanProtocolHandler::ParseRx(g_protocol[dev], g_stage + off, len, g_parsed, g_stream[dev],
-                                        serial ? &g_replies[dev] : nullptr);
+            if (g_protocol[dev] == PROTOCOL_GS_USB_ELMUE) {
+                CanProtocolElmue::ParseRx(g_stage + off, len, g_elmue_ts[dev], g_parsed, &g_events[dev], g_echo[dev]);
+                if (g_events[dev].size() > kRepliesMax) g_events[dev].erase(0, g_events[dev].size() - kRepliesMax);
+            } else {
+                CanProtocolHandler::ParseRx(g_protocol[dev], g_stage + off, len, g_parsed, g_stream[dev],
+                                            serial ? &g_replies[dev] : nullptr);
+            }
             if (g_replies[dev].size() > kRepliesMax) g_replies[dev].erase(0, g_replies[dev].size() - kRepliesMax);
 
             // A serial chunk holds frames that arrived since the previous chunk, not all at once: spread
@@ -312,12 +460,59 @@ EMSCRIPTEN_KEEPALIVE void core_reset_clock(int dev) {
 // a fresh receive stream.
 EMSCRIPTEN_KEEPALIVE void core_set_protocol(int dev, int protocol) {
     if (dev < 0 || dev >= kMaxDevices) return;
-    g_protocol[dev] = (protocol == PROTOCOL_PEAK_PCAN_FD || protocol == PROTOCOL_SLCAN)
+    g_protocol[dev] = (protocol == PROTOCOL_PEAK_PCAN_FD || protocol == PROTOCOL_SLCAN || protocol == PROTOCOL_GS_USB_ELMUE)
                           ? static_cast<CanProtocolType>(protocol) : PROTOCOL_GS_USB_CANDLELIGHT;
     g_stream[dev].Reset();
     g_replies[dev].clear();
     g_prev_chunk_ms[dev] = 0.0;
     g_rx_gate[dev] = true;
+    g_elmue_ts[dev] = false;
+    g_events[dev].clear();
+    for (CanMessage& e : g_echo[dev]) e = CanMessage();
+}
+
+// A gs_usb adapter that runs in Elmue mode (call before the channel is started, instead of core_set_protocol):
+// `with_timestamp` tells whether the channel was started with GS_DevFlagTimestamp
+EMSCRIPTEN_KEEPALIVE void core_set_elmue(int dev, int with_timestamp) {
+    if (dev < 0 || dev >= kMaxDevices) return;
+    core_set_protocol(dev, PROTOCOL_GS_USB_ELMUE);
+    g_elmue_ts[dev] = with_timestamp != 0;
+}
+
+// One answer of GS_USB_BREQ_TIMESTAMP: the adapter clock (µs), the page time in the middle of the request
+// and the round trip of the request (both ms, on the page timeline)
+EMSCRIPTEN_KEEPALIVE void core_clock_sample(int dev, uint32_t hw_us, double host_mid_ms, double rtt_ms) {
+    if (dev >= 0 && dev < kMaxDevices) g_clock[dev].AddSample(hw_us, host_mid_ms, rtt_ms);
+}
+
+// Statistics of the clock samples of an adapter as 8 doubles (valid until the next call):
+// [0] samples, [1] good samples, [2] offset (adapter -> page) ms, [3] drift ppm (+: the adapter clock runs fast), [4] spread (rms) µs,
+// [5] shortest round trip ms, [6] last round trip ms, [7] largest deviation µs
+EMSCRIPTEN_KEEPALIVE double* core_clock_stats(int dev) {
+    std::memset(g_sync_out, 0, sizeof(g_sync_out));
+    if (dev >= 0 && dev < kMaxDevices) {
+        const ClockSync& c = g_clock[dev];
+        g_sync_out[0] = c.st_total;
+        g_sync_out[1] = c.st_accepted;
+        g_sync_out[2] = c.st_offset_ms;
+        g_sync_out[3] = c.st_drift_ppm;
+        g_sync_out[4] = c.st_jitter_us;
+        g_sync_out[5] = c.st_rtt_min;
+        g_sync_out[6] = c.st_rtt_last;
+        g_sync_out[7] = c.st_max_resid_us;
+    }
+    return g_sync_out;
+}
+
+// Moves the pending event lines of an Elmue adapter ("U<percent>", "T<text>", "E<id>:<data>") into the reply buffer
+// and returns their length; the bytes are at core_reply_ptr() until the next call.
+EMSCRIPTEN_KEEPALIVE int core_take_events(int dev) {
+    if (dev < 0 || dev >= kMaxDevices) return 0;
+    std::string& r = g_events[dev];
+    g_reply_out_len = r.size() < kRepliesMax ? r.size() : kRepliesMax;
+    if (g_reply_out_len) std::memcpy(g_reply_out, r.data(), g_reply_out_len);
+    r.clear();
+    return static_cast<int>(g_reply_out_len);
 }
 
 // SLCAN adapters: frames are dropped while the gate is closed (the replies of commands still come through, the

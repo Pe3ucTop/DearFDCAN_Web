@@ -2,12 +2,14 @@
 // Umbrella header of the CAN protocol layer. The definitions live in
 //   can_protocol_common.h   protocol independent types (CanMessage, CanPayload, CanBittiming, ...) and helpers
 //   can_protocol_gsusb.h    gs_usb (candleLight / CANable) structures, frame parsing and building
+//   can_protocol_elmue.h    the ElmueSoft CANable 2.5 extension of gs_usb (compact messages, blobs, errors, filters)
 //   can_protocol_pcan.h     PEAK PCAN-USB FD (uCAN) structures, frame parsing/building and command sequences
 //   can_protocol_slcan.h    SLCAN (Lawicel / CANable) line protocol of serial adapters
 // and CanProtocolHandler below is the entry point the rest of the program uses for everything that
 // depends on the protocol of an adapter, so that the callers do not depend on which backend does the work.
 #include "can_protocol_common.h"
 #include "can_protocol_gsusb.h"
+#include "can_protocol_elmue.h"
 #include "can_protocol_pcan.h"
 #include "can_protocol_slcan.h"
 

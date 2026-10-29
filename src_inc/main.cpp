@@ -167,6 +167,10 @@ int main(int, char**) {
         g_AppUI.OnControlOutDone(dev, request, ok);
     });
 
+    webusb.SetOnEvents([](int dev, const std::string& lines) {
+        g_AppUI.OnAdapterEvents(dev, lines);
+    });
+
     webusb.SetOnSnapshot([](const SnapshotView& snapshot) {
         g_AppUI.OnSnapshot(snapshot);
     });
