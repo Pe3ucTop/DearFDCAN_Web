@@ -154,6 +154,20 @@ sync burst and stop, switch back to legacy), the UI sequences headless with real
 feedback rejection, failed required / optional transfers, legacy start byte for byte as before, TX bytes, events, rendering) and both build modes
 without warnings. **Not verified: any real CANable 2.5 or other Elmue adapter.**
 
+**2026-10-29, PEAK error, status, bus load and calibration records.** The PEAK parser skipped every record that is not a CAN frame (the start
+sequence even switched the bus load report off). Now it decodes `ERROR` (type, direction, error counters), `STATUS` (passive / warning / bus off /
+recovered), `BUSLOAD` (4096 = 100 %), `CALIBRATION` and `OVERRUN` (layouts from `pcanfd_core_user.h`, `pcanfd_usb_fw.h`). Errors and status changes
+become frames in the Elmue error layout (`is_error`), so the trace and the device pane decode them with the same code, and leave as event lines
+(`U` load, `E` error, `S` state, `T` text); the start sequence enables the error and bus load options and the calibration records
+(`PCAN_USB_OPTION_CALIBRATION` through the USB option mask, as PEAK's driver does), the stop sequence clears them. The calibration records are the
+only clock information PEAK sends (there is no timestamp request): the core pairs each with the arrival time of its transfer and fits a line to the
+samples whose delay is lowest after taking out the drift, giving drift and spread. They are **not** used to place frames: PEAK's driver says their
+clock does not always share a base with the event timestamps, and the two use separate 64 bit extensions here, so a different base cannot reset the
+frame mapping. The frame mapping (lowest latency) follows the measured drift instead of the fixed 100 ppm allowance once it is known. Verified without
+hardware: record decoding, split records, a fuzzer (ASan/UBSan), start / stop option bytes, a simulated clock 60 ppm slow with delayed records and a
+32 bit wrap (estimated 62 ppm, spread 0.09 ms), the worker with a mock PEAK `USBDevice` (events, sync messages, no timestamp request) and the UI.
+**Not verified: any real PEAK adapter** (the error / status / bus load record layouts and the option bits come from PEAK's driver sources only).
+
 ## Verified overall
 
 The CAN core, frame parser and URL parsing were unit-tested natively (ASan/UBSan) and the worker was exercised against mock devices with the

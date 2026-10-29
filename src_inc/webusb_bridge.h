@@ -42,6 +42,7 @@ struct DeviceOpenInfo {
 // about once a second and the core fits a line through the samples with the shortest round trips)
 struct ClockSyncStats {
     bool valid = false;            // at least one sample arrived since the channel was started
+    bool pushed = false;           // the samples are records the adapter sends (PEAK): rtt_* is then the delay above the lowest, not a round trip
     uint32_t samples = 0;          // timestamp requests answered
     uint32_t accepted = 0;         // of the last 64, those with a short round trip (the ones the fit uses)
     double offset_ms = 0.0;        // adapter time -> page time at the newest sample

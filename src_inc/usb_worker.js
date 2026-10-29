@@ -281,6 +281,7 @@ class Device {
         this.syncTimer = 0;
         this.syncFails = 0;
         this.syncCount = 0;
+        this.syncTotal = 0;
 
         this.st = { rx: 0, rxPrev: 0, rxErrors: 0, txDropped: 0, txErrors: 0, recoveries: 0 };
     }
@@ -358,7 +359,19 @@ class Device {
     // Statistics of the clock samples for the page: [samples, good, offset ms, drift ppm, spread µs, min rtt ms, last rtt ms, worst µs]
     postSync() {
         const ptr = core._core_clock_stats(this.dev);
-        this.post('sync', { s: Array.from(new Float64Array(core.HEAPU8.buffer, ptr, 8)) });
+        const s = Array.from(new Float64Array(core.HEAPU8.buffer, ptr, 9));
+        this.syncTotal = s[0];
+        this.post('sync', { s: s });
+    }
+
+    // What the core collected from the stream besides frames: event lines (Elmue, PEAK) and, for PEAK, the statistics of the
+    // calibration records the adapter pushes (reported when a new one arrived)
+    drainAux() {
+        if (this.elmue || this.protocol === PROTO_PCAN) this.drainEvents();
+        if (this.protocol === PROTO_PCAN && this.rxEnabled) {
+            const ptr = core._core_clock_stats(this.dev);
+            if (new Float64Array(core.HEAPU8.buffer, ptr, 1)[0] !== this.syncTotal) this.postSync();
+        }
     }
 
     // Event lines of the Elmue protocol ("U<percent>", "T<text>", "E<id>:<data>"): bus load, firmware text, error reports
@@ -628,6 +641,7 @@ class Device {
         }
         if (!this.rxEnabled && core) {
             core._core_reset_clock(this.dev);       // new channel start: adapter clock may restart
+            this.syncTotal = 0;
             if (this.protocol === PROTO_GS) {
                 // gs_usb: the page says whether the channel runs in Elmue mode (compact messages) and with timestamps
                 this.elmue = !!m.elmue;
@@ -989,7 +1003,7 @@ function processStage() {
         // serial adapters: the lines that were not frames are answers to commands
         for (const d of devices) {
             if (d instanceof SerialDevice) { if (d.isOpen) d.drainReplies(); }
-            else if (d && d.elmue && d.usb) d.drainEvents();
+            else if (d && d.usb && (d.elmue || d.protocol === PROTO_PCAN)) d.drainAux();
         }
     }
 }

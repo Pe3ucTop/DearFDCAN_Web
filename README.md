@@ -16,6 +16,8 @@ available in Firefox/Safari) and talks to the adapter directly, no driver or nat
   messages instead of 80 byte frames, several frames per USB transfer ("blobs"), tx echoes by marker, error reports (bus state, error counters,
   decoded error flags, shown in the trace and in the device pane), bus load in percent, text messages of the firmware, board information,
   the real bit-timing limits of the data phase, the 120 Ω termination switch and up to eight hardware ID filters in the adapter.
+- **PEAK PCAN-USB FD reports**: error and status records (bus state, error counters, error type, shown like the Elmue reports), bus load, and
+  the adapter's calibration records (its clock, sent about once a second), from which the drift and the spread of the adapter's clock are shown.
 - **Clock synchronisation** of gs_usb adapters with hardware timestamps: once a second the adapter's clock is read (`GS_USB_BREQ_TIMESTAMP`),
   the round trip of each request brackets the moment it was latched, and a line fitted through the samples with the shortest round trips gives
   the offset and the drift of the adapter's quartz against the browser clock. The Devices window shows the drift in ppm and the **spread** of the
@@ -192,8 +194,11 @@ Tunables: `RX_SLOTS`, `TX_INFLIGHT`, `PUBLISH_MS`, `BATCH_CREDITS` at the top of
   "not yet in use", so after replugging them their device numbers may be swapped.
 - Only CAN channel 0 of an adapter is used; multi-channel adapters (gs_usb with several channels, PCAN-USB X6 / Pro FD with two ports) show their
   channel count but are driven as one channel.
-- PEAK specifics: the protocol is picked from the USB ids only (no manual override); every transmitted frame requests a TX echo, calibration,
-  status and error records are ignored, there is no hardware loopback switch and the CAN clock is fixed at 80 MHz.
+- PEAK specifics: the protocol is picked from the USB ids only (no manual override); every transmitted frame requests a TX echo, there is no
+  hardware loopback switch and the CAN clock is fixed at 80 MHz. The calibration records are used for the drift / spread statistics only: PEAK's
+  own driver notes that their clock is not guaranteed to share a base with the frame timestamps (the PCAN-USB X6 for one), so the frame times keep
+  using the lowest-latency estimate, now following the measured drift instead of a fixed allowance. Cache-critical records and the remaining
+  fields of the error codes are not decoded; error type "counter decremented" updates the counters only.
 - SLCAN specifics: the protocol cannot be detected from the serial port, so every port added with **Add Serial Port** is SLCAN (dialect detected or
   chosen); a serial port without USB ids is told apart from another one only by its position in the browser's list of permitted ports. There are no
   hardware timestamps (arrival times of the serial chunks, spread inside a chunk) and no TX echo (frames you send do not show up in the trace); a

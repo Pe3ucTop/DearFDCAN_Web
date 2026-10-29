@@ -184,7 +184,7 @@ EM_JS(void, js_webusb_init, (), {
             _webusb_cb_stats(m.dev, m.rxPerSec, m.txDropped, m.recoveries, m.rxErrors, m.txErrors);
             break;
         case 'sync':
-            _webusb_cb_sync(m.dev, m.s[0], m.s[1], m.s[2], m.s[3], m.s[4], m.s[5], m.s[6], m.s[7]);
+            _webusb_cb_sync(m.dev, m.s[0], m.s[1], m.s[2], m.s[3], m.s[4], m.s[5], m.s[6], m.s[7], m.s[8]);
             break;
         case 'events': {
             const text = usb.cstr(m.text);
@@ -407,9 +407,10 @@ extern "C" {
     }
 
     EMSCRIPTEN_KEEPALIVE void webusb_cb_sync(int dev, double samples, double accepted, double offset_ms, double drift_ppm,
-                                             double jitter_us, double rtt_min_ms, double rtt_last_ms, double worst_us) {
+                                             double jitter_us, double rtt_min_ms, double rtt_last_ms, double worst_us, double pushed) {
         ClockSyncStats s;
         s.valid = true;
+        s.pushed = pushed != 0.0;
         s.samples = static_cast<uint32_t>(samples);
         s.accepted = static_cast<uint32_t>(accepted);
         s.offset_ms = offset_ms;

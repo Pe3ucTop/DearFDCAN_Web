@@ -5,6 +5,7 @@
 //
 // Layouts and values follow PEAK's Linux driver (pcanfd_core_user.h, pcanfd_usb_fw.h, pcanfd_usb.c).
 #include "can_protocol_common.h"
+#include <string>
 
 // USB ids
 constexpr uint16_t PEAK_USB_VENDOR_ID       = 0x0C72;
@@ -229,13 +230,36 @@ static_assert(sizeof(PcanFwInfo) == 84, "firmware info is 84 bytes");
 inline const CanBitTimingLimits& PcanNominalLimits() { static const CanBitTimingLimits l = {256, 128, 128, 1024}; return l; }
 inline const CanBitTimingLimits& PcanDataLimits()    { static const CanBitTimingLimits l = {32, 16, 16, 1024}; return l; }
 
+// Non-frame records of the stream (layouts from pcanfd_core_user.h / pcanfd_usb_fw.h). All start with size, type, ts_low, ts_high.
+//   error      0x0002: u8 channel | (type << 4) | D<<7, u8 code | G<<7, u8 tx error counter, u8 rx error counter
+//   status     0x0003: u8 channel | RB 0x10 | passive 0x20 | warning 0x40 | bus off 0x80
+//   bus load   0x0004: u8 channel, u8 unused, u16 load (4096 = 100 %)
+//   calibration 0x0100: u16 USB frame index, u16 unused (sent about once a second when PCAN_USB_OPTION_CALIBRATION is on)
+//   overrun    0x0101: u8 channel
+constexpr uint8_t PCAN_ERR_BIT = 0, PCAN_ERR_FORM = 1, PCAN_ERR_STUFF = 2, PCAN_ERR_OTHER = 3, PCAN_ERR_COUNTER_DEC = 4;
+constexpr uint8_t PCAN_ST_RB = 0x10, PCAN_ST_PASSIVE = 0x20, PCAN_ST_WARNING = 0x40, PCAN_ST_BUSOFF = 0x80;
+constexpr size_t PCAN_REC_ERROR_SIZE = 16, PCAN_REC_STATUS_SIZE = 16, PCAN_REC_BUSLOAD_SIZE = 16, PCAN_REC_CALIBRATION_SIZE = 16;
+
+// What the parser reports besides the CAN frames
+struct PcanExtras {
+    // Event lines for the page, the format of the Elmue protocol plus one more:
+    //   "U<percent>\n"  bus load,  "E<id 8 hex>:<data 16 hex>\n"  error report (see CanProtocolElmue::DecodeError),
+    //   "S<0..3>\n"  bus state (0 active, 1 warning, 2 passive, 3 bus off),  "T<text>\n"  text
+    std::string* events = nullptr;
+    // ts_low of every calibration record: the adapter clock sampled when the record was sent. The caller pairs it with the
+    // arrival time of the transfer (the adapter pushes it, there is no request to time).
+    std::vector<uint32_t>* calibrations = nullptr;
+};
+
 class CanProtocolPcan {
 public:
     // Parses a bulk IN transfer of the data endpoint. Records split across two transfers are reassembled
     // through `state` (keep one per adapter and call Reset() when the stream restarts). Only the CAN frames
-    // of `channel` are returned: other channels and non-frame records (status, error, calibration) are skipped.
+    // of `channel` are returned: other channels and non-frame records are skipped, unless `extras` is given: then
+    // error and status records of the channel are also returned as frames (`is_error`, in the Elmue layout) and
+    // all of them, bus load and calibration records go to `extras`.
     static void ParseRxStream(const uint8_t* buffer, int length, std::vector<CanMessage>& out,
-                              CanRxStreamState& state, uint8_t channel = 0);
+                              CanRxStreamState& state, uint8_t channel = 0, PcanExtras* extras = nullptr);
 
     // Builds the bulk OUT transfer for one frame on a channel (the record plus a terminating empty record).
     // The frame is sent with a request to echo it back (flag API_SRR) tagged with an incrementing 8-bit

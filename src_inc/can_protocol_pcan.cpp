@@ -1,4 +1,5 @@
 #include "can_protocol_pcan.h"
+#include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <utility>
@@ -103,19 +104,112 @@ void DecodeCanRx(const uint8_t* rec, int size, std::vector<CanMessage>& out, uin
     out.push_back(msg);
 }
 
-void HandleRecord(const uint8_t* rec, int size, std::vector<CanMessage>& out, uint8_t channel) {
+uint32_t Le32At(const uint8_t* p) {
+    uint32_t v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+void AddEvent(PcanExtras* extras, const std::string& line) {
+    if (extras && extras->events && extras->events->size() < 4096) *extras->events += line;
+}
+
+// An error or status record as a frame in the layout of the Elmue error report, so that the trace and the device pane decode both alike
+// (err_id: eErrFlagsCanID, data[1]: controller state flags, data[2]: protocol violation, data[6]/[7]: error counters)
+void PushErrorFrame(PcanExtras* extras, std::vector<CanMessage>& out, uint32_t err_id, const uint8_t d[8], uint32_t ts_low) {
+    CanMessage m;
+    m.is_error = true;
+    m.id = err_id & CAN_ID_SFF_MASK;
+    m.dlc = 8;
+    m.payload.assign(d, d + 8);
+    m.hw_timestamp_us = ts_low;
+    m.has_hw_timestamp = true;
+    out.push_back(m);
+
+    char line[48];
+    std::snprintf(line, sizeof(line), "E%08X:", err_id);
+    std::string text = line;
+    for (int i = 0; i < 8; ++i) {
+        std::snprintf(line, sizeof(line), "%02X", d[i]);
+        text += line;
+    }
+    AddEvent(extras, text + "\n");
+}
+
+// Records that are not CAN frames. `size` is at least the header size.
+void HandleInfoRecord(uint16_t type, const uint8_t* rec, int size, std::vector<CanMessage>& out, uint8_t channel, PcanExtras* extras) {
+    const uint32_t ts_low = size >= 8 ? Le32At(rec + 4) : 0;
+    switch (type) {
+        case PCAN_MSG_ERROR: {
+            if (size < static_cast<int>(PCAN_REC_ERROR_SIZE) || (rec[12] & 0x0F) != channel) return;
+            const uint8_t kind = (rec[12] >> 4) & 0x07;
+            uint8_t d[8] = {};
+            d[6] = rec[14];                                  // error counters
+            d[7] = rec[15];
+            if (kind == PCAN_ERR_COUNTER_DEC) {              // only the counters went down: no frame, the counters are in the event
+                char line[48];
+                std::snprintf(line, sizeof(line), "E00000000:000000000000%02X%02X\n", d[6], d[7]);
+                AddEvent(extras, line);
+                return;
+            }
+            if (kind == PCAN_ERR_BIT) d[2] |= 0x01;
+            else if (kind == PCAN_ERR_FORM) d[2] |= 0x02;
+            else if (kind == PCAN_ERR_STUFF) d[2] |= 0x04;
+            if (rec[12] & 0x80) d[2] |= 0x80;                // the error happened while this node was transmitting
+            if (extras) PushErrorFrame(extras, out, 0x0080 /* bus error */, d, ts_low);
+            break;
+        }
+        case PCAN_MSG_STATUS: {
+            if (size < static_cast<int>(PCAN_REC_STATUS_SIZE) || (rec[12] & 0x0F) != channel) return;
+            const uint8_t st = rec[12];
+            uint8_t d[8] = {};
+            uint32_t err_id = 0;
+            int state = 0;
+            if (st & PCAN_ST_BUSOFF)       { err_id = 0x0040; state = 3; }
+            else if (st & PCAN_ST_PASSIVE) { d[1] = 0x30; state = 2; }
+            else if (st & PCAN_ST_WARNING) { d[1] = 0x0C; state = 1; }
+            else                           { d[1] = 0x40; }  // back to error active
+            if (extras) {
+                PushErrorFrame(extras, out, err_id, d, ts_low);
+                AddEvent(extras, "S" + std::to_string(state) + "\n");
+            }
+            break;
+        }
+        case PCAN_MSG_BUSLOAD: {
+            if (size < static_cast<int>(PCAN_REC_BUSLOAD_SIZE) || (rec[12] & 0x0F) != channel) return;
+            uint16_t v = 0;
+            std::memcpy(&v, rec + 14, sizeof(v));
+            AddEvent(extras, "U" + std::to_string(std::min(100u, static_cast<unsigned>(v) * 100u / 4096u)) + "\n");
+            break;
+        }
+        case PCAN_MSG_USB_CALIBRATION:
+            if (size >= static_cast<int>(PCAN_REC_CALIBRATION_SIZE) && extras && extras->calibrations && extras->calibrations->size() < 64) {
+                extras->calibrations->push_back(ts_low);
+            }
+            break;
+        case PCAN_MSG_USB_OVERRUN:
+            AddEvent(extras, "Tthe adapter lost records (receive overrun)\n");
+            break;
+        default:
+            break;
+    }
+}
+
+void HandleRecord(const uint8_t* rec, int size, std::vector<CanMessage>& out, uint8_t channel, PcanExtras* extras) {
     uint16_t type = 0;
     std::memcpy(&type, rec + 2, sizeof(type));
     if (type == PCAN_MSG_CAN_RX && size >= static_cast<int>(offsetof(PcanRxMsg, data))) {
         DecodeCanRx(rec, size, out, channel);
+    } else if (extras) {
+        HandleInfoRecord(type, rec, size, out, channel, extras);
     }
-    // status, error, bus load, calibration, overrun and cache records are not used yet
+    // cache records are not used
 }
 
 } // namespace
 
 void CanProtocolPcan::ParseRxStream(const uint8_t* buffer, int length, std::vector<CanMessage>& out,
-                                    CanRxStreamState& state, uint8_t channel) {
+                                    CanRxStreamState& state, uint8_t channel, PcanExtras* extras) {
     if (!buffer || length <= 0) return;
     const int max_record = static_cast<int>(CanRxStreamState::kMaxRecord);
     int pos = 0;
@@ -137,7 +231,7 @@ void CanProtocolPcan::ParseRxStream(const uint8_t* buffer, int length, std::vect
         state.frag_len = static_cast<uint16_t>(state.frag_len + take);
         pos += take;
         if (state.frag_len == size) {
-            HandleRecord(state.frag, size, out, channel);
+            HandleRecord(state.frag, size, out, channel, extras);
             state.Reset();
         }
     }
@@ -156,7 +250,7 @@ void CanProtocolPcan::ParseRxStream(const uint8_t* buffer, int length, std::vect
             std::memcpy(state.frag, buffer + pos, state.frag_len);
             return;
         }
-        HandleRecord(buffer + pos, size, out, channel);
+        HandleRecord(buffer + pos, size, out, channel, extras);
         pos += size;
     }
     if (pos + 1 == length && length > 0 && state.frag_len == 0) {
@@ -218,11 +312,12 @@ std::vector<std::vector<uint8_t>> CanProtocolPcan::BuildStartCommands(uint8_t ch
     err_cnt.sel_mask = PCAN_WRERRCNT_TE | PCAN_WRERRCNT_RE;
     cmds.Add(err_cnt);
 
-    // 2. options: error reporting on, ISO CAN FD (or CAN 2.0 only frames), bus load and fast-forward off
-    const uint16_t opt_clr = static_cast<uint16_t>(PCAN_OPTION_BUSLOAD | (enable_fd ? PCAN_OPTION_20AB_MODE : 0));
-    const uint16_t opt_set = static_cast<uint16_t>(PCAN_OPTION_ERROR | (enable_fd ? PCAN_OPTION_ISO_MODE : PCAN_OPTION_20AB_MODE));
+    // 2. options: error / status and bus load reports on, ISO CAN FD (or CAN 2.0 only frames), fast-forward off; and the
+    // calibration records (adapter clock, about once a second) the clock synchronisation is built on
+    const uint16_t opt_clr = static_cast<uint16_t>(enable_fd ? PCAN_OPTION_20AB_MODE : 0);
+    const uint16_t opt_set = static_cast<uint16_t>(PCAN_OPTION_ERROR | PCAN_OPTION_BUSLOAD | (enable_fd ? PCAN_OPTION_ISO_MODE : PCAN_OPTION_20AB_MODE));
     cmds.Add(OptionCommand(PCAN_CMD_CLR_DIS_OPTION, channel, opt_clr, PCAN_USB_OPTION_FAST_FWD));
-    cmds.Add(OptionCommand(PCAN_CMD_SET_EN_OPTION, channel, opt_set, 0));
+    cmds.Add(OptionCommand(PCAN_CMD_SET_EN_OPTION, channel, opt_set, PCAN_USB_OPTION_CALIBRATION));
 
     // 3. bit timing
     if (enable_fd) cmds.Add(FastTiming(channel, data));
@@ -248,6 +343,6 @@ std::vector<std::vector<uint8_t>> CanProtocolPcan::BuildStopCommands(uint8_t cha
     CommandTransfers cmds;
     cmds.Add(SimpleCommand(PCAN_CMD_RESET_MODE, channel));
     cmds.Flush();
-    cmds.Add(OptionCommand(PCAN_CMD_CLR_DIS_OPTION, channel, PCAN_OPTION_ERROR | PCAN_OPTION_BUSLOAD, 0));
+    cmds.Add(OptionCommand(PCAN_CMD_CLR_DIS_OPTION, channel, PCAN_OPTION_ERROR | PCAN_OPTION_BUSLOAD, PCAN_USB_OPTION_CALIBRATION));
     return cmds.Take();
 }

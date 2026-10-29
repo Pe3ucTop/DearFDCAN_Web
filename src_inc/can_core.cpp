@@ -75,6 +75,10 @@ struct ClockSync {
     Sample ring[kRing] = {};
     int ring_n = 0, ring_head = 0;
     bool fit_valid = false;
+    bool push_init = false;
+    uint32_t push_last_hw = 0;
+    uint64_t push_unwrapped = 0;
+    bool push_mode = false;       // the samples are records the adapter pushed (PEAK calibration), not answers to a request
     double fit_a = 0.0, fit_b = 0.0;                    // offset(x) = a + b * x, x = adapter time in ms
     double st_total = 0.0, st_accepted = 0.0, st_jitter_us = 0.0, st_max_resid_us = 0.0;
     double st_rtt_min = 0.0, st_rtt_last = 0.0, st_offset_ms = 0.0, st_drift_ppm = 0.0;
@@ -120,14 +124,17 @@ struct ClockSync {
             last_out_ms = 0.0;
         } else {
             if (host_ms > last_host_ms) {
-                offset_ms += kDriftAllowance * (host_ms - last_host_ms);
+                // the minimum may creep up by the assumed drift; with pushed samples the measured drift of the adapter's quartz is used
+                // (it is negative when the adapter runs fast), so the minimum follows the clock in both directions
+                const double rate = (push_mode && fit_valid) ? fit_b : kDriftAllowance;
+                offset_ms += rate * (host_ms - last_host_ms);
                 last_host_ms = host_ms;
             }
             const double observed = host_ms - hw_ms;
             if (observed < offset_ms) offset_ms = observed;
         }
         double t;
-        if (fit_valid) {
+        if (fit_valid && !push_mode) {
             t = hw_ms + fit_a + fit_b * hw_ms;
             if (t > host_ms) t = host_ms;       // a frame cannot be handled before it happened
         } else {
@@ -146,6 +153,7 @@ struct ClockSync {
             Unwrap(hw_us, x);
         }
         if (rtt_ms < 0.0) rtt_ms = 0.0;
+        push_mode = false;
         st_total += 1.0;
         st_rtt_last = rtt_ms;
         ring[ring_head] = Sample{x, host_mid_ms - x, rtt_ms};
@@ -154,7 +162,51 @@ struct ClockSync {
         Refit();
     }
 
+    // A record the adapter pushed (PEAK calibration): its clock value and the arrival time of the transfer that carried it. There is no
+    // round trip; the delay between the adapter's clock reading and the arrival is what varies, and it is only ever positive, so the
+    // samples whose offset is lowest (after taking out the drift) are the accurate ones. Their excess over the lowest plays the part
+    // of the round trip. The result describes the adapter's clock rate and the scatter of the delay; it is not used to place frames,
+    // because the clock of these records is not guaranteed to be the one of the frame timestamps (the frame minimum keeps doing that,
+    // following the measured drift).
+    void AddPushSample(uint32_t hw_us, double host_ms) {
+        // Own 64 bit extension: the base of these timestamps may differ from the frames' (see above), so the two must not share one
+        double x;
+        if (!push_init || static_cast<int32_t>(hw_us - push_last_hw) < 0) {
+            if (push_init && static_cast<int32_t>(hw_us - push_last_hw) > -kBackJitterUs) return;   // a late older record: ignore
+            push_init = true;                                   // first record, or the clock restarted: start over
+            ring_n = ring_head = 0;
+            push_unwrapped = hw_us;
+        } else {
+            push_unwrapped += static_cast<uint32_t>(hw_us - push_last_hw);
+        }
+        push_last_hw = hw_us;
+        x = static_cast<double>(push_unwrapped) / 1000.0;
+        push_mode = true;
+        st_total += 1.0;
+        ring[ring_head] = Sample{x, host_ms - x, 0.0};
+        ring_head = (ring_head + 1) % kRing;
+        if (ring_n < kRing) ++ring_n;
+        Refit();
+    }
+
     void Refit() {
+        if (push_mode) {
+            // slope of the lower envelope (the lowest offset of the older and of the newer half of the samples), then the excess over it
+            auto at = [&](int i) -> Sample& { return ring[(ring_head - ring_n + i + 2 * kRing) % kRing]; };
+            double b0 = 0.0;
+            const int half = ring_n / 2;
+            if (half >= 4) {
+                int lo1 = 0, lo2 = half;
+                for (int i = 0; i < half; ++i) if (at(i).off_ms < at(lo1).off_ms) lo1 = i;
+                for (int i = half; i < ring_n; ++i) if (at(i).off_ms < at(lo2).off_ms) lo2 = i;
+                const double dx = at(lo2).x_ms - at(lo1).x_ms;
+                if (dx >= 8000.0) b0 = std::max(-kMaxDrift, std::min(kMaxDrift, (at(lo2).off_ms - at(lo1).off_ms) / dx));
+            }
+            double lowest = at(0).off_ms - b0 * at(0).x_ms;
+            for (int i = 1; i < ring_n; ++i) lowest = std::min(lowest, at(i).off_ms - b0 * at(i).x_ms);
+            for (int i = 0; i < ring_n; ++i) at(i).rtt_ms = (at(i).off_ms - b0 * at(i).x_ms) - lowest;
+            st_rtt_last = at(ring_n - 1).rtt_ms;
+        }
         double rtt_min = ring[0].rtt_ms;
         for (int i = 1; i < ring_n; ++i) rtt_min = std::min(rtt_min, ring[i].rtt_ms);
         st_rtt_min = rtt_min;
@@ -229,7 +281,8 @@ std::string g_replies[kMaxDevices];             // reply tokens not yet fetched 
 bool g_elmue_ts[kMaxDevices] = {};              // the channel runs with GS_DevFlagTimestamp (4 extra bytes per message)
 CanMessage g_echo[kMaxDevices][256];
 std::string g_events[kMaxDevices];
-double g_sync_out[8] = {};
+double g_sync_out[9] = {};
+std::vector<uint32_t> g_calibrations;           // PEAK calibration records of the transfer being parsed
 bool g_rx_gate[kMaxDevices];                    // false: frames of the adapter are parsed but dropped
 double g_prev_chunk_ms[kMaxDevices] = {};       // arrival time of the previous chunk of the adapter
 constexpr size_t   kRepliesMax = 4096;
@@ -351,6 +404,14 @@ EMSCRIPTEN_KEEPALIVE void core_process(int used) {
             if (g_protocol[dev] == PROTOCOL_GS_USB_ELMUE) {
                 CanProtocolElmue::ParseRx(g_stage + off, len, g_elmue_ts[dev], g_parsed, &g_events[dev], g_echo[dev]);
                 if (g_events[dev].size() > kRepliesMax) g_events[dev].erase(0, g_events[dev].size() - kRepliesMax);
+            } else if (g_protocol[dev] == PROTOCOL_PEAK_PCAN_FD) {
+                g_calibrations.clear();
+                PcanExtras extras;
+                extras.events = &g_events[dev];
+                extras.calibrations = &g_calibrations;
+                CanProtocolPcan::ParseRxStream(g_stage + off, len, g_parsed, g_stream[dev], 0, &extras);
+                if (g_events[dev].size() > kRepliesMax) g_events[dev].erase(0, g_events[dev].size() - kRepliesMax);
+                for (uint32_t ts : g_calibrations) g_clock[dev].AddPushSample(ts, host_ms);
             } else {
                 CanProtocolHandler::ParseRx(g_protocol[dev], g_stage + off, len, g_parsed, g_stream[dev],
                                             serial ? &g_replies[dev] : nullptr);
@@ -485,7 +546,7 @@ EMSCRIPTEN_KEEPALIVE void core_clock_sample(int dev, uint32_t hw_us, double host
     if (dev >= 0 && dev < kMaxDevices) g_clock[dev].AddSample(hw_us, host_mid_ms, rtt_ms);
 }
 
-// Statistics of the clock samples of an adapter as 8 doubles (valid until the next call):
+// Statistics of the clock samples of an adapter as 9 doubles (valid until the next call; [8] = 1 for pushed samples, PEAK):
 // [0] samples, [1] good samples, [2] offset (adapter -> page) ms, [3] drift ppm (+: the adapter clock runs fast), [4] spread (rms) µs,
 // [5] shortest round trip ms, [6] last round trip ms, [7] largest deviation µs
 EMSCRIPTEN_KEEPALIVE double* core_clock_stats(int dev) {
@@ -500,6 +561,7 @@ EMSCRIPTEN_KEEPALIVE double* core_clock_stats(int dev) {
         g_sync_out[5] = c.st_rtt_min;
         g_sync_out[6] = c.st_rtt_last;
         g_sync_out[7] = c.st_max_resid_us;
+        g_sync_out[8] = c.push_mode ? 1.0 : 0.0;
     }
     return g_sync_out;
 }

@@ -509,6 +509,8 @@ void AppUI::OnAdapterEvents(int dev, const std::string& lines) {
         const std::string body = line.substr(1);
         if (line[0] == 'U') {
             d.bus_load = std::clamp(std::atoi(body.c_str()), 0, 100);
+        } else if (line[0] == 'S') {
+            d.bus_state = static_cast<ElmBusState>(std::clamp(std::atoi(body.c_str()), 0, 3));
         } else if (line[0] == 'T') {
             d.adapter_text = body;
         } else if (line[0] == 'E') {
@@ -688,6 +690,7 @@ void AppUI::StartCanChannel(int dev) {
     if (d.protocol == PROTOCOL_PEAK_PCAN_FD) {
         // Command transfers (clock, options, bit timing, acceptance filter, bus on), written in order; the
         // channel is open when the last one is done (see OnControlOutDone)
+        ResetBusReport(d);
         const auto transfers = CanProtocolPcan::BuildStartCommands(0, d.enable_fd, d.enable_listen_only, d.nom_bt, d.data_bt);
         for (size_t i = 0; i < transfers.size(); ++i) {
             usb.CommandOut(dev, kPcanCmdIdStart + static_cast<int>(i), transfers[i].data(), static_cast<int>(transfers[i].size()));
@@ -1345,22 +1348,29 @@ void AppUI::RenderHardwareSetupWindow(float x, float y, float w, float h) {
                 "Board features", d.has_board ? CanProtocolElmue::BoardFlagsText(d.board.board_flags) : std::string());
             row("Protocol mode", d.channel_open || d.channel_opening ? std::string(d.elmue_active ? "Elmue (compact messages, USB blobs)" : "legacy gs_usb")
                                                                       : std::string(d.use_elmue ? "Elmue at the next start" : "legacy at the next start"),
-                "Bus load", d.elmue_active && d.channel_open && d.bus_load >= 0 ? fmt("%d %%", d.bus_load) : std::string());
-            if (d.elmue_active && d.channel_open) {
-                static const char* const kBusStates[] = {"active", "warning", "passive", "BUS OFF"};
-                row("Bus state", std::string(kBusStates[d.bus_state & 3]) + fmt("  (RX errors %u, TX errors %u)", d.bus_rx_errors, d.bus_tx_errors),
-                    "Error reports", d.error_reports ? fmt("%u", d.error_reports) : std::string());
-                if (!d.last_error_text.empty() || !d.adapter_text.empty()) row("Last error", d.last_error_text, "Adapter text", d.adapter_text);
-            }
+                "", "");
+        }
+
+        // What the adapter reports about the bus while the channel runs (Elmue protocol, PEAK): state, error counters, load, last error
+        if (d.connected && d.channel_open && (d.elmue_active || pcan)) {
+            static const char* const kBusStates[] = {"active", "warning", "passive", "BUS OFF"};
+            row("Bus state", std::string(kBusStates[d.bus_state & 3]) + fmt("  (RX errors %u, TX errors %u)", d.bus_rx_errors, d.bus_tx_errors),
+                "Bus load", d.bus_load >= 0 ? fmt("%d %%", d.bus_load) : std::string("(not reported yet)"));
+            row("Error reports", d.error_reports ? fmt("%u", d.error_reports) : std::string(), "Last error", d.last_error_text);
+            if (!d.adapter_text.empty()) row("Adapter text", d.adapter_text, "", "");
         }
 
         // Synchronisation of the adapter's clock with the page's (gs_usb with timestamps): the spread is how far the samples
         // of the last minute scatter around the fitted line, i.e. the accuracy the frame times can have
         if (d.connected && ds.sync.valid) {
             const ClockSyncStats& s = ds.sync;
-            row("Clock sync", fmt("%u requests, %u used", s.samples, s.accepted), "Clock drift", fmt("%+.1f ppm", s.drift_ppm));
+            // PEAK adapters push their clock (calibration records) instead of answering requests: there is no round trip, the
+            // spread shows how steadily the records arrive, and the drift is the adapter's clock rate against the browser's
+            row("Clock sync", fmt(s.pushed ? "%u calibration records, %u used" : "%u requests, %u used", s.samples, s.accepted),
+                "Clock drift", s.accepted >= 4 ? fmt("%+.1f ppm", s.drift_ppm) : std::string("collecting..."));
             row("Sync spread", s.accepted >= 2 ? fmt("%.0f us rms, worst %.0f us", s.jitter_us, s.worst_us) : std::string("collecting..."),
-                "Request time", fmt("%.2f ms shortest, %.2f ms last", s.rtt_min_ms, s.rtt_last_ms));
+                s.pushed ? "Arrival delay" : "Request time",
+                s.pushed ? fmt("%.2f ms above the lowest", s.rtt_last_ms) : fmt("%.2f ms shortest, %.2f ms last", s.rtt_min_ms, s.rtt_last_ms));
         }
 
         ImGui::EndTable();
