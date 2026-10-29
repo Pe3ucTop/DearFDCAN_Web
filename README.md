@@ -206,4 +206,4 @@ See [ChangeLog.md](ChangeLog.md).
 
 ## License
 
-MIT, see `LICENSE`.
+Apache License 2.0, see `LICENSE`.
