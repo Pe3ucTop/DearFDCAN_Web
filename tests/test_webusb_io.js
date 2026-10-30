@@ -290,7 +290,53 @@ async function testWatchdogAndClose() {
     await q.closeDevice();
 }
 
+// A device the owner already holds ({device}), receiving on demand (autoReceive false) and completion callbacks of transmits:
+// what a library for other programs (libs/emscripten-webusb) needs
+async function testDirectAndOnDemand() {
+    const u = mockUsb(); u.configuration = null;
+    let selected = null;
+    u.selectConfiguration = async (v) => { selected = v; u.configuration = mockUsb().configuration; };
+    installUsb([]);                                         // getDevices() would find nothing: the device object is used as it is
+    const p = new TestPort('direct', { autoReceive: false, txInflight: 1 });
+    await p.openDevice({ device: u, configuration: 2 }, handshake);
+    check(p.usb === u && u.opened && selected === 2 && u.claimed === 1, 'a given device is opened, the requested configuration selected and the interface claimed');
+    check(u.rxWaiters.length === 0 && !p.receiving, 'with autoReceive false no transfer is pending after the open');
+
+    p.reconfigureRx(7, 256);
+    await sleep(5);
+    check(u.released === 0 && p.rxEp === 7 && p.rxSize === 256 && u.rxWaiters.length === 0, 'reconfiguring while not receiving only remembers the values');
+    p.beginRx(3, 1024);
+    check(p.receiving && u.rxWaiters.length === 3 && u.rxWaiters[0].ep === 3 && u.rxWaiters[0].len === 1024, 'beginRx starts the receive slots on the endpoint and size given');
+    completeRx(u, [1]);
+    await sleep(2);
+    check(p.data.length === 1, 'data arrives after beginRx');
+    p.stopRx();
+    completeRx(u, [2]);
+    await sleep(2);
+    check(!p.receiving && p.data.length === 1 && u.rxWaiters.length === 2, 'after stopRx what the pending transfers bring is dropped and no slot is re-armed');
+    p.beginRx(0, 0);
+    check(p.receiving && u.rxWaiters.length === 2 + 3, 'beginRx can start again');
+
+    // completion callbacks: after the transfer, with false for a failed one and for one that never ran
+    const done = [];
+    const gate = [];
+    u.outBehavior = (ep, data) => new Promise(res => gate.push(() => res(data.byteLength === 2 ? { status: 'babble' } : { status: 'ok' })));
+    p.enqueueTx(new Uint8Array(1).buffer, 0, ok => done.push('a' + ok));
+    p.enqueueTx(new Uint8Array(2).buffer, 0, ok => done.push('b' + ok));
+    p.enqueueTx(new Uint8Array(3).buffer, 0, ok => done.push('c' + ok));
+    p.enqueueTx(new Uint8Array(4).buffer, 0, ok => done.push('d' + ok));
+    await sleep(2);
+    gate.shift()(); await sleep(2);
+    gate.shift()(); await sleep(2);
+    check(done.join() === 'atrue,bfalse' && u.outs.length === 3, 'a callback per transfer with its result, in order (' + done + ')');
+    await p.closeDevice();
+    check(done.join() === 'atrue,bfalse,dfalse' && u.outs.length === 3, 'a transfer that never ran is reported as failed when the session ends (' + done + ')');
+    gate.shift()(); await sleep(2);
+    check(done.join() === 'atrue,bfalse,dfalse,ctrue', 'the one in flight reports when the browser completes it (' + done + ')');
+}
+
 (async () => {
+    await testDirectAndOnDemand();
     await testMatchingAndOpen();
     await testReceive();
     await testControl();

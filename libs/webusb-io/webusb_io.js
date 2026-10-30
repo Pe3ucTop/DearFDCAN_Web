@@ -39,6 +39,7 @@ const DEFAULTS = {
     pingTimeoutMs: 1500,
     pingFailsMax: 2,            // failed probes in a row that trigger a recovery
     rxErrorsBeforeRecover: 5,   // errors of one receive slot in a row
+    autoReceive: true,          // start the receive transfers when the port is opened; false: the owner calls beginRx() when it wants data
     inUse: null,                // () => array of the USBDevice objects other ports use (device matching skips them)
     tag: 'webusb-io'            // prefix of the log lines
 };
@@ -117,6 +118,7 @@ class UsbPort {
 
         // Receive state. rxGen is the generation token (see the top of the file).
         this.rxGen = 0;
+        this.receiving = false;             // receive transfers are being kept pending
         this.rxEp = this.opt.defaultEpIn;
         this.txEp = this.opt.defaultEpOut;
         this.cmdEp = 0;                     // command endpoint of protocols that have one (PEAK); others configure through control requests
@@ -160,9 +162,10 @@ class UsbPort {
     // Open / close / loss
     // -----------------------------------------------------------------------------------------
 
-    // Finds, opens and claims the permitted device {vid, pid, serial?}, calls `handshake(usb)` (async, returns
-    // { layout: {rxEp, txEp, cmdEp, rxSize}, ... }) and starts receiving. Resolves with what the handshake returned; rejects if
-    // anything failed (the device is closed again).
+    // Finds, opens and claims the permitted device {vid, pid, serial?} (or takes the USBDevice object in {device}, e.g. the one the user
+    // picked in the chooser), calls `handshake(usb)` (async, returns { layout: {rxEp, txEp, cmdEp, rxSize}, ... }) and starts
+    // receiving (unless the option autoReceive is false). Resolves with what the handshake returned; rejects if anything failed
+    // (the device is closed again).
     openDevice(criteria, handshake) {
         const run = openLock.then(() => this._openDevice(criteria, handshake));
         openLock = run.catch(() => {});
@@ -172,15 +175,20 @@ class UsbPort {
     async _openDevice(c, handshake) {
         let d = null;
         try {
-            // requestDevice() is window-only; the page already obtained the permission for this origin.
-            const list = await navigator.usb.getDevices();
-            const taken = new Set(this.opt.inUse ? this.opt.inUse() : []);
-            const cand = list.filter(x => x.vendorId === c.vid && x.productId === c.pid &&
-                                          (c.serial == null || x.serialNumber === c.serial) && !taken.has(x));
-            d = cand.find(x => !x.opened) || cand[0];
-            if (!d) throw new Error('device is not among the permitted devices');
-            await d.open();
-            if (d.configuration === null) await d.selectConfiguration(1);
+            if (c.device) {
+                d = c.device;
+            } else {
+                // requestDevice() is window-only; the page already obtained the permission for this origin.
+                const list = await navigator.usb.getDevices();
+                const taken = new Set(this.opt.inUse ? this.opt.inUse() : []);
+                const cand = list.filter(x => x.vendorId === c.vid && x.productId === c.pid &&
+                                              (c.serial == null || x.serialNumber === c.serial) && !taken.has(x));
+                d = cand.find(x => !x.opened) || cand[0];
+                if (!d) throw new Error('device is not among the permitted devices');
+            }
+            if (!d.opened || !c.device) await d.open();
+            if (c.configuration && (d.configuration === null || d.configuration.configurationValue !== c.configuration)) await d.selectConfiguration(c.configuration);
+            else if (d.configuration === null) await d.selectConfiguration(1);
             await d.claimInterface(this.opt.iface);
             const hs = await handshake(d);
             const layout = hs.layout;
@@ -193,7 +201,7 @@ class UsbPort {
             this.txQueue = [];
             this.txHead = 0;
             this.onOpening(hs);
-            this.startRx();
+            if (this.opt.autoReceive) this.startRx();
             this.lastPingOk = performance.now();
             this.pingFails = 0;
             this.pingBusy = false;
@@ -230,8 +238,11 @@ class UsbPort {
         this.beforeTeardown();
         this.usb = null;
         this.rxGen++;
+        this.receiving = false;
+        const unsent = this.txQueue.slice(this.txHead);
         this.txQueue = [];
         this.txHead = 0;
+        for (const item of unsent) this.finishTx(item, false);       // they will never run
         this.afterTeardown();
     }
 
@@ -282,14 +293,32 @@ class UsbPort {
 
     startRx() {
         const gen = ++this.rxGen;
+        this.receiving = true;
         this.slotErr.fill(0);
         this.lastRxDone = performance.now();
         for (let i = 0; i < this.opt.rxSlots; i++) this.submitRx(i, gen);
     }
 
+    // For a port opened with autoReceive false: start receiving on this endpoint with this transfer size (0 = keep the current one).
+    // If it already receives, the pending transfers are replaced (see reconfigureRx).
+    beginRx(ep, size) {
+        if (!this.usb) return;
+        if (this.receiving) { this.reconfigureRx(ep, size); return; }
+        if (ep) this.rxEp = ep & 0x7F;
+        if (size) this.rxSize = Math.max(64, Math.min(size | 0, 16384));
+        this.startRx();
+    }
+
+    // Stops receiving. WebUSB cannot cancel a pending transfer: the ones in flight complete when the adapter sends something, and
+    // what they bring is dropped.
+    stopRx() {
+        this.receiving = false;
+        this.rxGen++;
+    }
+
     submitRx(slot, gen) {
         const d = this.usb;
-        if (gen !== this.rxGen || !d) return;
+        if (gen !== this.rxGen || !d || !this.receiving) return;
         let p;
         try {
             p = d.transferIn(this.rxEp, this.rxSize);
@@ -370,7 +399,7 @@ class UsbPort {
         if (e !== this.rxEp || s !== this.rxSize) {
             this.rxEp = e;
             this.rxSize = s;
-            this.recover('RX endpoint/size changed');
+            if (this.receiving) this.recover('RX endpoint/size changed');
         }
     }
 
@@ -378,12 +407,19 @@ class UsbPort {
     // Transmit: bounded queue, limited number of transfers in flight. Returns false if the frame was dropped.
     // -----------------------------------------------------------------------------------------
 
-    enqueueTx(data, ep) {
+    // `done(ok)` (optional) is called when the transfer finished, or with false if it was never sent (the session ended first).
+    // It is not called for a dropped frame (the return value says so).
+    enqueueTx(data, ep, done) {
         if (!this.usb || this.txQueue.length - this.txHead >= this.opt.txQueueMax) { this.st.txDropped++; return false; }
         this.onTxQueued(data, ep);
-        this.txQueue.push({ data: data, ep: ep ? (ep & 0x7F) : this.txEp });
+        this.txQueue.push({ data: data, ep: ep ? (ep & 0x7F) : this.txEp, done: done || null });
         this.pumpTx();
         return true;
+    }
+
+    finishTx(item, ok) {
+        if (!item.done) return;
+        try { item.done(ok); } catch (e) { this.error('transmit callback failed:', e); }
     }
 
     pumpTx() {
@@ -392,19 +428,22 @@ class UsbPort {
         while (d && this.txInflight < this.opt.txInflight && this.txHead < this.txQueue.length) {
             const item = this.txQueue[this.txHead++];
             this.txInflight++;
-            let p;
+            let p, ok = true;
             try { p = d.transferOut(item.ep, item.data); } catch (e) { p = Promise.reject(e); }
             p.then(r => {
                 if (r.status === 'stall') {
+                    ok = false;
                     this.st.txErrors++;
                     return d.clearHalt('out', item.ep);
                 }
-                if (r.status !== 'ok') this.st.txErrors++;
+                if (r.status !== 'ok') { ok = false; this.st.txErrors++; }
             }).catch(err => {
+                ok = false;
                 this.st.txErrors++;
                 if (this.usb === d && isGone(err)) this.lost(errText(err));
             }).finally(() => {
                 this.txInflight--;
+                this.finishTx(item, ok);
                 this.pumpTx();
             });
         }

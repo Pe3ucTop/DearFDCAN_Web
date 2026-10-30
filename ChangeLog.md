@@ -210,6 +210,20 @@ unchanged against the refactored worker, multi-file and packed. Found by the tes
 sink, so a serial port cannot write again until it is reopened (reading is not affected). Behaviour is otherwise as before; both Emscripten modes
 build without warnings.
 
+**2026-10-30, step 3 of the split: `libs/emscripten-webusb`.** WebUSB for any program compiled with Emscripten. `webusb.h` is a C API
+modelled on WebUSB, not on libusb (decision of `DECISIONS.md`): up to 8 devices by index; `webusb_request_device` (chooser with filters) and
+`webusb_scan` (permitted devices, also in a worker); `webusb_open` (configuration + interface); descriptor information (ids, class, BCD versions,
+strings, endpoints); `webusb_control_out` / `_in` and `webusb_bulk_out` with completion callbacks (id, status, user pointer, the bytes of an IN);
+`webusb_start_receive` with a callback per completed transfer (time stamped, several transfers always pending); events for added / opened /
+closed / error / cancelled / scan done; counters. `library_webusb.js` is only the C face (table, callbacks, marshalling between the heap and the
+transfers); the transport is `webusb_io.js`, linked as `--pre-js`. To make that possible `UsbPort` got: a device object given by the caller
+(`openDevice({device, configuration})`), receiving on demand (`autoReceive: false`, `beginRx`, `stopRx`) and completion callbacks of transmits
+(`enqueueTx(data, ep, done)`, `done(false)` for what never ran). The monitor's behaviour does not change (its tests pass as before; `test_webusb_io`
+grew to 57 checks). Test: `libs/emscripten-webusb/test` links a C program with the library for Node and drives it against a mock `navigator.usb`
+(scan, chooser filters, open and failed open, endpoint lists, control transfers in order with data copied at the call, bulk OUT with a full queue,
+receive with a 20 kB transfer and stop, unplug and reopen, close during open); CMake target `run_test_webusb`, run by `make test`. **Not
+verified: a real browser or a real device.**
+
 ## Verified overall
 
 The CAN core, frame parser and URL parsing were unit-tested natively (ASan/UBSan) and the worker was exercised against mock devices with the

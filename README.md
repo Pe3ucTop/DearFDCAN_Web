@@ -185,6 +185,7 @@ unit-tested natively.
 | `libs/can-engine/can_wire.h` | Snapshot format shared by the page and the worker core |
 | `libs/webusb-io/webusb_io.js` | The WebUSB transport (`UsbPort`): finding and opening a permitted device, receive slots with generations, recovery, ordered control / command transfers, transmit queue, watchdog; no CAN protocol, no wasm, no `postMessage`; see its README |
 | `libs/webserial-io/webserial_io.js` | The Web Serial transport (`SerialConnection`): open with DTR/RTS, read loop that survives recoverable stream errors, ordered writes with acknowledgements; see its README |
+| `libs/emscripten-webusb/` | WebUSB for any Emscripten program: `webusb.h` (devices, open, control / bulk OUT transfers with completion callbacks, receive callbacks) and `library_webusb.js` on top of `webusb-io`; its own API modelled on WebUSB, no libusb compatibility; with its own test and README. The monitor does not use it (its workers use `webusb-io` directly) |
 | `apps/dearfdcan_web/WORKER_PROTOCOL.md` | The messages between the page, the CAN worker and the serial worker |
 | `libs/emscripten-webserial/` | Standalone Emscripten library: Web Serial ports as `/dev/ttyWeb0..7` device nodes (POSIX `read`/`write`/`poll`/termios), with its own test; not used by the monitor itself, see its README |
 
@@ -195,6 +196,7 @@ Tests (`tests/`, they need no adapter and no browser):
 | `tests/test_elmue.cpp`, `tests/test_clock_sync.cpp`, `tests/test_pcan_records.cpp` | Unit tests of the protocol layer and the core (Elmue messages, blobs, echoes and a fuzzer; the clock fit against a simulated drifting clock; PEAK records and options), natively under ASan / UBSan |
 | `tests/test_app_ui.cpp` | Headless test of the adapter sequences driven by `AppUI` (open, capabilities, start, acknowledgements, stop, transmit, reports) for gs_usb (legacy and Elmue), PEAK and SLCAN, with the real Dear ImGui and a recording stand-in for the bridge, natively under ASan / UBSan |
 | `tests/test_webusb_io.js`, `tests/test_webserial_io.js` | The transport libraries against a mock `USBDevice` (matching, receive slots and generations, recovery, loss, ordered control transfers, transmit queue, watchdog) and a mock `SerialPort` on Web Streams (open, signals, reading, ordered writes with acknowledgements, close during open, loss), under Node |
+| `libs/emscripten-webusb/test/` | `test_webusb.c` + `run_test.js`: the C API linked with the library and run under Node against a mock `navigator.usb` (`cmake --build build/em --target run_test_webusb`; `make test` runs it when `make` was run before) |
 | `tests/test_serial_worker.js` | The real `serial_worker.js` over the library: `pick`, `sopen`, `srx`, `swrite` / `swack`, `sstats`, `sclose`, `forget` (also the packed one) |
 | `tests/test_workers.js`, `tests/worker_harness.js` | The real `usb_worker.js` and `can_core.wasm` in a Node `vm` against mock USB adapters (Elmue blobs and echoes, clock requests, PEAK records): `node tests/test_workers.js build/multi apps/dearfdcan_web` after `make MODE=multi`; with `build/tmp/single/usb_worker_bundle.js` as a third argument the packed worker of the single-file build |
 

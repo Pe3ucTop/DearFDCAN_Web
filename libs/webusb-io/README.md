@@ -36,5 +36,10 @@ What `UsbPort` does for you:
   trigger a recovery. A silent bus is not a failure, a dead control pipe is.
 * **Loss**: an unplugged adapter ends the session at once (`onLost`).
 
+Also available: `openDevice({ device })` takes a `USBDevice` the caller already holds (e.g. from `requestDevice()`) instead of matching one, and
+may select a configuration; with the option `autoReceive: false` nothing is received until `beginRx(endpoint, size)` (and `stopRx()` ends it);
+`enqueueTx(data, ep, done)` calls `done(ok)` when the transfer finished or will never run. `libs/emscripten-webusb` builds a C API for
+Emscripten programs on these.
+
 The hooks, the options and the details are described at the top of `webusb_io.js`. `tests/test_webusb_io.js` runs it against a mock
-`USBDevice`. A C API for programs compiled with Emscripten is planned (`DECISIONS.md`, step 3).
+`USBDevice`.

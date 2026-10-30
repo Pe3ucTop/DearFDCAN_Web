@@ -10,6 +10,7 @@
 # Layout (see DECISIONS.md):
 #   libs/webusb-io          WebUSB transport: one UsbPort per adapter              (JavaScript)
 #   libs/webserial-io       Web Serial transport: one SerialConnection per port    (JavaScript)
+#   libs/emscripten-webusb  C API (webusb.h) for Emscripten programs, on top of webusb-io   (test: target run_test_webusb)
 #   libs/can-core           types, DLC and bit-timing helpers                     (header only)
 #   libs/can-protocols      gs_usb, ElmueSoft, PEAK PCAN-USB FD and SLCAN: frames, commands, reports
 #   libs/can-engine         the worker core: clock sync, ID table, trace, snapshots
@@ -51,6 +52,7 @@ endif()
 
 add_subdirectory(libs/webusb-io)
 add_subdirectory(libs/webserial-io)
+add_subdirectory(libs/emscripten-webusb)
 add_subdirectory(libs/can-core)
 add_subdirectory(libs/can-protocols)
 add_subdirectory(libs/can-engine)
