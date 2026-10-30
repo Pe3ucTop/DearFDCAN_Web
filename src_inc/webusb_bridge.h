@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 
+#include "can_adapter.h"      // DeviceOpenInfo, kRxFlag*
 #include "can_wire.h"
 
 // What the browser reports about an adapter (available as soon as the user has picked it)
@@ -16,26 +17,6 @@ struct UsbDeviceInfo {
     std::string usb_version;     // bcdUSB, e.g. "2.0.0"
     std::string device_version;  // bcdDevice, e.g. "1.0.0"
     bool is_serial = false;      // a Web Serial port (SLCAN adapter); vid/pid are 0 unless it is a USB serial adapter
-};
-
-// What the worker learned when it opened an adapter
-struct DeviceOpenInfo {
-    std::string endpoints;                                   // endpoint list of the data interface
-    CanProtocolType protocol = PROTOCOL_GS_USB_CANDLELIGHT;  // detected from the USB ids
-    std::string info;                                        // protocol specific details as "key=value;key=value"
-
-    // Value of a key of `info`, empty if it is not there (PCAN: fw, bl, hw, mcu, ser, ch, fwtype)
-    std::string Get(const std::string& key) const {
-        size_t pos = 0;
-        while (pos < info.size()) {
-            size_t end = info.find(';', pos);
-            if (end == std::string::npos) end = info.size();
-            const size_t eq = info.find('=', pos);
-            if (eq != std::string::npos && eq < end && info.compare(pos, eq - pos, key) == 0) return info.substr(eq + 1, end - eq - 1);
-            pos = end + 1;
-        }
-        return std::string();
-    }
 };
 
 // How well the adapter's clock is synchronised with the page clock (gs_usb: the worker reads the adapter's timestamp
@@ -113,7 +94,7 @@ public:
     // Start/Stop only gate processing of received frames; endpoint 0 / size 0 keep the detected values.
     // flags (gs_usb): kRxElmue = the channel runs in Elmue mode, kRxTimestamps = it was started with adapter timestamps
     // (the worker then keeps reading the adapter clock to synchronise it)
-    static constexpr int kRxElmue = 1, kRxTimestamps = 2;
+    static constexpr int kRxElmue = kRxFlagElmue, kRxTimestamps = kRxFlagTimestamps;
     void StartRxPump(int dev, int endpoint, int max_packet_size, int flags = 0);
     void StopRxPump(int dev);
 

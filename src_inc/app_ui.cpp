@@ -255,44 +255,29 @@ double AppUI::GetNowMs() const {
 // Device slots
 // ============================================================================
 
-// Ids of the command transfers of PEAK start/stop sequences; their acknowledgements come back through
-// OnControlOutDone() and are told apart from gs_usb request codes by being >= 0x100
-static constexpr int kPcanCmdIdStart = 0x100;
-static constexpr int kPcanCmdIdStop  = 0x200;
-// Control transfers of the gs_usb Elmue sequences are acknowledged with ids of their own, because the same request code
-// (MODE) is sent several times: a failure of a "required" one aborts the start, an "optional" one is ignored
-static constexpr int kGsIdRequired = 0x500;
-static constexpr int kGsIdOptional = 0x600;
-static constexpr int kGsIdQuiet    = 0x700;   // housekeeping outside of a start (mode reset at open, termination): acknowledgement not interesting
-// SLCAN command ids are SLCAN_CMD_ID_START / SLCAN_CMD_ID_STOP / SLCAN_CMD_VERSION (can_protocol_slcan.h)
+// Transfers of the driver go through the page's bridge to the worker
+void BridgeTransport::ControlOut(uint8_t request, uint16_t value, uint16_t index, const uint8_t* data, int length, int id) {
+    WebUsbBridge::GetInstance().ControlTransferOut(dev_, request, value, index, data, length, id);
+}
+void BridgeTransport::ControlIn(uint8_t request, uint16_t value, uint16_t index, uint16_t length) {
+    WebUsbBridge::GetInstance().ControlTransferIn(dev_, request, value, index, length);
+}
+void BridgeTransport::CommandOut(int id, const uint8_t* data, int length) {
+    WebUsbBridge::GetInstance().CommandOut(dev_, id, data, length);
+}
+void BridgeTransport::StartRx(int endpoint, int size, int flags) {
+    WebUsbBridge::GetInstance().StartRxPump(dev_, endpoint, size, flags);
+}
+void BridgeTransport::StopRx() {
+    WebUsbBridge::GetInstance().StopRxPump(dev_);
+}
 
-// Register limits of an adapter's bit timing: what the editors may enter and the automatic calculation may use
-static const CanBitTimingLimits kGsLimits = {512, 128, 128, 1024};   // as wide as the editor always allowed
-// gs_usb adapters that answered BT_CONST_EXT tell the real limits of both phases
-static CanBitTimingLimits GsLimitsOf(const ElmTimeLimits& t) {
-    return CanBitTimingLimits{t.seg1_max, t.seg2_max, t.sjw_max, t.brp_max};
-}
-static CanBitTimingLimits NominalLimitsOf(const DeviceSlot& d) {
-    if (d.protocol == PROTOCOL_SLCAN) return d.slcan_info.valid && d.slcan_info.nominal.brp_max ? d.slcan_info.nominal : CanProtocolSlcan::DefaultNominalLimits();
-    if (d.protocol == PROTOCOL_PEAK_PCAN_FD) return PcanNominalLimits();
-    return d.has_bt_ext && d.bt_ext.nominal.brp_max ? GsLimitsOf(d.bt_ext.nominal) : kGsLimits;
-}
-static CanBitTimingLimits DataLimitsOf(const DeviceSlot& d) {
-    if (d.protocol == PROTOCOL_SLCAN) return d.slcan_info.valid && d.slcan_info.data.brp_max ? d.slcan_info.data : CanProtocolSlcan::DefaultDataLimits();
-    if (d.protocol == PROTOCOL_PEAK_PCAN_FD) return PcanDataLimits();
-    return d.has_bt_ext && d.bt_ext.data.brp_max ? GsLimitsOf(d.bt_ext.data) : kGsLimits;
-}
+// Bit-timing limits of the adapter: what the editors may enter (the calculation itself is in can_adapter.cpp)
+static CanBitTimingLimits NominalLimitsOf(const DeviceSlot& d) { return NominalLimits(d); }
+static CanBitTimingLimits DataLimitsOf(const DeviceSlot& d) { return DataLimits(d); }
 
 // Bit rates of the Lawicel "S" command, in kbit/s
 static const int kClassicRatesKbps[] = {10, 20, 50, 100, 125, 250, 500, 800, 1000};
-
-// Automatic calculation within the limits; if nothing fits gs_usb keeps the old search (it always produced
-// some value), other protocols leave the previous values
-static void CalculateTiming(CanProtocolType protocol, uint32_t fclk_hz, uint32_t bps, float sample_point,
-                            const CanBitTimingLimits& limits, GsDeviceBittiming& bt) {
-    if (CanProtocolHandler::AutoCalculateBittiming(fclk_hz, bps, sample_point, limits, bt)) return;
-    if (protocol == PROTOCOL_GS_USB_CANDLELIGHT) CanProtocolHandler::AutoCalculateBittiming(fclk_hz, bps, sample_point, bt);
-}
 
 void AppUI::InitDeviceDefaults(DeviceSlot& d) const {
     d.target_nom_kbps = defaults_.target_nom_kbps;
@@ -303,54 +288,22 @@ void AppUI::InitDeviceDefaults(DeviceSlot& d) const {
     d.enable_loopback = defaults_.enable_loopback;
     d.enable_listen_only = defaults_.enable_listen_only;
 
-    // Placeholder limits until the adapter answers GS_USB_BREQ_BT_CONST
-    std::memset(&d.bt_const, 0, sizeof(d.bt_const));
-    d.bt_const.fclk_can  = 80000000U; // Default 80 MHz clock
-    d.bt_const.tseg1_min = 1;
-    d.bt_const.tseg1_max = 256;
-    d.bt_const.tseg2_min = 1;
-    d.bt_const.tseg2_max = 128;
-    d.bt_const.sjw_max   = 128;
-    d.bt_const.brp_min   = 1;
-    d.bt_const.brp_max   = 512;
-    d.has_bt_const = false;
-    d.has_config = false;
-    std::memset(&d.config, 0, sizeof(d.config));
-
+    InitAdapterState(d);
     RecalculateTimings(d);
 }
 
 void AppUI::RecalculateTimings(DeviceSlot& d) {
-    CalculateTiming(d.protocol, d.bt_const.fclk_can, d.target_nom_kbps * 1000U, d.target_nom_sp, NominalLimitsOf(d), d.nom_bt);
-    CalculateTiming(d.protocol, d.bt_const.fclk_can, d.target_data_kbps * 1000U, d.target_data_sp, DataLimitsOf(d), d.data_bt);
+    ::RecalculateTimings(d, d);
 }
 
-// Fixed properties of the adapter's protocol. A PEAK adapter has no bit-timing constants request: it runs
-// its CAN cores from an 80 MHz domain and supports CAN FD, hardware timestamps and listen-only mode.
 void AppUI::ApplyProtocol(DeviceSlot& d, CanProtocolType protocol) {
-    d.protocol = protocol;
-    if (protocol == PROTOCOL_PEAK_PCAN_FD) {
-        std::memset(&d.bt_const, 0, sizeof(d.bt_const));
-        d.bt_const.feature = GS_CAN_FEATURE_FD | GS_CAN_FEATURE_HW_TIMESTAMP | GS_CAN_FEATURE_LISTEN_ONLY;
-        d.bt_const.fclk_can = PCAN_CAN_CLOCK_HZ;
-        d.has_bt_const = true;
-        d.enable_loopback = false;   // no internal loopback mode in this protocol
-    } else if (protocol == PROTOCOL_SLCAN) {
-        // The clock and the limits come from the 'V' answer of a CANable adapter (see OnControlDataReceived);
-        // until then the usual 160 MHz of the STM32G4 firmware and its default limits are assumed
-        d.is_serial = true;
-        d.bt_const.feature = GS_CAN_FEATURE_FD | GS_CAN_FEATURE_LISTEN_ONLY | GS_CAN_FEATURE_LOOP_BACK;
-        if (d.slcan_info.valid && d.slcan_info.clock_mhz) d.bt_const.fclk_can = d.slcan_info.clock_mhz * 1000000U;
-        else if (!d.has_bt_const) d.bt_const.fclk_can = 160000000U;      // first time: replaces the 80 MHz placeholder
-        d.has_bt_const = true;
-    }
-    RecalculateTimings(d);
+    ApplyProtocolDefaults(d, d, protocol);
 }
 
-SlcanDialect AppUI::EffectiveDialect(const DeviceSlot& d) {
-    if (d.slcan_dialect_choice == 1) return SLCAN_DIALECT_CANABLE;
-    if (d.slcan_dialect_choice == 2) return SLCAN_DIALECT_LAWICEL;
-    return d.slcan_probed ? d.slcan_dialect : SLCAN_DIALECT_LAWICEL;
+void AppUI::CreateDriver(int dev, CanProtocolType protocol) {
+    DeviceSlot& d = devices_[dev];
+    d.transport = BridgeTransport(dev);
+    d.adapter = CreateAdapter(protocol, dev, d, d, d.transport, *this);
 }
 
 bool AppUI::IsBusOn(int dev) const {
@@ -414,6 +367,7 @@ void AppUI::OnDeviceAdded(int dev, const UsbDeviceInfo& info) {
         InitDeviceDefaults(d);
         d.serial_baud = new_serial_baud_;
         if (info.is_serial) ApplyProtocol(d, PROTOCOL_SLCAN);
+        CreateDriver(dev, info.is_serial ? PROTOCOL_SLCAN : PROTOCOL_GS_USB_CANDLELIGHT);   // a USB adapter's driver is replaced if it is PEAK
     }
 
     d.used = true;
@@ -437,40 +391,10 @@ void AppUI::OnDeviceOpened(int dev, const DeviceOpenInfo& open) {
     d.connected = true;
     d.endpoints = open.endpoints;
 
-    if (open.protocol == PROTOCOL_SLCAN) {
-        // Serial adapter: ask which firmware it runs. The answer sets the dialect, clock and bit-timing limits;
-        // if there is none (or it is not understood) the adapter is treated as a classic Lawicel one.
-        d.protocol = PROTOCOL_SLCAN;
-        d.slcan_probed = false;
-        d.slcan_info = SlcanVersionInfo();
-        static const uint8_t kVersionCmd[] = {'V', '\r'};
-        WebUsbBridge::GetInstance().CommandOut(dev, SLCAN_CMD_VERSION, kVersionCmd, sizeof(kVersionCmd));
-        return;
-    }
-    ApplyProtocol(d, open.protocol);
-
-    if (open.protocol == PROTOCOL_PEAK_PCAN_FD) {
-        // The worker already read the firmware info while opening: no requests to send
-        d.pcan_fw = open.Get("fw");
-        d.pcan_bl = open.Get("bl");
-        d.pcan_hw = open.Get("hw");
-        d.pcan_mcu = open.Get("mcu");
-        d.pcan_serial = open.Get("ser");
-        d.pcan_channels = open.Get("ch");
-        return;
-    }
-
-    // gs_usb: query bit-timing constants and the adapter description from EP0
-    d.elmue_supported = false;
-    d.elmue_active = false;
-    d.hw_timestamps_active = false;
-    d.has_bt_ext = false;
-    d.has_board = false;
-    d.feedback_labels.clear();
-    ResetBusReport(d);
-    auto& usb = WebUsbBridge::GetInstance();
-    usb.ControlTransferIn(dev, GS_USB_BREQ_BT_CONST, 0, 0, sizeof(GsDeviceBtConst));
-    usb.ControlTransferIn(dev, GS_USB_BREQ_DEVICE_CONFIG, 0, 0, sizeof(GsDeviceConfig));
+    // The protocol is known now: a PEAK adapter replaces the gs_usb driver every USB adapter starts with. The driver then asks the
+    // adapter what it is (gs_usb: constants and description, SLCAN: 'V'; PEAK: the worker read the firmware info already).
+    if (!d.adapter || d.adapter->Protocol() != open.protocol) CreateDriver(dev, open.protocol);
+    d.adapter->OnOpened(open);
 }
 
 void AppUI::OnDeviceClosed(int dev, const std::string& reason) {
@@ -485,46 +409,10 @@ void AppUI::OnDeviceClosed(int dev, const std::string& reason) {
     d.status = (reason == "closed by host") ? std::string() : reason;
 }
 
-void AppUI::ResetBusReport(DeviceSlot& d) {
-    d.bus_load = -1;
-    d.bus_state = ELM_BUS_ACTIVE;
-    d.bus_rx_errors = d.bus_tx_errors = 0;
-    d.error_reports = 0;
-    d.last_error_text.clear();
-    d.adapter_text.clear();
-}
-
-// Lines of the Elmue protocol that are not CAN frames: bus load, text of the firmware, error reports
+// Bus load / error / state / text lines of the worker core (Elmue protocol, PEAK)
 void AppUI::OnAdapterEvents(int dev, const std::string& lines) {
-    if (!ValidDevice(dev) || !devices_[dev].used) return;
-    DeviceSlot& d = devices_[dev];
-    size_t pos = 0;
-    while (pos < lines.size()) {
-        size_t end = lines.find('\n', pos);
-        if (end == std::string::npos) end = lines.size();
-        const std::string line = lines.substr(pos, end - pos);
-        pos = end + 1;
-        if (line.empty()) continue;
-
-        const std::string body = line.substr(1);
-        if (line[0] == 'U') {
-            d.bus_load = std::clamp(std::atoi(body.c_str()), 0, 100);
-        } else if (line[0] == 'S') {
-            d.bus_state = static_cast<ElmBusState>(std::clamp(std::atoi(body.c_str()), 0, 3));
-        } else if (line[0] == 'T') {
-            d.adapter_text = body;
-        } else if (line[0] == 'E') {
-            uint32_t err_id = 0;
-            uint8_t data[8] = {};
-            if (!CanProtocolElmue::ParseErrorEvent(body, err_id, data)) continue;
-            const ElmErrorInfo info = CanProtocolElmue::DecodeError(err_id, data);
-            ++d.error_reports;
-            d.bus_rx_errors = info.rx_errors;
-            d.bus_tx_errors = info.tx_errors;
-            if (info.state_known) d.bus_state = info.state;
-            if (!info.text.empty()) d.last_error_text = info.text;
-        }
-    }
+    if (!ValidDevice(dev) || !devices_[dev].used || !devices_[dev].adapter) return;
+    devices_[dev].adapter->OnEvents(lines);
 }
 
 void AppUI::OnNotice(const std::string& text) {
@@ -534,128 +422,14 @@ void AppUI::OnNotice(const std::string& text) {
 
 void AppUI::OnControlDataReceived(int dev, uint8_t request, const uint8_t* data, int length) {
     if (!ValidDevice(dev) || !devices_[dev].used) return;
-    DeviceSlot& d = devices_[dev];
-
-    if (d.protocol == PROTOCOL_SLCAN) {
-        // Answer to 'V'. CANable firmware: clock and limits for the bit-timing calculation; classic: just a version.
-        if (request != SLCAN_CMD_VERSION || length <= 0) return;
-        SlcanVersionInfo v;
-        if (!CanProtocolSlcan::ParseVersionLine(std::string(reinterpret_cast<const char*>(data), static_cast<size_t>(length)), v)) {
-            d.slcan_probed = true;
-            d.slcan_dialect = SLCAN_DIALECT_LAWICEL;
-            return;
-        }
-        d.slcan_info = v;
-        d.slcan_dialect = v.dialect;
-        d.slcan_probed = true;
-        if (v.dialect == SLCAN_DIALECT_CANABLE) {
-            d.bt_const.fclk_can = v.clock_mhz * 1000000U;
-            d.has_bt_const = true;
-            RecalculateTimings(d);
-        }
-        return;
-    }
-
-    if (request == GS_USB_BREQ_BT_CONST && length >= static_cast<int>(sizeof(GsDeviceBtConst))) {
-        std::memcpy(&d.bt_const, data, sizeof(GsDeviceBtConst));
-        d.has_bt_const = true;
-        if (d.bt_const.fclk_can > 0) RecalculateTimings(d);
-
-        // An Elmue (CANable 2.5) adapter: switch its extended requests on (they need the Elmue flag in the last MODE request, which a
-        // reset with the flag provides) and read what only they can tell
-        if ((d.bt_const.feature & ELM_FEATURE_PROTOCOL) && !d.elmue_supported) {
-            d.elmue_supported = true;
-            auto& usb = WebUsbBridge::GetInstance();
-            GsDeviceMode reset = {GS_CAN_MODE_RESET, ELM_FEATURE_PROTOCOL};
-            usb.ControlTransferOut(dev, GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&reset), sizeof(reset), kGsIdQuiet);
-            usb.ControlTransferIn(dev, ELM_BREQ_GET_BOARD_INFO, 0, 0, sizeof(ElmBoardInfo));
-            if (d.bt_const.feature & GS_CAN_FEATURE_BT_CONST_EXT) usb.ControlTransferIn(dev, GS_USB_BREQ_BT_CONST_EXT, 0, 0, sizeof(GsDeviceBtConstExt));
-        }
-    } else if (request == GS_USB_BREQ_DEVICE_CONFIG && length >= static_cast<int>(sizeof(GsDeviceConfig))) {
-        std::memcpy(&d.config, data, sizeof(GsDeviceConfig));
-        d.has_config = true;
-    } else if (request == GS_USB_BREQ_BT_CONST_EXT && length >= static_cast<int>(sizeof(GsDeviceBtConstExt))) {
-        std::memcpy(&d.bt_ext, data, sizeof(GsDeviceBtConstExt));
-        d.has_bt_ext = true;
-        RecalculateTimings(d);
-    } else if (request == ELM_BREQ_GET_BOARD_INFO) {
-        d.has_board = CanProtocolElmue::ParseBoardInfo(data, length, d.board);
-    } else if (request == ELM_BREQ_GET_LAST_ERROR && length >= 1) {
-        // The adapter's verdict on the request sent before (it cannot stall the data stage to say so)
-        const std::string what = d.feedback_labels.empty() ? std::string("a command") : d.feedback_labels.front();
-        if (!d.feedback_labels.empty()) d.feedback_labels.erase(d.feedback_labels.begin());
-        if (data[0] != 2 /* success */ && (d.channel_opening || d.channel_open)) {
-            OnNotice("Device " + std::to_string(dev + 1) + ": the adapter rejected " + what + ": " + CanProtocolElmue::FeedbackText(data[0]));
-            StopCanChannel(dev);
-        }
-    }
+    if (devices_[dev].adapter) devices_[dev].adapter->OnControlIn(request, data, length);
 }
 
-// Control OUT results arrive in submission order per adapter. The channel counts as open only after the
-// MODE_START request was acknowledged; any failure of the start sequence rolls it back.
+// Control OUT results arrive in submission order per adapter. The channel counts as open only after the last step of the start
+// sequence was acknowledged; any failure of the start sequence rolls it back (see can_adapter.cpp).
 void AppUI::OnControlOutDone(int dev, int request, bool ok) {
     if (!ValidDevice(dev) || !devices_[dev].used) return;
-    DeviceSlot& d = devices_[dev];
-
-    if (request == kGsIdQuiet) return;
-    if (request >= kGsIdRequired && request < kGsIdQuiet) {
-        // gs_usb Elmue start sequence (see StartGsUsbElmue): the last required transfer is MODE_START
-        if (!d.channel_opening) return;
-        if (!ok) {
-            if (request < kGsIdOptional) {
-                OnNotice("Device " + std::to_string(dev + 1) + ": a start command was not accepted by the adapter");
-                StopCanChannel(dev);
-            }
-        } else if (request == d.gs_start_last_id) {
-            d.channel_opening = false;
-            d.channel_open = true;
-        }
-        return;
-    }
-
-    if (d.protocol == PROTOCOL_SLCAN && request == SLCAN_CMD_VERSION) {
-        if (!ok) {              // no answer to 'V': not a CANable firmware
-            d.slcan_probed = true;
-            d.slcan_dialect = SLCAN_DIALECT_LAWICEL;
-        }
-        return;
-    }
-    if (!d.channel_opening) return;
-
-    if (d.protocol == PROTOCOL_SLCAN) {
-        // The start sequence is a few command lines; every one is answered by the adapter
-        if (request < SLCAN_CMD_ID_START) return;
-        if (!ok) {
-            OnNotice("Device " + std::to_string(dev + 1) + ": the adapter rejected a start command");
-            StopCanChannel(dev);
-        } else if (request == d.slcan_start_last_id) {
-            d.channel_opening = false;
-            d.channel_open = true;
-        }
-        return;
-    }
-
-    if (d.protocol == PROTOCOL_PEAK_PCAN_FD) {
-        // The start sequence is a few command transfers; the channel is open after the last one was written
-        if (request < kPcanCmdIdStart) return;
-        if (!ok) {
-            StopCanChannel(dev);
-        } else if (request == d.pcan_start_last_id) {
-            d.channel_opening = false;
-            d.channel_open = true;
-        }
-        return;
-    }
-
-    if (!ok) {
-        // Firmware may legitimately reject HOST_FORMAT (it is optional); everything else is fatal
-        if (request != GS_USB_BREQ_HOST_FORMAT) StopCanChannel(dev);
-        return;
-    }
-    if (request == GS_USB_BREQ_MODE) {
-        d.channel_opening = false;
-        d.channel_open = true;
-    }
+    if (devices_[dev].adapter) devices_[dev].adapter->OnControlOutDone(request, ok);
 }
 
 // The worker core owns parsing, per-ID aggregation (count, cycle time from adapter timestamps) and
@@ -684,171 +458,20 @@ void AppUI::OnSnapshot(const SnapshotView& snapshot) {
 void AppUI::StartCanChannel(int dev) {
     if (!ValidDevice(dev)) return;
     DeviceSlot& d = devices_[dev];
-    if (!d.used || !d.connected || d.channel_opening || d.channel_open) return;
-    auto& usb = WebUsbBridge::GetInstance();
-
-    if (d.protocol == PROTOCOL_PEAK_PCAN_FD) {
-        // Command transfers (clock, options, bit timing, acceptance filter, bus on), written in order; the
-        // channel is open when the last one is done (see OnControlOutDone)
-        ResetBusReport(d);
-        const auto transfers = CanProtocolPcan::BuildStartCommands(0, d.enable_fd, d.enable_listen_only, d.nom_bt, d.data_bt);
-        for (size_t i = 0; i < transfers.size(); ++i) {
-            usb.CommandOut(dev, kPcanCmdIdStart + static_cast<int>(i), transfers[i].data(), static_cast<int>(transfers[i].size()));
-        }
-        d.pcan_start_last_id = kPcanCmdIdStart + static_cast<int>(transfers.size()) - 1;
-        usb.StartRxPump(dev, 0, 0);
-        d.channel_opening = true;
-        return;
-    }
-
-    if (d.protocol == PROTOCOL_SLCAN) {
-        // Command lines (reset, flags, bit timing, open), each answered by the adapter; the channel is open when
-        // the last one was acknowledged (see OnControlOutDone)
-        const SlcanDialect dialect = EffectiveDialect(d);
-        const bool fd = d.enable_fd && dialect == SLCAN_DIALECT_CANABLE;
-        const auto cmds = CanProtocolSlcan::BuildStartCommands(dialect, fd, d.enable_listen_only, d.enable_loopback,
-                                                               d.nom_bt, d.data_bt, static_cast<uint32_t>(d.target_nom_kbps) * 1000U);
-        if (cmds.empty()) {
-            OnNotice("Device " + std::to_string(dev + 1) + ": this adapter supports only the bit rates 10, 20, 50, 100, 125, 250, 500, 800 and 1000 kbps");
-            return;
-        }
-        for (size_t i = 0; i < cmds.size(); ++i) {
-            usb.CommandOut(dev, SLCAN_CMD_ID_START + static_cast<int>(i), reinterpret_cast<const uint8_t*>(cmds[i].data()), static_cast<int>(cmds[i].size()));
-        }
-        d.slcan_start_last_id = SLCAN_CMD_ID_START + static_cast<int>(cmds.size()) - 1;
-        usb.StartRxPump(dev, 0, 0);
-        d.channel_opening = true;
-        return;
-    }
-
-    if (d.elmue_supported && d.use_elmue) {
-        StartGsUsbElmue(dev);
-        return;
-    }
-
-    uint32_t host_format = 0x0000BEEFU;
-    usb.ControlTransferOut(dev, GS_USB_BREQ_HOST_FORMAT, 1, 0, reinterpret_cast<const uint8_t*>(&host_format), sizeof(host_format));
-    usb.ControlTransferOut(dev, GS_USB_BREQ_BITTIMING, 0, 0, reinterpret_cast<const uint8_t*>(&d.nom_bt), sizeof(d.nom_bt));
-
-    if (d.enable_fd) {
-        usb.ControlTransferOut(dev, GS_USB_BREQ_DATA_BITTIMING, 0, 0, reinterpret_cast<const uint8_t*>(&d.data_bt), sizeof(d.data_bt));
-    }
-
-    GsDeviceMode mode_cmd = {};
-    mode_cmd.mode = GS_CAN_MODE_START;
-    mode_cmd.flags = 0;
-    if (d.enable_fd)          mode_cmd.flags |= GS_CAN_FEATURE_FD;
-    if (d.enable_loopback)    mode_cmd.flags |= GS_CAN_FEATURE_LOOP_BACK;
-    if (d.enable_listen_only) mode_cmd.flags |= GS_CAN_FEATURE_LISTEN_ONLY;
-    // Ask the adapter to append its microsecond timestamp to every frame: cycle times are then
-    // computed from the adapter clock instead of the (jittery) USB/browser arrival time
-    d.hw_timestamps_active = d.use_hw_timestamps && (d.bt_const.feature & GS_CAN_FEATURE_HW_TIMESTAMP);
-    if (d.hw_timestamps_active) mode_cmd.flags |= GS_CAN_FEATURE_HW_TIMESTAMP;
-
-    usb.ControlTransferOut(dev, GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd));
-
-    // endpoint and transfer size as detected by the worker; with timestamps the worker also keeps the adapter clock synchronised
-    usb.StartRxPump(dev, 0, 0, d.hw_timestamps_active ? WebUsbBridge::kRxTimestamps : 0);
-    d.channel_opening = true;     // channel_open is set when MODE_START is acknowledged
-}
-
-// Start of a gs_usb channel in Elmue mode. The adapter keeps the Elmue requests (id >= 20) switched on only while the last MODE request
-// carried the Elmue flag, so the sequence starts with a mode reset that has it. Each request is followed by a read of the adapter's
-// verdict (ELM_BREQ_GET_LAST_ERROR), because a firmware that rejects a parameter cannot stall the data stage to tell.
-void AppUI::StartGsUsbElmue(int dev) {
-    DeviceSlot& d = devices_[dev];
-    auto& usb = WebUsbBridge::GetInstance();
-    d.feedback_labels.clear();
-    ResetBusReport(d);
-
-    int required = 0, optional = 0;
-    auto out = [&](uint8_t request, const void* data, int length, bool is_required, const char* label) {
-        const int id = is_required ? kGsIdRequired + required++ : kGsIdOptional + optional++;
-        usb.ControlTransferOut(dev, request, 0, 0, static_cast<const uint8_t*>(data), length, id);
-        if (is_required && label) {
-            usb.ControlTransferIn(dev, ELM_BREQ_GET_LAST_ERROR, 0, 0, 1);
-            d.feedback_labels.push_back(label);
-        }
-        return id;
-    };
-
-    const uint32_t host_format = 0x0000BEEFU;
-    out(GS_USB_BREQ_HOST_FORMAT, &host_format, sizeof(host_format), false, nullptr);
-    const GsDeviceMode reset = {GS_CAN_MODE_RESET, ELM_FEATURE_PROTOCOL};
-    out(GS_USB_BREQ_MODE, &reset, sizeof(reset), true, "the mode reset");
-    out(GS_USB_BREQ_BITTIMING, &d.nom_bt, sizeof(d.nom_bt), true, "the bit timing");
-    if (d.enable_fd) out(GS_USB_BREQ_DATA_BITTIMING, &d.data_bt, sizeof(d.data_bt), true, "the data bit timing");
-
-    if (d.use_filters) {
-        bool any = false;
-        for (const DeviceSlot::HwFilter& f : d.filters) any = any || f.enabled;
-        if (any) {
-            const auto clear = CanProtocolElmue::BuildFilter(ELM_FIL_HOST_CLEAR);
-            out(ELM_BREQ_SET_FILTER, clear.data(), static_cast<int>(clear.size()), true, "clearing the filters");
-            for (const DeviceSlot::HwFilter& f : d.filters) {
-                if (!f.enabled) continue;
-                const uint32_t id_mask = f.extended ? CAN_ID_EFF_MASK : CAN_ID_SFF_MASK;
-                const auto add = CanProtocolElmue::BuildFilter(f.extended ? ELM_FIL_HOST_PASS_29 : ELM_FIL_HOST_PASS_11, f.id & id_mask, f.mask & id_mask);
-                out(ELM_BREQ_SET_FILTER, add.data(), static_cast<int>(add.size()), true, "a filter");
-            }
-        }
-    }
-
-    const uint8_t busload = d.busload_report ? 10 : 0;               // report interval in 100 ms steps
-    out(ELM_BREQ_SET_BUSLOAD_REPORT, &busload, sizeof(busload), false, nullptr);
-    if (d.termination_on && (d.bt_const.feature & GS_CAN_FEATURE_TERMINATION)) {
-        const uint32_t on = 1;
-        out(GS_USB_BREQ_SET_TERMINATION, &on, sizeof(on), false, nullptr);
-    }
-
-    d.hw_timestamps_active = d.use_hw_timestamps && (d.bt_const.feature & GS_CAN_FEATURE_HW_TIMESTAMP);
-    GsDeviceMode start = {GS_CAN_MODE_START, CanProtocolElmue::ModeFlags(d.bt_const.feature, d.hw_timestamps_active)};
-    if (d.enable_fd)          start.flags |= GS_CAN_FEATURE_FD;
-    if (d.enable_loopback)    start.flags |= GS_CAN_FEATURE_LOOP_BACK;
-    if (d.enable_listen_only) start.flags |= GS_CAN_FEATURE_LISTEN_ONLY;
-    d.gs_start_last_id = out(GS_USB_BREQ_MODE, &start, sizeof(start), true, "the start");
-
-    d.elmue_active = true;
-    // Messages of up to 2048 bytes (blobs); the worker resolves tx echoes and, with timestamps, keeps the adapter clock synchronised
-    usb.StartRxPump(dev, 0, ELM_MAX_BLOB_SIZE, WebUsbBridge::kRxElmue | (d.hw_timestamps_active ? WebUsbBridge::kRxTimestamps : 0));
-    d.channel_opening = true;
+    if (!d.used || !d.connected || d.channel_opening || d.channel_open || !d.adapter) return;
+    d.adapter->Start();      // the sequence and the receive pump; the channel is open when the driver saw the last acknowledgement
 }
 
 // 120 ohm termination resistor of the adapter (GS_CAN_FEATURE_TERMINATION): switched at once, and again at every channel start
 void AppUI::SetTermination(int dev, bool on) {
     DeviceSlot& d = devices_[dev];
     d.termination_on = on;
-    if (!d.connected || !(d.bt_const.feature & GS_CAN_FEATURE_TERMINATION)) return;
-    const uint32_t value = on ? 1 : 0;
-    WebUsbBridge::GetInstance().ControlTransferOut(dev, GS_USB_BREQ_SET_TERMINATION, 0, 0, reinterpret_cast<const uint8_t*>(&value), sizeof(value), kGsIdQuiet);
+    if (d.connected && d.adapter) d.adapter->SetTermination(on);
 }
 
 void AppUI::StopCanChannel(int dev) {
-    if (!ValidDevice(dev)) return;
-    DeviceSlot& d = devices_[dev];
-    auto& usb = WebUsbBridge::GetInstance();
-    usb.StopRxPump(dev);
-
-    if (d.protocol == PROTOCOL_PEAK_PCAN_FD) {
-        const auto transfers = CanProtocolPcan::BuildStopCommands(0);
-        for (size_t i = 0; i < transfers.size(); ++i) {
-            usb.CommandOut(dev, kPcanCmdIdStop + static_cast<int>(i), transfers[i].data(), static_cast<int>(transfers[i].size()));
-        }
-    } else if (d.protocol == PROTOCOL_SLCAN) {
-        const auto cmds = CanProtocolSlcan::BuildStopCommands();
-        for (size_t i = 0; i < cmds.size(); ++i) {
-            usb.CommandOut(dev, SLCAN_CMD_ID_STOP + static_cast<int>(i), reinterpret_cast<const uint8_t*>(cmds[i].data()), static_cast<int>(cmds[i].size()));
-        }
-    } else {
-        // An Elmue adapter keeps its extended requests (filters, bus load, board info) available only if this MODE request has the flag
-        GsDeviceMode mode_cmd = {GS_CAN_MODE_RESET, d.elmue_supported ? ELM_FEATURE_PROTOCOL : 0u};
-        usb.ControlTransferOut(dev, GS_USB_BREQ_MODE, 0, 0, reinterpret_cast<const uint8_t*>(&mode_cmd), sizeof(mode_cmd), d.elmue_supported ? kGsIdQuiet : -1);
-    }
-    d.channel_opening = false;
-    d.channel_open = false;
-    d.elmue_active = false;
-    d.hw_timestamps_active = false;
-    d.feedback_labels.clear();
+    if (!ValidDevice(dev) || !devices_[dev].adapter) return;
+    devices_[dev].adapter->Stop();
 }
 
 // Closes the adapter, forgets its slot and everything that referred to it
@@ -856,6 +479,7 @@ void AppUI::RemoveDevice(int dev) {
     if (!ValidDevice(dev) || !devices_[dev].used) return;
     if (devices_[dev].channel_open || devices_[dev].channel_opening) StopCanChannel(dev);
     WebUsbBridge::GetInstance().RemoveDevice(dev);
+    devices_[dev].adapter.reset();      // the driver refers to the slot: it goes first
     devices_[dev] = DeviceSlot();
 
     for (PeriodicTxJob& job : periodic_jobs_) {
@@ -925,32 +549,18 @@ bool AppUI::TargetHasOpenChannel(int target) const {
 
 // Sends one frame to one adapter, or to every adapter that is BUS ON. Returns the number of adapters.
 int AppUI::SendFrame(const CanMessage& msg, int target) {
-    // The transfer format depends on the adapter's protocol: build it once per protocol in use
-    std::vector<uint8_t> usb_bytes[3];
-    bool built[3] = {false, false, false};
     int sent = 0;
     for (int dev = 0; dev < kMaxDevices; ++dev) {
         if (target != kTargetAllDevices && target != dev) continue;
-        if (!IsBusOn(dev)) continue;
-        const CanProtocolType protocol = EffectiveProtocol(devices_[dev]);
-        if (protocol == PROTOCOL_SLCAN) {
-            // The line depends on the dialect of the adapter; a classic one cannot send CAN FD frames
-            const std::vector<uint8_t> line = CanProtocolHandler::BuildTx(protocol, msg, static_cast<uint8_t>(EffectiveDialect(devices_[dev])));
-            if (line.empty()) {
-                OnNotice("Device " + std::to_string(dev + 1) + ": CAN FD frames cannot be sent through a classic (Lawicel) adapter");
-                continue;
-            }
-            WebUsbBridge::GetInstance().TransferOut(dev, 0, line.data(), static_cast<int>(line.size()));
-            ++sent;
+        if (!IsBusOn(dev) || !devices_[dev].adapter) continue;
+        // The transfer format is the driver's business (an Elmue message carries a marker of its own, so one is built per adapter)
+        const std::vector<uint8_t> bytes = devices_[dev].adapter->BuildTx(msg);
+        if (bytes.empty()) {
+            // only a classic (Lawicel) serial adapter refuses a frame
+            OnNotice("Device " + std::to_string(dev + 1) + ": CAN FD frames cannot be sent through a classic (Lawicel) adapter");
             continue;
         }
-        // The Elmue message carries a marker that identifies the frame in its echo: one message per adapter, never shared
-        const int slot = (protocol == PROTOCOL_PEAK_PCAN_FD) ? 1 : (protocol == PROTOCOL_GS_USB_ELMUE ? 2 : 0);
-        if (!built[slot] || protocol == PROTOCOL_GS_USB_ELMUE) {
-            usb_bytes[slot] = CanProtocolHandler::BuildTx(protocol, msg, 0);
-            built[slot] = true;
-        }
-        WebUsbBridge::GetInstance().TransferOut(dev, 0, usb_bytes[slot].data(), static_cast<int>(usb_bytes[slot].size()));
+        WebUsbBridge::GetInstance().TransferOut(dev, 0, bytes.data(), static_cast<int>(bytes.size()));
         ++sent;
     }
     return sent;

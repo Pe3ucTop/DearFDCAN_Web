@@ -46,7 +46,7 @@ OBJ := $(BUILD)/obj
 # ---------------------------------------------------------------------------------------------
 # Page: Dear ImGui user interface + WebUSB bridge
 # ---------------------------------------------------------------------------------------------
-APP_SRCS   := main.cpp webusb_bridge.cpp can_protocol.cpp can_protocol_gsusb.cpp can_protocol_elmue.cpp can_protocol_pcan.cpp can_protocol_slcan.cpp app_ui.cpp
+APP_SRCS   := main.cpp webusb_bridge.cpp can_protocol.cpp can_protocol_gsusb.cpp can_protocol_elmue.cpp can_protocol_pcan.cpp can_protocol_slcan.cpp can_adapter.cpp app_ui.cpp
 IMGUI_SRCS := imgui.cpp imgui_draw.cpp imgui_tables.cpp imgui_widgets.cpp \
               backends/imgui_impl_glfw.cpp backends/imgui_impl_opengl3.cpp
 

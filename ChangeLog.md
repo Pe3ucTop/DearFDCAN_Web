@@ -168,6 +168,18 @@ hardware: record decoding, split records, a fuzzer (ASan/UBSan), start / stop op
 32 bit wrap (estimated 62 ppm, spread 0.09 ms), the worker with a mock PEAK `USBDevice` (events, sync messages, no timestamp request) and the UI.
 **Not verified: any real PEAK adapter** (the error / status / bus load record layouts and the option bits come from PEAK's driver sources only).
 
+**2026-10-30, step 0 of the split into libraries and a utility** (`DECISIONS.md`): no behaviour change, the protocol logic moved to where it
+belongs. `AppUI` held the start / stop sequences, the matching of acknowledgements, the capability queries, the bit-timing limits and the
+choice of the transmit format of every protocol; it is now `can_adapter.*`: a driver per protocol (`GsUsbAdapter` with the Elmue mode,
+`PcanAdapter`, `SlcanAdapter`) over an `ITransport` interface (control out / in, command out, start / stop of the receive pump) that the page
+implements with the bridge (`BridgeTransport`), reporting to an `IAdapterListener`. The driver works on two plain structures that the slot
+inherits, `AdapterState` (what the adapter and the channel are) and `ChannelConfig` (what the user wants), so the windows still show and edit
+the same fields. The UI keeps rendering, the settings and the forwarding of events. `usb_worker.js`: `Device` is the part common to every USB
+adapter, `GsUsbDevice` (Elmue staging of the transmitted frames, clock requests) and `PcanDevice` (firmware handshake, calibration statistics)
+the protocol classes, chosen from the USB ids when the slot is opened. The headless tests that had lived only in a scratch directory are in the
+repository now (`tests/`): the sequences of all three protocols through `AppUI` (98 checks, unchanged by the move: they were run on the code
+before it and after it) and the real worker against mock adapters (20 checks). Both build modes without warnings.
+
 ## Verified overall
 
 The CAN core, frame parser and URL parsing were unit-tested natively (ASan/UBSan) and the worker was exercised against mock devices with the

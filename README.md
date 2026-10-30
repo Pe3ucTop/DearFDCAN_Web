@@ -162,10 +162,11 @@ All sources and headers are in `src_inc/`:
 | File | Role |
 |---|---|
 | `src_inc/main.cpp` | GLFW/ImGui setup, main loop, wiring of bridge callbacks |
-| `src_inc/app_ui.cpp/.h` | All windows, adapter slots (`DeviceSlot`), per-adapter channel start/stop, snapshot ingestion, URL parameters |
+| `src_inc/app_ui.cpp/.h` | All windows, adapter slots (`DeviceSlot`: the adapter's state and the user's settings, plus its driver), snapshot ingestion, URL parameters |
+| `src_inc/can_adapter.cpp/.h` | Adapter drivers (gs_usb with Elmue, PEAK, SLCAN) over the `ITransport` interface: capabilities, start / stop sequences and their acknowledgements, bit-timing limits, transmit frames, bus reports; no UI and no Emscripten code |
 | `src_inc/url_params.h` | Parsing of the URL parameter values |
 | `src_inc/webusb_bridge.cpp/.h` | Page side of the worker link (EM_JS): device slots, device events, snapshot validation, per-adapter statistics |
-| `src_inc/usb_worker.js` | CAN worker: one context per adapter (USB: WebUSB I/O, RX slots, control/TX queues, watchdog; serial: staging of the bytes from `serial_worker.js` and command acknowledgements), hosts the core, snapshot publishing |
+| `src_inc/usb_worker.js` | CAN worker: one context per adapter (`Device` is the common USB part: RX slots, control/TX queues, watchdog; `GsUsbDevice` (clock requests, Elmue echoes) and `PcanDevice` (firmware handshake, calibration statistics) are the protocol classes; `SerialDevice` stages the bytes from `serial_worker.js` and matches command acknowledgements), hosts the core, snapshot publishing |
 | `src_inc/serial_worker.js` | Serial worker: Web Serial I/O only (ports, read loop, ordered writes), linked to the CAN worker by a `MessageChannel` |
 | `src_inc/can_core.cpp` | Worker wasm module: frame parsing, ID table keyed by (device, ID), trace queue, per-adapter clock mapping |
 | `src_inc/can_protocol_common.h` | Protocol independent definitions: `CanMessage`/`CanPayload`, `CanBittiming`, `CanProtocolType`, DLC helpers, bit-timing calculation, `kMaxDevices` |
@@ -176,6 +177,15 @@ All sources and headers are in `src_inc/`:
 | `src_inc/can_protocol.cpp/.h` | Umbrella header and the `CanProtocolHandler` facade: the single entry point the UI and the core use, forwards to the protocol backend |
 | `src_inc/can_wire.h` | Snapshot format shared by the page and the worker core |
 | `emscripten_webserial/` | Standalone Emscripten library: Web Serial ports as `/dev/ttyWeb0..7` device nodes (POSIX `read`/`write`/`poll`/termios), with its own test; not used by the monitor itself, see its README |
+
+Tests (`tests/`, they need no adapter and no browser):
+
+| File | Role |
+|---|---|
+| `tests/test_app_ui.cpp`, `tests/run_native.sh` | Headless test of the adapter sequences driven by `AppUI` (open, capabilities, start, acknowledgements, stop, transmit, reports) for gs_usb (legacy and Elmue), PEAK and SLCAN, with the real Dear ImGui and a recording stand-in for the bridge, natively under ASan / UBSan: `sh tests/run_native.sh` |
+| `tests/test_workers.js`, `tests/worker_harness.js` | The real `usb_worker.js` and `can_core.wasm` in a Node `vm` against mock USB adapters (Elmue blobs and echoes, clock requests, PEAK records): `node tests/test_workers.js build/multi src_inc` after `make MODE=multi` |
+
+The direction of the project (libraries for transport and CAN, and the utility) and the decisions taken are in `DECISIONS.md`.
 
 Build tooling in the repository root:
 

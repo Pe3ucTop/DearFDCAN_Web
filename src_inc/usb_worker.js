@@ -258,7 +258,7 @@ class Device {
         this.txEp = DEFAULT_EP_OUT;
         this.cmdEp = 0;                 // command endpoint (PCAN); gs_usb configures through control requests
         this.rxSize = DEFAULT_RX_SIZE;
-        this.protocol = PROTO_GS;
+        this.protocol = this.protocolId;
         this.slotErr = new Array(RX_SLOTS).fill(0);
         this.recovering = false;
 
@@ -273,15 +273,7 @@ class Device {
         this.pingBusy = false;
         this.pingFails = 0;
 
-        // gs_usb in Elmue mode (compact messages): the core needs to see the transmitted frames to resolve the tx echoes
-        this.elmue = false;
-
-        // Clock synchronisation (GS_USB_BREQ_TIMESTAMP)
-        this.syncOn = false;
-        this.syncTimer = 0;
-        this.syncFails = 0;
-        this.syncCount = 0;
-        this.syncTotal = 0;
+        this.syncTotal = 0;             // clock samples the core had when the statistics were last posted
 
         this.st = { rx: 0, rxPrev: 0, rxErrors: 0, txDropped: 0, txErrors: 0, recoveries: 0 };
     }
@@ -301,77 +293,25 @@ class Device {
     get active() { return !!this.usb; }
 
     // -----------------------------------------------------------------------------------------
-    // Clock synchronisation: the adapter's timestamp is read with a control transfer; the round trip brackets the moment
-    // the adapter latched it, so the middle of it is the page time of the sample (the core filters by round trip)
+    // What a protocol class (GsUsbDevice, PcanDevice below) provides; the rest of this class is the same for every USB adapter
     // -----------------------------------------------------------------------------------------
 
-    startSync() {
-        if (this.syncOn) return;
-        this.syncOn = true;
-        this.syncFails = 0;
-        this.syncCount = 0;
-        this.scheduleSync(SYNC_FIRST_MS);
-    }
+    get protocolId() { return PROTO_GS; }                   // CanProtocolType
+    async handshake(usb) { throw new Error('not implemented'); }   // -> { layout: {rxEp, txEp, cmdEp, rxSize}, info, text }
+    onRxEnable(m) {}                // the receive gate opens (the page started a channel); the core is told the protocol here
+    onRxStarted(m) {}               // the gate is open and the adapter is connected
+    onRxStopped() {}                // the gate closed
+    onTeardown() {}                 // the session ends
+    onTx(data, ep) {}               // a frame is about to be queued for sending
+    probeRequest() { return null; } // a harmless control IN the adapter has to answer: [setup, length]
+    drainAux() {}                   // after the core processed a transfer: events and statistics that came with it
 
-    stopSync() {
-        this.syncOn = false;
-        clearTimeout(this.syncTimer);
-        this.syncTimer = 0;
-    }
-
-    scheduleSync(ms) {
-        clearTimeout(this.syncTimer);
-        // queued behind the control transfers that are still waiting (the channel start), like every control transfer
-        this.syncTimer = setTimeout(() => { if (this.syncOn && this.usb) this.enqueue(() => this.syncOnce()); }, ms);
-    }
-
-    async syncOnce() {
-        const d = this.usb;
-        if (!this.syncOn || !d || !core) return;
-        let ok = false;
-        try {
-            const setup = { requestType: 'vendor', recipient: 'interface', request: GS_USB_BREQ_TIMESTAMP, value: 0, index: IFACE };
-            const t0 = now();
-            const r = await withTimeout(d.controlTransferIn(setup, 4), PING_TIMEOUT_MS, 'clock sample timeout');
-            const t1 = now();
-            if (r.status === 'ok' && r.data && r.data.byteLength >= 4 && this.syncOn && this.usb === d) {
-                processStage();             // frames received so far are mapped with the estimate they were received under
-                core._core_clock_sample(this.dev, r.data.getUint32(0, true), (t0 + t1) / 2, t1 - t0);
-                this.lastPingOk = performance.now();     // the control pipe answered: no liveness probe needed
-                this.postSync();
-                ok = true;
-            }
-        } catch (err) {
-            if (this.usb === d && isGone(err)) { this.lost(errText(err)); return; }
-        }
-        if (!this.syncOn) return;
-        if (ok) {
-            this.syncFails = 0;
-        } else if (++this.syncFails >= SYNC_FAILS_MAX) {
-            console.warn('[usb_worker] dev ' + this.dev + ' does not answer the clock request, synchronisation stopped');
-            this.syncOn = false;
-            return;
-        }
-        this.syncCount++;
-        this.scheduleSync(this.syncCount < SYNC_BURST ? SYNC_BURST_MS : SYNC_MS);
-    }
-
-    // Statistics of the clock samples for the page: [samples, good, offset ms, drift ppm, spread µs, min rtt ms, last rtt ms, worst µs]
+    // Statistics of the clock samples for the page: [samples, good, offset ms, drift ppm, spread µs, min rtt ms, last rtt ms, worst µs, pushed]
     postSync() {
         const ptr = core._core_clock_stats(this.dev);
         const s = Array.from(new Float64Array(core.HEAPU8.buffer, ptr, 9));
         this.syncTotal = s[0];
         this.post('sync', { s: s });
-    }
-
-    // What the core collected from the stream besides frames: event lines (Elmue, PEAK) and, for PEAK, the statistics of the
-    // calibration records the adapter pushes (reported when a new one arrived)
-    drainAux() {
-        if (this.elmue || this.protocol === PROTO_PCAN) this.drainEvents();
-        if (this.protocol === PROTO_PCAN && this.rxEnabled) {
-            const ptr = core._core_clock_stats(this.dev);
-            if (new Float64Array(core.HEAPU8.buffer, ptr, 1)[0] !== this.syncTotal) this.postSync();
-        }
     }
 
     // Event lines of the Elmue protocol ("U<percent>", "T<text>", "E<id>:<data>"): bus load, firmware text, error reports
@@ -424,21 +364,10 @@ class Device {
             return;
         }
 
-        // Protocol: forced by the page or chosen from the USB ids; the endpoint layout depends on it
-        const protocol = (m.protocol === PROTO_GS || m.protocol === PROTO_PCAN) ? m.protocol : detectProtocol(d.vendorId, d.productId);
-        let layout, info = '', text;
-        if (protocol === PROTO_PCAN) {
-            const hs = await pcanHandshake(d);
-            layout = { rxEp: hs.layout.rxEp, txEp: hs.layout.txEp, cmdEp: hs.layout.cmdOut, rxSize: PCAN_RX_SIZE };
-            info = hs.info;
-            text = describeEndpoints(d) || ('CMD OUT ' + hs.layout.cmdOut + ', CMD IN ' + hs.layout.cmdIn + ', MSG IN ' + hs.layout.rxEp + ', MSG OUT ' + hs.layout.txEp);
-        } else {
-            const ep = inspectEndpoints(d);
-            // 2048 bytes: the biggest transfer of the Elmue protocol (a blob of several frames); a legacy adapter simply
-            // ends its transfers early. The page asks for the same size when it starts an Elmue channel, so no re-claim is needed.
-            layout = { rxEp: ep.rxEp, txEp: ep.txEp, cmdEp: 0, rxSize: Math.max(GS_RX_SIZE, ep.rxSize) };
-            text = ep.text;
-        }
+        // The endpoint layout (and, for PEAK, the firmware info) depends on the protocol of this class
+        const protocol = this.protocolId;
+        const hs = await this.handshake(d);
+        const layout = hs.layout, info = hs.info, text = hs.text;
 
         this.protocol = protocol;
         this.usb = d;
@@ -485,8 +414,7 @@ class Device {
         this.usb = null;
         this.rxGen++;
         this.rxEnabled = false;
-        this.elmue = false;
-        this.stopSync();
+        this.onTeardown();
         this.txQueue = [];
         this.txHead = 0;
         updateTimers();
@@ -636,23 +564,18 @@ class Device {
         if (!enable) {
             processStage();                 // everything received before the stop still counts
             this.rxEnabled = false;
-            this.stopSync();
+            this.onRxStopped();
             return;
         }
         if (!this.rxEnabled && core) {
             core._core_reset_clock(this.dev);       // new channel start: adapter clock may restart
             this.syncTotal = 0;
-            if (this.protocol === PROTO_GS) {
-                // gs_usb: the page says whether the channel runs in Elmue mode (compact messages) and with timestamps
-                this.elmue = !!m.elmue;
-                if (this.elmue) core._core_set_elmue(this.dev, m.ts ? 1 : 0);
-                else core._core_set_protocol(this.dev, PROTO_GS);
-            }
+            this.onRxEnable(m);                     // e.g. gs_usb: the channel runs in Elmue mode and with timestamps
             core._core_reset_stream(this.dev);      // and the record stream starts at a record boundary
         }
         this.rxEnabled = true;
         if (!this.usb) return;
-        if (this.protocol === PROTO_GS && m.ts) this.startSync();
+        this.onRxStarted(m);
         const ep = m.ep ? (m.ep & 0x7F) : this.rxEp;
         const size = Math.max(64, Math.min(m.size | 0 || this.rxSize, 16384));
         if (ep !== this.rxEp || size !== this.rxSize) {
@@ -675,8 +598,7 @@ class Device {
 
     enqueueTx(data, ep) {
         if (!this.usb || this.txQueue.length - this.txHead >= TX_QUEUE_MAX) { this.st.txDropped++; return; }
-        // Elmue echoes only carry a marker: the core keeps the frame until its echo arrives
-        if (this.elmue && this.rxEnabled && core) stageBytes(this.dev, ep ? (ep & 0x7F) : this.txEp, new Uint8Array(data), now());
+        this.onTx(data, ep);
         this.txQueue.push({ data: data, ep: ep ? (ep & 0x7F) : this.txEp });
         this.pumpTx();
     }
@@ -724,10 +646,8 @@ class Device {
         const d = this.usb;
         this.pingBusy = true;
         try {
-            // A harmless read the adapter has to answer: gs_usb bit-timing constants, PCAN firmware info
-            const probe = this.protocol === PROTO_PCAN
-                ? [{ requestType: 'vendor', recipient: 'other', request: PCAN_VREQ_INFO, value: PCAN_VREQ_INFO_FIRMWARE, index: 0 }, 36]
-                : [{ requestType: 'vendor', recipient: 'interface', request: GS_USB_BREQ_BT_CONST, value: 0, index: IFACE }, 40];
+            // A harmless read the adapter has to answer (gs_usb: bit-timing constants, PCAN: firmware info)
+            const probe = this.probeRequest();
             const r = await withTimeout(d.controlTransferIn(probe[0], probe[1]), PING_TIMEOUT_MS, 'liveness probe timeout');
             if (r.status !== 'ok') throw new Error('liveness probe status ' + r.status);
             this.pingFails = 0;
@@ -741,6 +661,141 @@ class Device {
             }
         } finally {
             this.pingBusy = false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// gs_usb (candleLight / CANable) in its legacy and in the ElmueSoft protocol: configured with vendor control requests, one frame per
+// bulk transfer (Elmue: several messages). While a channel runs with adapter timestamps the worker reads the adapter's clock once a second.
+// ---------------------------------------------------------------------------------------------
+
+class GsUsbDevice extends Device {
+    constructor(dev) {
+        super(dev);
+        this.elmue = false;             // the channel runs in Elmue mode: the core needs the transmitted frames to resolve the tx echoes
+
+        // Clock synchronisation (GS_USB_BREQ_TIMESTAMP)
+        this.syncOn = false;
+        this.syncTimer = 0;
+        this.syncFails = 0;
+        this.syncCount = 0;
+    }
+
+    get protocolId() { return PROTO_GS; }
+
+    async handshake(usb) {
+        const ep = inspectEndpoints(usb);
+        // 2048 bytes: the biggest transfer of the Elmue protocol (a blob of several frames); a legacy adapter simply
+        // ends its transfers early. The page asks for the same size when it starts an Elmue channel, so no re-claim is needed.
+        return { layout: { rxEp: ep.rxEp, txEp: ep.txEp, cmdEp: 0, rxSize: Math.max(GS_RX_SIZE, ep.rxSize) }, info: '', text: ep.text };
+    }
+
+    probeRequest() {
+        return [{ requestType: 'vendor', recipient: 'interface', request: GS_USB_BREQ_BT_CONST, value: 0, index: IFACE }, 40];
+    }
+
+    // The page says whether the channel runs in Elmue mode (compact messages) and with timestamps
+    onRxEnable(m) {
+        this.elmue = !!m.elmue;
+        if (this.elmue) core._core_set_elmue(this.dev, m.ts ? 1 : 0);
+        else core._core_set_protocol(this.dev, PROTO_GS);
+    }
+
+    onRxStarted(m) { if (m.ts) this.startSync(); }
+    onRxStopped() { this.stopSync(); }
+    onTeardown() { this.elmue = false; this.stopSync(); }
+
+    // Elmue echoes only carry a marker: the core keeps the frame until its echo arrives
+    onTx(data, ep) {
+        if (this.elmue && this.rxEnabled && core) stageBytes(this.dev, ep ? (ep & 0x7F) : this.txEp, new Uint8Array(data), now());
+    }
+
+    drainAux() { if (this.elmue) this.drainEvents(); }
+
+    // -----------------------------------------------------------------------------------------
+    // Clock synchronisation: the adapter's timestamp is read with a control transfer; the round trip brackets the moment
+    // the adapter latched it, so the middle of it is the page time of the sample (the core filters by round trip)
+    // -----------------------------------------------------------------------------------------
+
+    startSync() {
+        if (this.syncOn) return;
+        this.syncOn = true;
+        this.syncFails = 0;
+        this.syncCount = 0;
+        this.scheduleSync(SYNC_FIRST_MS);
+    }
+
+    stopSync() {
+        this.syncOn = false;
+        clearTimeout(this.syncTimer);
+        this.syncTimer = 0;
+    }
+
+    scheduleSync(ms) {
+        clearTimeout(this.syncTimer);
+        // queued behind the control transfers that are still waiting (the channel start), like every control transfer
+        this.syncTimer = setTimeout(() => { if (this.syncOn && this.usb) this.enqueue(() => this.syncOnce()); }, ms);
+    }
+
+    async syncOnce() {
+        const d = this.usb;
+        if (!this.syncOn || !d || !core) return;
+        let ok = false;
+        try {
+            const setup = { requestType: 'vendor', recipient: 'interface', request: GS_USB_BREQ_TIMESTAMP, value: 0, index: IFACE };
+            const t0 = now();
+            const r = await withTimeout(d.controlTransferIn(setup, 4), PING_TIMEOUT_MS, 'clock sample timeout');
+            const t1 = now();
+            if (r.status === 'ok' && r.data && r.data.byteLength >= 4 && this.syncOn && this.usb === d) {
+                processStage();             // frames received so far are mapped with the estimate they were received under
+                core._core_clock_sample(this.dev, r.data.getUint32(0, true), (t0 + t1) / 2, t1 - t0);
+                this.lastPingOk = performance.now();     // the control pipe answered: no liveness probe needed
+                this.postSync();
+                ok = true;
+            }
+        } catch (err) {
+            if (this.usb === d && isGone(err)) { this.lost(errText(err)); return; }
+        }
+        if (!this.syncOn) return;
+        if (ok) {
+            this.syncFails = 0;
+        } else if (++this.syncFails >= SYNC_FAILS_MAX) {
+            console.warn('[usb_worker] dev ' + this.dev + ' does not answer the clock request, synchronisation stopped');
+            this.syncOn = false;
+            return;
+        }
+        this.syncCount++;
+        this.scheduleSync(this.syncCount < SYNC_BURST ? SYNC_BURST_MS : SYNC_MS);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// PEAK PCAN-USB FD (uCAN): commands are bulk OUT transfers, frames and reports are records on a shared bulk IN endpoint. The adapter
+// pushes calibration records (its clock), whose statistics are posted when a new one arrived.
+// ---------------------------------------------------------------------------------------------
+
+class PcanDevice extends Device {
+    get protocolId() { return PROTO_PCAN; }
+
+    async handshake(usb) {
+        const hs = await pcanHandshake(usb);
+        return {
+            layout: { rxEp: hs.layout.rxEp, txEp: hs.layout.txEp, cmdEp: hs.layout.cmdOut, rxSize: PCAN_RX_SIZE },
+            info: hs.info,
+            text: describeEndpoints(usb) || ('CMD OUT ' + hs.layout.cmdOut + ', CMD IN ' + hs.layout.cmdIn + ', MSG IN ' + hs.layout.rxEp + ', MSG OUT ' + hs.layout.txEp)
+        };
+    }
+
+    probeRequest() {
+        return [{ requestType: 'vendor', recipient: 'other', request: PCAN_VREQ_INFO, value: PCAN_VREQ_INFO_FIRMWARE, index: 0 }, 36];
+    }
+
+    drainAux() {
+        this.drainEvents();
+        if (this.rxEnabled) {
+            const ptr = core._core_clock_stats(this.dev);
+            if (new Float64Array(core.HEAPU8.buffer, ptr, 1)[0] !== this.syncTotal) this.postSync();
         }
     }
 }
@@ -1003,7 +1058,7 @@ function processStage() {
         // serial adapters: the lines that were not frames are answers to commands
         for (const d of devices) {
             if (d instanceof SerialDevice) { if (d.isOpen) d.drainReplies(); }
-            else if (d && d.usb && (d.elmue || d.protocol === PROTO_PCAN)) d.drainAux();
+            else if (d && d.usb) d.drainAux();
         }
     }
 }
@@ -1062,13 +1117,15 @@ self.onmessage = (ev) => {
     let d = devices[n];
 
     if (m.type === 'open') {
-        // A slot is either a USB adapter or a serial port; reusing it for the other kind replaces the context
-        const serial = m.transport === 'serial';
-        if (d && (d instanceof SerialDevice) !== serial) {
+        // A slot is a PEAK adapter, another USB adapter (gs_usb) or a serial port, each with a context class of its own; reusing
+        // the slot for another kind replaces the context. The protocol is forced by the page or chosen from the USB ids.
+        const Kind = m.transport === 'serial' ? SerialDevice
+            : ((m.protocol === PROTO_PCAN || (m.protocol !== PROTO_GS && detectProtocol(m.vid, m.pid) === PROTO_PCAN)) ? PcanDevice : GsUsbDevice);
+        if (d && d.constructor !== Kind) {
             d.close(null, true);
             d = devices[n] = null;
         }
-        if (!d) d = devices[n] = serial ? new SerialDevice(n) : new Device(n);
+        if (!d) d = devices[n] = new Kind(n);
         d.enqueue(() => d.open(m));
         return;
     }
