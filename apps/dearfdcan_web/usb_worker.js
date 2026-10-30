@@ -212,6 +212,19 @@ class Device extends UsbPort {
     }
     onLost(reason) { this.post('closed', { reason: reason }); }
 
+    // The warnings and errors of the transport go to the page's event log (the console is gone when it was not open). At most a burst of
+    // 10 lines and then 2 per second per adapter, so a failure that repeats cannot flood the page.
+    onLog(level, text) {
+        const t = performance.now();
+        this.logBudget = Math.min(10, (this.logBudget === undefined ? 10 : this.logBudget) + (t - (this.logAt || t)) / 500);
+        this.logAt = t;
+        if (this.logBudget < 1) { this.logDropped = (this.logDropped || 0) + 1; return; }
+        this.logBudget -= 1;
+        const dropped = this.logDropped || 0;
+        this.logDropped = 0;
+        this.post('log', { level: level, text: dropped ? text + ' (' + dropped + ' lines before were left out)' : text });
+    }
+
     // Copy one completed transfer into the core's staging buffer as [u16 len][u8 dev][u8 ep][f64 time][bytes]
     onRxData(dv) {
         if (!this.rxEnabled || !core) return;
@@ -254,7 +267,7 @@ class Device extends UsbPort {
         try {
             hs = await this.openDevice({ vid: m.vid, pid: m.pid, serial: m.serial }, usb => this.handshake(usb));
         } catch (err) {
-            console.error('[usb_worker] dev ' + this.dev + ' open failed:', err);
+            this.error('open failed:', err);
             this.post('closed', { reason: 'open failed: ' + errText(err) });
             return;
         }
@@ -433,7 +446,7 @@ class GsUsbDevice extends Device {
         if (ok) {
             this.syncFails = 0;
         } else if (++this.syncFails >= SYNC_FAILS_MAX) {
-            console.warn('[usb_worker] dev ' + this.dev + ' does not answer the clock request, synchronisation stopped');
+            this.warn('does not answer the clock request, synchronisation stopped');
             this.syncOn = false;
             return;
         }

@@ -171,6 +171,10 @@ int main(int, char**) {
         g_AppUI.OnAdapterEvents(dev, lines);
     });
 
+    webusb.SetOnLog([](int dev, int level, const std::string& text) {
+        g_AppUI.OnLog(dev, level, text);
+    });
+
     webusb.SetOnSnapshot([](const SnapshotView& snapshot) {
         g_AppUI.OnSnapshot(snapshot);
     });

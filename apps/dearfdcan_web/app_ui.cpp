@@ -395,6 +395,7 @@ void AppUI::OnDeviceOpened(int dev, const DeviceOpenInfo& open) {
     // adapter what it is (gs_usb: constants and description, SLCAN: 'V'; PEAK: the worker read the firmware info already).
     if (!d.adapter || d.adapter->Protocol() != open.protocol) CreateDriver(dev, open.protocol);
     d.adapter->OnOpened(open);
+    AddLog(0, dev, std::string("opened (") + CanProtocolName(open.protocol) + (open.endpoints.empty() ? "" : ", " + open.endpoints) + ")");
 }
 
 void AppUI::OnDeviceClosed(int dev, const std::string& reason) {
@@ -407,6 +408,120 @@ void AppUI::OnDeviceClosed(int dev, const std::string& reason) {
     d.elmue_active = false;
     d.hw_timestamps_active = false;
     d.status = (reason == "closed by host") ? std::string() : reason;
+    if (reason == "closed by host") AddLog(0, dev, "closed");
+    else AddLog(reason.empty() ? 0 : 2, dev, reason.empty() ? std::string("closed") : "closed: " + reason);
+}
+
+// ----------------------------------------------------------------------------
+// Event log
+// ----------------------------------------------------------------------------
+
+static constexpr size_t kLogMaxLines = 600;
+static constexpr size_t kLogMaxText = 400;
+static const char* kLogStorageKey = "dearfdcan.log";
+
+EM_JS(void, js_log_store, (const char* key, const char* text), {
+    try { localStorage.setItem(UTF8ToString(key), UTF8ToString(text)); } catch (e) { /* storage blocked or full */ }
+});
+
+EM_JS(int, js_log_load, (const char* key, char* out, int size), {
+    try {
+        const s = localStorage.getItem(UTF8ToString(key));
+        if (!s) return 0;
+        stringToUTF8(s, out, size);
+        return 1;
+    } catch (e) { return 0; }
+});
+
+EM_JS(void, js_log_time, (char* out, int size), {
+    const d = new Date();
+    const p = (n, w) => String(n).padStart(w, '0');
+    stringToUTF8(p(d.getHours(), 2) + ':' + p(d.getMinutes(), 2) + ':' + p(d.getSeconds(), 2) + '.' + p(d.getMilliseconds(), 3), out, size);
+});
+
+void AppUI::AddLog(int level, int dev, const std::string& text) {
+    char stamp[24] = "";
+    js_log_time(stamp, sizeof(stamp));
+    std::string line = stamp;
+    line += "  ";
+    if (ValidDevice(dev)) line += "dev " + std::to_string(dev + 1) + ": ";
+    line += text.size() > kLogMaxText ? text.substr(0, kLogMaxText) + "..." : text;
+    log_.push_back({level, line});
+    while (log_.size() > kLogMaxLines) log_.pop_front();
+    log_dirty_ = true;
+}
+
+void AppUI::OnLog(int dev, int level, const std::string& text) {
+    AddLog(level >= 2 ? 2 : 1, dev, text);
+}
+
+// The log as text: one line per entry, "<level>|<line>"; stored at most once a second
+void AppUI::SaveLog() {
+    std::string all;
+    for (const LogLine& l : log_) {
+        if (l.level < 0) continue;                        // markers
+        all += static_cast<char>('0' + l.level);
+        all += '|';
+        all += l.text;
+        all += '\n';
+    }
+    js_log_store(kLogStorageKey, all.c_str());
+    log_dirty_ = false;
+}
+
+void AppUI::LoadLog() {
+    log_loaded_ = true;
+    static char buf[1 << 18];
+    buf[0] = '\0';
+    if (!js_log_load(kLogStorageKey, buf, sizeof(buf))) return;
+    std::deque<LogLine> previous;
+    const char* p = buf;
+    while (*p) {
+        const char* end = std::strchr(p, '\n');
+        const size_t n = end ? static_cast<size_t>(end - p) : std::strlen(p);
+        if (n >= 3 && p[1] == '|' && p[0] >= '0' && p[0] <= '2') previous.push_back({p[0] - '0', std::string(p + 2, n - 2)});
+        if (!end) break;
+        p = end + 1;
+    }
+    if (previous.empty()) return;
+    previous.push_back({-1, "---- the lines above are from the previous session ----"});
+    log_.insert(log_.begin(), previous.begin(), previous.end());
+    while (log_.size() > kLogMaxLines) log_.pop_front();
+}
+
+void AppUI::RenderLogWindow() {
+    ImGui::SetNextWindowSize(ImVec2(760, 280), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(60, 120), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("6. Event log", &show_log_window_)) {
+        ImGui::End();
+        return;
+    }
+    if (ImGui::Button("Copy all")) {
+        std::string all;
+        for (const LogLine& l : log_) { all += l.text; all += '\n'; }
+        ImGui::SetClipboardText(all.c_str());
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear")) {
+        log_.clear();
+        log_dirty_ = true;
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("Follow", &log_autoscroll_);
+    ImGui::SameLine();
+    ImGui::TextDisabled("%zu lines, kept in this browser; lines before the dashes are from the previous session", log_.size());
+
+    ImGui::BeginChild("##logtext", ImVec2(0, 0), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar);
+    for (const LogLine& l : log_) {
+        if (l.level == 2)      ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.40f, 1.0f));
+        else if (l.level == 1) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.35f, 1.0f));
+        else if (l.level < 0)  ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextUnformatted(l.text.c_str());
+        if (l.level != 0) ImGui::PopStyleColor();
+    }
+    if (log_autoscroll_ && (ImGui::IsWindowAppearing() || ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f)) ImGui::SetScrollHereY(1.0f);
+    ImGui::EndChild();
+    ImGui::End();
 }
 
 // Bus load / error / state / text lines of the worker core (Elmue protocol, PEAK)
@@ -418,6 +533,7 @@ void AppUI::OnAdapterEvents(int dev, const std::string& lines) {
 void AppUI::OnNotice(const std::string& text) {
     notice_ = text;
     notice_time_ms_ = GetNowMs();
+    AddLog(1, -1, text);
 }
 
 void AppUI::OnControlDataReceived(int dev, uint8_t request, const uint8_t* data, int length) {
@@ -429,7 +545,10 @@ void AppUI::OnControlDataReceived(int dev, uint8_t request, const uint8_t* data,
 // sequence was acknowledged; any failure of the start sequence rolls it back (see can_adapter.cpp).
 void AppUI::OnControlOutDone(int dev, int request, bool ok) {
     if (!ValidDevice(dev) || !devices_[dev].used) return;
-    if (devices_[dev].adapter) devices_[dev].adapter->OnControlOutDone(request, ok);
+    if (!devices_[dev].adapter) return;
+    const bool was_open = devices_[dev].channel_open;
+    devices_[dev].adapter->OnControlOutDone(request, ok);
+    if (!was_open && devices_[dev].channel_open) AddLog(0, dev, "BUS ON");
 }
 
 // The worker core owns parsing, per-ID aggregation (count, cycle time from adapter timestamps) and
@@ -460,6 +579,7 @@ void AppUI::StartCanChannel(int dev) {
     DeviceSlot& d = devices_[dev];
     if (!d.used || !d.connected || d.channel_opening || d.channel_open || !d.adapter) return;
     d.adapter->Start();      // the sequence and the receive pump; the channel is open when the driver saw the last acknowledgement
+    AddLog(0, dev, d.channel_opening ? "start sequence sent" : "start refused");
 }
 
 // 120 ohm termination resistor of the adapter (GS_CAN_FEATURE_TERMINATION): switched at once, and again at every channel start
@@ -472,6 +592,7 @@ void AppUI::SetTermination(int dev, bool on) {
 void AppUI::StopCanChannel(int dev) {
     if (!ValidDevice(dev) || !devices_[dev].adapter) return;
     devices_[dev].adapter->Stop();
+    AddLog(0, dev, "BUS OFF");
 }
 
 // Closes the adapter, forgets its slot and everything that referred to it
@@ -636,6 +757,7 @@ float AppUI::RenderMenuBar() {
             ImGui::MenuItem("1. Devices & Bit-Timing Setup", nullptr, &show_hw_window_);
             ImGui::MenuItem("2. Receive Table by ID (Grouped Monitor)", nullptr, &show_id_table_window_);
             ImGui::MenuItem("3. Receive Trace (Chronological Stream)", nullptr, &show_trace_window_);
+            ImGui::MenuItem("6. Event log (connections, losses, errors)", nullptr, &show_log_window_);
             ImGui::MenuItem("4. Transmit Frame & Periodic Jobs", nullptr, &show_tx_window_);
             ImGui::MenuItem("5. Sent Messages History", nullptr, &show_history_window_);
             ImGui::EndMenu();
@@ -1828,6 +1950,8 @@ void AppUI::RenderSentHistoryWindow(float x, float y, float w, float h) {
 // ============================================================================
 void AppUI::Render() {
     double now_ms = GetNowMs();
+    if (!log_loaded_) LoadLog();
+    if (log_dirty_ && now_ms - log_saved_ms_ >= 1000.0) { log_saved_ms_ = now_ms; SaveLog(); }
 
     // 1. Execute periodic CAN transmissions scheduled by user
     ProcessPeriodicJobs(now_ms);
@@ -1859,5 +1983,6 @@ void AppUI::Render() {
     if (show_id_table_window_) RenderIdTableWindow(now_ms, x_right, y1, right_w, row1_h);
     if (show_tx_window_)       RenderTransmitWindow(now_ms, x_left, y2, left_w, row2_h);
     if (show_trace_window_)    RenderTraceWindow(x_right, y2, right_w, row2_h);
+    if (show_log_window_)      RenderLogWindow();
     if (show_history_window_)  RenderSentHistoryWindow(x_left, y3, usable_w + pad, row3_h);
 }

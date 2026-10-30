@@ -224,6 +224,14 @@ grew to 57 checks). Test: `libs/emscripten-webusb/test` links a C program with t
 receive with a 20 kB transfer and stop, unplug and reopen, close during open); CMake target `run_test_webusb`, run by `make test`. **Not
 verified: a real browser or a real device.**
 
+**2026-10-30, lost device after start, event log** (`webusb_io.js`, `usb_worker.js`, `webusb_bridge.*`, `app_ui.*`). On real hardware a device was
+reported lost ("device 1 lost, worker 2 disconnect") shortly after use and the log was gone. Likely cause (a hypothesis: there was no log to
+confirm it): while the port recovers from receive errors it releases and re-claims the interface, and a transfer issued in that window fails
+with `InvalidStateError`, which was taken for an unplug. Now transfers wait for the recovery (`waitRecovery`), the TX pump does not run during
+it, gone-errors in that window do not declare the device lost, and a failed recovery is reported as such. New regression test in
+`test_webusb_io` (65 checks; fails against the old behaviour). The transport's warnings and errors now travel to the page (`log` message,
+rate limited) and, with connections, BUS ON/OFF and losses with their reasons, go to a persistent **Event log** window. Not verified on hardware.
+
 ## Verified overall
 
 The CAN core, frame parser and URL parsing were unit-tested natively (ASan/UBSan) and the worker was exercised against mock devices with the

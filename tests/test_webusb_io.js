@@ -335,7 +335,67 @@ async function testDirectAndOnDemand() {
     check(done.join() === 'atrue,bfalse,dfalse,ctrue', 'the one in flight reports when the browser completes it (' + done + ')');
 }
 
+// While the interface is released and claimed again the browser refuses every transfer with InvalidStateError, which looks like an
+// unplugged adapter. Transfers started in that window must wait for its end and must not end the session.
+async function testRecoveryWindow() {
+    const invalid = () => Object.assign(new Error('An operation that changes interface state is in progress.'), { name: 'InvalidStateError' });
+    const u = mockUsb(); installUsb([u]);
+    let busy = false;
+    u.releaseInterface = async () => { busy = true; u.released++; u.rxWaiters = []; await sleep(25); };
+    const claim = u.claimInterface.bind(u);
+    u.claimInterface = async (n) => { await sleep(25); await claim(n); busy = false; };
+    for (const name of ['transferOut', 'controlTransferIn', 'controlTransferOut']) {
+        const real = u[name].bind(u);
+        u[name] = async (...a) => { if (busy) throw invalid(); return real(...a); };
+    }
+    const realIn = u.transferIn.bind(u);
+    u.transferIn = (ep, len) => (busy ? Promise.reject(invalid()) : realIn(ep, len));
+
+    const p = new TestPort('window', { txInflight: 2 });
+    await p.openDevice({ vid: u.vendorId, pid: u.productId }, handshake);
+    p.events.length = 0;
+
+    p.reconfigureRx(6, 512);                                    // starts the recovery
+    check(p.recovering, 'the recovery is running');
+    const accepted = [1, 2, 3].map(i => p.enqueueTx(new Uint8Array([i]).buffer));
+    const ctl = p.controlTransfer(false, { requestType: 'vendor', recipient: 'interface', request: 6, value: 0, index: 0 }, 4);
+    const cmd = p.commandTransfer(1, new Uint8Array(2), 'id 9');
+    await sleep(15);
+    check(u.outs.length === 0 && u.ctrl.length === 0, 'nothing is sent while the interface is being re-claimed');
+    const [rc, rm] = await Promise.all([ctl, cmd]);
+    await sleep(20);
+    check(p.usb && !p.events.some(x => x.startsWith('lost:')), 'the session survives transfers started during the recovery (' + p.events.join() + ')');
+    check(rc.ok && rm.ok && u.ctrl.length === 1, 'a control transfer and a command that were started meanwhile ran afterwards');
+    check(accepted.every(Boolean) && u.outs.length === 3 + 1 && p.st.recoveries === 1 && u.rxWaiters.length === 3 && u.rxWaiters[0].ep === 6, 'the queued transmits went out afterwards, receiving continues on the new endpoint');
+
+    // a refusal that does arrive during the recovery (a transfer already on its way) is an ordinary failure
+    p.reconfigureRx(3, 512);
+    const early = p.controlTransfer(true, { requestType: 'vendor', recipient: 'interface', request: 1, value: 0, index: 0 }, new Uint8Array(1));
+    await sleep(60);
+    check((await early).ok && p.usb, 'a control transfer queued behind a second recovery succeeds too');
+
+    // an adapter that really goes away during the recovery ends the session
+    const v = mockUsb(); installUsb([v]);
+    v.releaseInterface = async () => { throw Object.assign(new Error('The device was disconnected.'), { name: 'NotFoundError' }); };
+    const q = new TestPort('gone');
+    await q.openDevice({ vid: v.vendorId, pid: v.productId }, handshake);
+    q.events.length = 0;
+    q.reconfigureRx(6, 512);
+    await sleep(20);
+    check(!q.usb && q.events.some(x => x.startsWith('lost:recovery failed')), 'an unplug during the recovery is a loss (' + q.events.join() + ')');
+
+    // log lines reach the owner
+    const w = mockUsb(); installUsb([w]);
+    const lines = [];
+    const r = new TestPort('log'); r.onLog = (level, text) => lines.push(level + ':' + text);
+    await r.openDevice({ vid: w.vendorId, pid: w.productId }, handshake);
+    w.ctrlBehavior = async () => { throw Object.assign(new Error('A transfer error has occurred.'), { name: 'NetworkError' }); };
+    await r.controlTransfer(false, { requestType: 'vendor', recipient: 'interface', request: 1, value: 0, index: 0 }, 4);
+    check(lines.length === 1 && lines[0] === 'error:control transfer failed: NetworkError: A transfer error has occurred.', 'warnings and errors go to onLog (' + lines + ')');
+}
+
 (async () => {
+    await testRecoveryWindow();
     await testDirectAndOnDemand();
     await testMatchingAndOpen();
     await testReceive();

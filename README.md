@@ -33,6 +33,9 @@ available in Firefox/Safari) and talks to the adapter directly, no driver or nat
 - **Receive Table by ID**: one row per device and ID with count, cycle time (min/max kept internally), changed bytes highlighted,
   sortable columns, `Dev` column and a device filter.
 - **Receive Trace**: chronological list with `Dev` column, filter by ID and by device, pause, auto-scroll.
+- **Event log** (View menu, "6. Event log"): connections, BUS ON/OFF, device losses with the reason, warnings and errors of the USB transport.
+  It is kept in the browser's `localStorage` (600 lines), so the lines of the previous session can be read after a reload; **Copy all**
+  puts the text on the clipboard.
 - **Transmit**: composer, burst, periodic jobs with optional auto-increment byte, history of sent frames; the target is one
   adapter or all adapters that are BUS ON, and jobs and history entries remember it.
 - Bit timing: automatic BRP/segment calculation from the adapter clock for a target bit rate and sample point (nominal and data phase), manual override.

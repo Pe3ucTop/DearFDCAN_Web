@@ -45,6 +45,7 @@ workers.
 | `ctrl_in` | `dev, epoch, request, data` | The bytes of a control IN (or the text line of the SLCAN version command). |
 | `ctrl_ack` | `dev, epoch, request, ok` | A control OUT or command finished (`request` as in §1). A command that is still waiting when the connection ends is answered with `ok: false`. |
 | `stats` | `dev, epoch, rxPerSec, txDropped, recoveries, rxErrors, txErrors` | Once a second while the adapter is open. |
+| `log` | `dev, level, text` | A warning (`level` 1) or an error (2) of the USB transport that is not a state change (a failed transfer, a recovery, a stopped synchronisation). Rate limited in the worker (a burst of 10, then about 2 a second, with a note of the dropped count); the page keeps them in its event log. |
 | `sync` | `dev, epoch, s` | Statistics of the clock samples of the adapter, 9 numbers: samples, good samples, offset (ms), drift (ppm, + = the adapter runs fast), spread (rms µs), shortest round trip (ms), last round trip (ms), worst deviation (µs), 1 = the samples are records the adapter pushes (PEAK; the "round trip" is then the delay above the lowest). gs_usb: after every answered `GS_USB_BREQ_TIMESTAMP`; PEAK: when a calibration record arrived. |
 | `events` | `dev, epoch, text` | Lines the core collected besides frames, `\n` separated: `U<percent>` bus load, `S<0..3>` bus state, `T<text>` text of the firmware, `E<id 8 hex>:<data 16 hex>` an error report. Elmue adapters and PEAK. |
 

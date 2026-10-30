@@ -29,11 +29,11 @@ target_link_libraries(page_objs PUBLIC can_adapters can_engine imgui_objs PRIVAT
 
 set(PAGE_EXPORTS
     _main _malloc _free _webusb_cb_device_added _webusb_cb_device_opened _webusb_cb_device_closed _webusb_cb_message
-    _webusb_cb_snapshot _webusb_cb_ctrl_in _webusb_cb_ctrl_ack _webusb_cb_stats _webusb_cb_sync _webusb_cb_events)
+    _webusb_cb_snapshot _webusb_cb_ctrl_in _webusb_cb_ctrl_ack _webusb_cb_stats _webusb_cb_sync _webusb_cb_events _webusb_cb_log)
 list(JOIN PAGE_EXPORTS "," PAGE_EXPORTS_ARG)
 set(PAGE_LINK_OPTIONS
     -sUSE_GLFW=3 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2
-    -sEXPORTED_RUNTIME_METHODS=stringToUTF8,lengthBytesUTF8
+    -sEXPORTED_RUNTIME_METHODS=stringToUTF8,lengthBytesUTF8,UTF8ToString
     -sEXPORTED_FUNCTIONS=${PAGE_EXPORTS_ARG})
 
 # --- the CAN worker module: can-engine + can-protocols as WebAssembly ---

@@ -20,6 +20,7 @@
 //   onRecovered()                the interface was claimed again after an error; the pending transfers were aborted
 //   beforeTeardown() / afterTeardown()   around the end of a session (closed by the owner, or lost)
 //   onLost(reason)               the session ended because of the adapter (unplugged, failed recovery, ...), after the teardown
+//   onLog(level, text)           a warning or error the port logged ('warn' / 'error'); it also goes to the console
 //   probeRequest()               a harmless control read the adapter has to answer: [setup, length], or null for no probe
 //
 // Loaded as a classic script (importScripts or a <script>); the one global it defines is WebUsbIo.
@@ -125,6 +126,7 @@ class UsbPort {
         this.rxSize = this.opt.defaultRxSize;
         this.slotErr = new Array(this.opt.rxSlots).fill(0);
         this.recovering = false;
+        this.recoveryDone = null;           // a promise while the interface is being released and claimed again
 
         this.txQueue = [];
         this.txHead = 0;
@@ -150,8 +152,14 @@ class UsbPort {
 
     get isOpen() { return !!this.usb; }
 
-    warn(...args) { console.warn('[' + this.opt.tag + '] ' + this.label, ...args); }
-    error(...args) { console.error('[' + this.opt.tag + '] ' + this.label, ...args); }
+    // Log lines go to the console and to onLog(level, text), where the owner can keep them (a console that was not open is lost)
+    warn(...args) { this.logLine('warn', args); }
+    error(...args) { this.logLine('error', args); }
+    logLine(level, args) {
+        console[level]('[' + this.opt.tag + '] ' + this.label, ...args);
+        try { this.onLog(level, args.map(a => (a instanceof Error ? (a.name ? a.name + ': ' : '') + a.message : String(a))).join(' ')); } catch (e) { /* the owner's problem */ }
+    }
+    onLog(level, text) {}
 
     // Runs `fn` after the commands enqueued before it; a failing command is logged and does not stop the chain
     enqueue(fn) {
@@ -254,6 +262,7 @@ class UsbPort {
     // Resolves { ok, data }: data is an ArrayBuffer with the bytes of a successful IN (null for OUT, for no data and for a failure).
     // Never rejects; a lost adapter ends the session.
     async controlTransfer(isOut, setup, payload) {
+        await this.waitRecovery();
         const d = this.usb;
         if (!d) return { ok: false, data: null };
         const ms = this.opt.ctrlTimeoutMs;
@@ -268,13 +277,21 @@ class UsbPort {
             return { ok: r.status === 'ok', data: data };
         } catch (err) {
             this.error('control transfer failed:', err);
-            if (this.usb === d && isGone(err)) this.lost(errText(err));
+            if (this.usb === d && isGone(err) && !this.recovering) this.lost(errText(err));
             return { ok: false, data: null };
         }
     }
 
+    // While the interface is released and claimed again (recover), the browser refuses every transfer with InvalidStateError, which
+    // looks exactly like an unplugged adapter. Transfers that are started in that window wait for its end, and a refusal that arrives
+    // during it is an ordinary failure, not a loss (a really unplugged adapter makes the recovery itself fail).
+    async waitRecovery() {
+        while (this.recoveryDone) await this.recoveryDone;
+    }
+
     // A bulk OUT transfer that is ordered with the control transfers (a command endpoint). `what` names it in messages.
     async commandTransfer(ep, data, what) {
+        await this.waitRecovery();
         const d = this.usb;
         if (!d) return { ok: false };
         try {
@@ -282,7 +299,7 @@ class UsbPort {
             return { ok: r.status === 'ok' };
         } catch (err) {
             this.error('command transfer failed:', err);
-            if (this.usb === d && isGone(err)) this.lost(errText(err));
+            if (this.usb === d && isGone(err) && !this.recovering) this.lost(errText(err));
             return { ok: false };
         }
     }
@@ -376,6 +393,8 @@ class UsbPort {
         this.st.recoveries++;
         this.warn('recovering:', reason);
         const gen = ++this.rxGen;
+        let finish;
+        this.recoveryDone = new Promise(res => { finish = res; });
         try {
             await d.releaseInterface(this.opt.iface);
             await d.claimInterface(this.opt.iface);
@@ -386,9 +405,12 @@ class UsbPort {
             this.onRecovered();
             for (let i = 0; i < this.opt.rxSlots; i++) this.submitRx(i, gen);
         } catch (err) {
-            if (this.usb === d) this.lost('recovery failed: ' + errText(err));
+            if (this.usb === d) { this.recovering = false; this.lost('recovery failed: ' + errText(err)); }
         } finally {
             this.recovering = false;
+            this.recoveryDone = null;
+            finish();
+            if (this.usb === d) this.pumpTx();          // what was queued during the recovery goes out now
         }
     }
 
@@ -424,6 +446,7 @@ class UsbPort {
 
     pumpTx() {
         if (this.txHead === this.txQueue.length) { this.txQueue.length = 0; this.txHead = 0; }
+        if (this.recovering) return;                // the browser refuses transfers meanwhile; recover() pumps again when it is done
         const d = this.usb;
         while (d && this.txInflight < this.opt.txInflight && this.txHead < this.txQueue.length) {
             const item = this.txQueue[this.txHead++];
@@ -440,7 +463,7 @@ class UsbPort {
             }).catch(err => {
                 ok = false;
                 this.st.txErrors++;
-                if (this.usb === d && isGone(err)) this.lost(errText(err));
+                if (this.usb === d && isGone(err) && !this.recovering) this.lost(errText(err));
             }).finally(() => {
                 this.txInflight--;
                 this.finishTx(item, ok);
@@ -475,7 +498,7 @@ class UsbPort {
             this.pingFails = 0;
             this.lastPingOk = performance.now();
         } catch (err) {
-            if (this.usb !== d) return;
+            if (this.usb !== d || this.recovering) return;
             if (isGone(err)) { this.lost(errText(err)); return; }
             if (++this.pingFails >= this.opt.pingFailsMax) {
                 this.pingFails = 0;

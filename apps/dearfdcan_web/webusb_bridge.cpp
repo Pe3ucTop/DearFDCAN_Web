@@ -183,6 +183,12 @@ EM_JS(void, js_webusb_init, (), {
         case 'stats':
             _webusb_cb_stats(m.dev, m.rxPerSec, m.txDropped, m.recoveries, m.rxErrors, m.txErrors);
             break;
+        case 'log': {
+            const text = usb.cstr(m.text);
+            _webusb_cb_log(m.dev, m.level === 'error' ? 2 : 1, text);
+            _free(text);
+            break;
+        }
         case 'sync':
             _webusb_cb_sync(m.dev, m.s[0], m.s[1], m.s[2], m.s[3], m.s[4], m.s[5], m.s[6], m.s[7], m.s[8]);
             break;
@@ -426,6 +432,10 @@ extern "C" {
         WebUsbBridge::GetInstance().InternalOnEvents(dev, text);
     }
 
+    EMSCRIPTEN_KEEPALIVE void webusb_cb_log(int dev, int level, const char* text) {
+        WebUsbBridge::GetInstance().InternalOnLog(dev, level, text);
+    }
+
     EMSCRIPTEN_KEEPALIVE void webusb_cb_stats(int dev, int rx_per_sec, int tx_dropped, int recoveries,
                                               int rx_errors, int tx_errors) {
         WebUsbBridge::GetInstance().InternalOnStats(dev, static_cast<uint32_t>(rx_per_sec), static_cast<uint32_t>(tx_dropped),
@@ -591,6 +601,11 @@ void WebUsbBridge::InternalOnControlOutDone(int dev, int request, bool ok) {
 void WebUsbBridge::InternalOnClockSync(int dev, const ClockSyncStats& stats) {
     if (!ValidDevice(dev)) return;
     dev_stats_[dev].sync = stats;
+}
+
+void WebUsbBridge::InternalOnLog(int dev, int level, const char* text) {
+    if (!ValidDevice(dev) || !text) return;
+    if (on_log_) on_log_(dev, level, std::string(text));
 }
 
 void WebUsbBridge::InternalOnEvents(int dev, const char* text) {

@@ -289,6 +289,33 @@ static void TestSlcan(AppUI& app) {
     app.RemoveDevice(3);
 }
 
+// The event log: lines from the worker, connections, losses with their reasons; the window renders
+static void TestEventLog(AppUI& app) {
+    app.log_.clear();
+    app.OnLog(1, 2, "control transfer failed: NetworkError: A transfer error has occurred.");
+    app.OnLog(1, 1, "recovering: RX errors");
+    UsbDeviceInfo info; info.vid = 0x1D50; info.pid = 0x606F;
+    app.OnDeviceAdded(4, info);
+    app.OnDeviceClosed(4, "device disconnected");
+    app.OnDeviceClosed(4, "closed by host");
+    app.OnNotice("Device 5: something to tell");
+    CHECK(app.log_.size() == 5);
+    CHECK(app.log_[0].level == 2 && app.log_[0].text.find("dev 2: control transfer failed") != std::string::npos);
+    CHECK(app.log_[1].level == 1 && app.log_[2].level == 2 && app.log_[2].text.find("dev 5: closed: device disconnected") != std::string::npos);
+    CHECK(app.log_[3].level == 0 && app.log_[3].text.find("dev 5: closed") != std::string::npos && app.log_[4].level == 1);
+    app.OnLog(0, 1, std::string(2000, 'x'));
+    CHECK(app.log_.back().text.size() < 500);
+    for (int i = 0; i < 1000; ++i) app.OnLog(0, 1, "line");
+    CHECK(app.log_.size() == 600 && app.log_dirty_);
+    app.show_log_window_ = true;
+    app.log_.push_front({-1, "---- marker ----"});
+    frame(); frame();
+    app.SaveLog();
+    CHECK(!app.log_dirty_);
+    app.show_log_window_ = false;
+    app.RemoveDevice(4);
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     ImGui::CreateContext();
@@ -297,6 +324,7 @@ int main() {
     TestGsUsb(app);
     TestPcan(app);
     TestSlcan(app);
+    TestEventLog(app);
     std::printf("%d checks, %d failed\n", g_n, g_fail);
     return g_fail != 0;
 }

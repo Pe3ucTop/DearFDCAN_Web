@@ -71,6 +71,7 @@ public:
     using ControlInCallback = std::function<void(int dev, uint8_t request, const uint8_t* data, int length)>;
     using ControlOutDoneCallback = std::function<void(int dev, int request, bool ok)>;
     using EventsCallback = std::function<void(int dev, const std::string& lines)>;   // Elmue bus load / text / error lines
+    using LogCallback = std::function<void(int dev, int level, const std::string& text)>;   // warnings (1) and errors (2) of the transport
 
     static WebUsbBridge& GetInstance();
 
@@ -128,6 +129,7 @@ public:
     void SetOnControlIn(ControlInCallback cb) { on_control_in_ = cb; }
     void SetOnControlOutDone(ControlOutDoneCallback cb) { on_control_out_done_ = cb; }
     void SetOnEvents(EventsCallback cb) { on_events_ = cb; }
+    void SetOnLog(LogCallback cb) { on_log_ = cb; }
 
     const UsbStats& GetStats() const { return stats_; }
     const UsbDeviceStats& GetDeviceStats(int dev) const;
@@ -144,6 +146,7 @@ public:
                          uint32_t rx_errors, uint32_t tx_errors);
     void InternalOnClockSync(int dev, const ClockSyncStats& stats);
     void InternalOnEvents(int dev, const char* text);
+    void InternalOnLog(int dev, int level, const char* text);
 
 private:
     WebUsbBridge() = default;
@@ -158,6 +161,7 @@ private:
     ControlInCallback on_control_in_;
     ControlOutDoneCallback on_control_out_done_;
     EventsCallback on_events_;
+    LogCallback on_log_;
 
     UsbStats stats_;
     std::array<UsbDeviceStats, kMaxDevices> dev_stats_;

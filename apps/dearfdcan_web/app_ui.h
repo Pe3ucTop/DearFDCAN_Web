@@ -90,6 +90,8 @@ public:
     void OnControlOutDone(int dev, int request, bool ok);
     // Elmue protocol: lines from the worker core ("U<percent>", "T<text>", "E<id>:<data>")
     void OnAdapterEvents(int dev, const std::string& lines);
+    // A warning (level 1) or error (2) of the transport in the worker; goes to the event log
+    void OnLog(int dev, int level, const std::string& text);
 
 private:
     void SetTermination(int dev, bool on);
@@ -134,6 +136,20 @@ private:
     void RenderSentHistoryWindow(float x, float y, float w, float h);
     void RenderIdTableWindow(double now_ms, float x, float y, float w, float h);
     void RenderTraceWindow(float x, float y, float w, float h);
+    void RenderLogWindow();
+
+    // Event log: connections, losses and their reasons, the transport's warnings, user notices. It is kept in the browser's
+    // localStorage, so what happened before a reload (or a crash of the page) can still be read.
+    struct LogLine { int level; std::string text; };   // level 0 info, 1 warning, 2 error
+    void AddLog(int level, int dev, const std::string& text);
+    void SaveLog();
+    void LoadLog();                // the lines of the previous session, once, at the first frame
+    std::deque<LogLine> log_;
+    bool log_loaded_ = false;
+    bool log_dirty_ = false;
+    double log_saved_ms_ = 0.0;
+    bool show_log_window_ = false;
+    bool log_autoscroll_ = true;
 
     double start_time_ms_;
 
