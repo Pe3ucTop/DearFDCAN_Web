@@ -25,10 +25,10 @@ Dependencies point downwards only. Layer 2 reaches the hardware through an inter
 | 5 | Repository | **Monorepo**, one directory per component; split into repositories later (`git subtree`) once the interfaces have settled. | Interfaces still change. |
 | 6 | Licence and file headers | Apache-2.0 for every component. Per-file headers are **postponed** until the layout is final. | Headers name the component, so they are written once. |
 
-## Target layout (after the migration)
+## Target layout (step 1 is in place; the JavaScript transport libraries of steps 2 and 3 are not)
 
 ```
-libs/emscripten-webserial/   exists today as emscripten_webserial/
+libs/emscripten-webserial/   Web Serial ports as /dev/ttyWebN
 libs/emscripten-webusb/      webusb-io (JS) + library_webusb.js + webusb.h
 libs/can-core/               types, DLC, bit timing                  (can_protocol_common.h)
 libs/can-protocols/          gs_usb, Elmue, PEAK, SLCAN              (can_protocol_*.cpp/.h)
@@ -51,11 +51,10 @@ The PEAK record layouts and option bits come from PEAK's Linux driver (GPL). Onl
 
 ## Steps
 
-0. **Prepare without moving files** (in progress): move the protocol logic out of `AppUI` into `AdapterDriver` over `ITransport`; split `usb_worker.js` into one class per protocol; keep the headless tests of the start sequences in the repository (`tests/`).
-1. CAN libraries: move to `libs/`, CMake with native unit tests, then the Emscripten build.
+0. **Prepare without moving files** (done 2026-10-30): the protocol logic moved out of `AppUI` into drivers over `ITransport` (`can_adapter.*`); `usb_worker.js` split into one class per protocol; the headless tests of the start sequences are in the repository (`tests/`).
+1. **CAN libraries** (done 2026-10-30): moved to `libs/` (`can-core`, `can-protocols`, `can-engine`, `can-adapters`), the monitor to `apps/dearfdcan_web/`, `emscripten_webserial` to `libs/emscripten-webserial/`; CMake describes the build, the `Makefile` is its front-end; native unit tests under CTest (sanitizers on); `compile_script.sh` removed. The move itself is `tools/restructure.sh`, to be run once and deleted.
 2. JavaScript transport: `webusb-io` / `webserial-io` with mock-device tests; the worker becomes a thin shell.
 3. `library_webusb.js` + `webusb.h` (own API) with a test like the one of `emscripten-webserial`.
-4. The utility on the new libraries; check the single-file build (`pack_worker.py` with several modules).
-5. Remove `compile_script.sh`, update the README tables.
+4. The utility on the new libraries; check the single-file build (`pack_worker.py` with several modules). The layout already builds the single-file page from the CMake targets; what stays is to let the page depend on the JavaScript transport libraries once they exist.
 
 Native transports and a console utility are **out of scope**.

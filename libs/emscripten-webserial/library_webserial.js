@@ -1,6 +1,6 @@
 // library_webserial.js - Web Serial ports as POSIX character devices (/dev/ttyWeb0, /dev/ttyWeb1, ...) for Emscripten.
 //
-// Link with:  em++ ... --js-library emscripten_webserial/library_webserial.js
+// Link with:  em++ ... --js-library libs/emscripten-webserial/library_webserial.js
 // C API and device semantics: webserial.h and README.md next to this file.
 //
 // What it does

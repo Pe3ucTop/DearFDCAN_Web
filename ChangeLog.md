@@ -180,6 +180,19 @@ the protocol classes, chosen from the USB ids when the slot is opened. The headl
 repository now (`tests/`): the sequences of all three protocols through `AppUI` (98 checks, unchanged by the move: they were run on the code
 before it and after it) and the real worker against mock adapters (20 checks). Both build modes without warnings.
 
+**2026-10-30, step 1 of the split: libraries, CMake, native tests.** `src_inc/` is gone: `libs/can-core` (types), `libs/can-protocols` (gs_usb,
+Elmue, PEAK, SLCAN and the facade), `libs/can-engine` (the worker core, `can_wire.h`), `libs/can-adapters` (the drivers), `libs/emscripten-webserial`
+(unchanged, moved) and `apps/dearfdcan_web` (the monitor with its two workers and `pack_worker.py`); no source line changed in the move, the include
+paths come from the CMake targets. CMake is the description of the build; the `Makefile` keeps its commands (`make`, `MODE=multi`, `serve`, `clean`,
+new `test`) and calls it, `compile_script.sh` is removed (it only wrapped `make`). One configuration (`build/em`) holds both modes as targets
+`single` and `multi`, so the objects, Dear ImGui among them, are compiled once; the results are still in `build/single/` and `build/multi/` and the
+single-file page is still copied to `docs/`. `can-engine` is an object library, so the module and the tests link its objects directly. The native
+configuration builds the libraries and `tests/`, run by CTest under ASan / UBSan: `test_elmue` (messages, blobs, echoes, a fuzzer, the core with
+transmit records), `test_clock_sync` (the clock fit against a simulated clock), `test_pcan_records` (PEAK records, options, calibration statistics) and
+`test_app_ui` (the adapter drivers through the interface; it builds `app_ui.cpp` natively against stand-ins for `<emscripten.h>` and `<GLFW/glfw3.h>`).
+The first three are the tests that had been lost with the scratch directory. Checked on a copy after the move: 4 native tests, 20 worker checks,
+both Emscripten modes without warnings, `docs/index.html` published. The move is `tools/restructure.sh` (`git mv`), to be run once.
+
 ## Verified overall
 
 The CAN core, frame parser and URL parsing were unit-tested natively (ASan/UBSan) and the worker was exercised against mock devices with the

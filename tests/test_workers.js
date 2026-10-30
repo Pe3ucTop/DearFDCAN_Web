@@ -4,7 +4,7 @@
 //     event lines, the clock requests and their statistics, the switch back to the legacy protocol
 //   * a PEAK PCAN-USB FD: records with calibration, bus load, error and status; no clock request
 //   * a slot that changes from one adapter kind to another
-// Usage: node tests/test_workers.js <build/multi directory> <src_inc directory>
+// Usage: node tests/test_workers.js <build/multi directory> <directory of usb_worker.js, apps/dearfdcan_web>
 const { sleep, createChecks, createMockDevice, createHarness, le32 } = require('./worker_harness');
 const BUILD = process.argv[2], SRC = process.argv[3];
 const C = createChecks();

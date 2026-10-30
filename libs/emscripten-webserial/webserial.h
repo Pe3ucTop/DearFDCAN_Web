@@ -1,7 +1,7 @@
 #ifndef WEBSERIAL_H_
 #define WEBSERIAL_H_
 // Web Serial ports as character devices of Emscripten's virtual file system: /dev/ttyWeb0 ... /dev/ttyWeb7.
-// Link with  --js-library emscripten_webserial/library_webserial.js  (see README.md).
+// Link with  --js-library libs/emscripten-webserial/library_webserial.js  (see README.md).
 //
 // Typical use:
 //     webserial_set_callback(on_event, NULL);

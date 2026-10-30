@@ -5,14 +5,14 @@ C and C++ code that talks to a serial port with `open()` / `read()` / `write()` 
 browser without a JavaScript rewrite.
 
 This is a standalone library (one JavaScript library file and one header); it does not depend on the rest of the repository.
-The CAN monitor itself does not use it: its serial path is `src_inc/serial_worker.js`, which moves the bytes into the CAN core
+The CAN monitor itself does not use it: its serial path is `apps/dearfdcan_web/serial_worker.js`, which moves the bytes into the CAN core
 without going through a file system (see the main README). The library is the reusable answer to "how does a
 Web Serial port look like a file descriptor", for programs that want the POSIX interface.
 
 ## Use
 
 ```sh
-em++ app.cpp -o app.html --js-library emscripten_webserial/library_webserial.js -Iemscripten_webserial
+em++ app.cpp -o app.html --js-library libs/emscripten-webserial/library_webserial.js -Ilibs/emscripten-webserial
 ```
 
 ```c
@@ -65,11 +65,11 @@ and DTR/RTS, chunked receive, partial reads, receive and transmit flow control, 
 during open, node creation and removal):
 
 ```sh
-emcc emscripten_webserial/test/test_webserial.c -o test_webserial.js -O1 -sENVIRONMENT=node -sMODULARIZE=1 -sEXPORT_NAME=createWS \
-     -sFORCE_FILESYSTEM=1 --js-library emscripten_webserial/library_webserial.js -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=64MB \
+emcc libs/emscripten-webserial/test/test_webserial.c -o test_webserial.js -O1 -sENVIRONMENT=node -sMODULARIZE=1 -sEXPORT_NAME=createWS \
+     -sFORCE_FILESYSTEM=1 --js-library libs/emscripten-webserial/library_webserial.js -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=64MB \
      -sEXPORTED_RUNTIME_METHODS='["FS","HEAPU8","HEAP32","ccall","UTF8ToString"]' \
      -sEXPORTED_FUNCTIONS='["_main","_malloc","_free","_webserial_supported","_webserial_scan","_webserial_open","_webserial_close","_webserial_remove","_webserial_state","_webserial_usb_ids","_webserial_last_error","_webserial_available","_webserial_request_port","_t_start","_t_event_count","_t_event","_t_event_index","_t_clear_events","_t_buf","_t_open","_t_errno","_t_read","_t_write","_t_poll","_t_close","_t_get_baud","_t_set_baud","_t_isatty"]'
-node emscripten_webserial/test/run_test.js ./test_webserial.js
+node libs/emscripten-webserial/test/run_test.js ./test_webserial.js
 ```
 
 Verified with Emscripten 6.0.10 and Node 22.

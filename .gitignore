@@ -67,7 +67,7 @@ vcpkg_installed/
 Testing/
 .cache/
 
-# Build output of make / compile_script.sh: build/<mode>/ (results), build/obj, build/tmp
+# Build output (make / CMake): build/single/ and build/multi/ (results), build/em, build/native, build/tmp
 /build/
 
 # The project's own build driver (the generic "Makefile" rule above is meant for CMake output)

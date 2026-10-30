@@ -83,7 +83,7 @@ available in Firefox/Safari) and talks to the adapter directly, no driver or nat
 |---|---|
 | Emscripten SDK | 6.0.10 (`emsdk-exec.sh` sources `/opt/Emscripten_SDK/emsdk_env.sh`, adjust the path for your machine) |
 | Dear ImGui | 1.93.0, sources in `IMGUI_DIR` (default `/Src_Libs/imgui`, see `Makefile`) |
-| GNU make | 4.3 |
+| CMake | 3.20 or newer (3.28 used); GNU make 4.3 for the `Makefile` front-end |
 | Python 3 | 3.12 (standard library only, used by `pack_worker.py`) |
 | Browser | Chromium-based (Chrome/Edge) with WebUSB / Web Serial, served over `https://` or `http://localhost` |
 | Adapter | GS-USB compatible firmware (candleLight FD style; hardware timestamps need the `HW_TIMESTAMP` feature), a PEAK PCAN-USB FD family adapter, or an SLCAN adapter on a serial port (the last two are not tested on real hardware, see the change history) |
@@ -98,11 +98,14 @@ driver is not bound to the device (unbind it, or use WinUSB/Zadig on Windows).
 make -j                        # single (default): build/single/index.html, one self-contained file, also copied to docs/index.html
 make -j MODE=multi             # build/multi/: index.html index.js index.wasm usb_worker.js serial_worker.js can_core.js can_core.wasm
 make serve                     # serve the selected mode on http://localhost:8000/
+make test                      # native tests (CTest, sanitizers) and, if build/multi exists, the worker tests
 make clean                     # remove build/
 make help                      # all variables
 ```
 
-`./compile_script.sh [single|multi]` is a thin wrapper for the same (`make -j MODE=...`). Both modes can coexist.
+The `Makefile` is a front-end for CMake (`emcmake cmake -S . -B build/em`, then `cmake --build build/em --target single`, or `multi`); both
+modes come from one build tree, so Dear ImGui is compiled once, and both can coexist. The native tests alone:
+`cmake -S . -B build/native && cmake --build build/native && ctest --test-dir build/native`.
 
 `single` builds the CAN core with `-sSINGLE_FILE`, packs its glue together with `usb_worker.js` into a string
 (`pack_worker.py`), packs `serial_worker.js` into another one and embeds both into the page, which starts the workers from Blob URLs.
@@ -157,46 +160,51 @@ Defaults: 500 kbit/s at 87.5 % nominal, 2000 kbit/s at 75 % data. The bit rate i
 
 ## Source layout
 
-All sources and headers are in `src_inc/`:
+The project is split into libraries (`libs/`) and the monitor that uses them (`apps/dearfdcan_web/`); the reasons and the plan are in `DECISIONS.md`.
+Layers, from the bottom: `emscripten-webserial` (transport, stand-alone) · `can-core` (types) → `can-protocols` (what the adapters speak) →
+`can-engine` (the worker core) and `can-adapters` (one driver per adapter) · the monitor. The CAN libraries have no browser code and are
+unit-tested natively.
 
 | File | Role |
 |---|---|
-| `src_inc/main.cpp` | GLFW/ImGui setup, main loop, wiring of bridge callbacks |
-| `src_inc/app_ui.cpp/.h` | All windows, adapter slots (`DeviceSlot`: the adapter's state and the user's settings, plus its driver), snapshot ingestion, URL parameters |
-| `src_inc/can_adapter.cpp/.h` | Adapter drivers (gs_usb with Elmue, PEAK, SLCAN) over the `ITransport` interface: capabilities, start / stop sequences and their acknowledgements, bit-timing limits, transmit frames, bus reports; no UI and no Emscripten code |
-| `src_inc/url_params.h` | Parsing of the URL parameter values |
-| `src_inc/webusb_bridge.cpp/.h` | Page side of the worker link (EM_JS): device slots, device events, snapshot validation, per-adapter statistics |
-| `src_inc/usb_worker.js` | CAN worker: one context per adapter (`Device` is the common USB part: RX slots, control/TX queues, watchdog; `GsUsbDevice` (clock requests, Elmue echoes) and `PcanDevice` (firmware handshake, calibration statistics) are the protocol classes; `SerialDevice` stages the bytes from `serial_worker.js` and matches command acknowledgements), hosts the core, snapshot publishing |
-| `src_inc/serial_worker.js` | Serial worker: Web Serial I/O only (ports, read loop, ordered writes), linked to the CAN worker by a `MessageChannel` |
-| `src_inc/can_core.cpp` | Worker wasm module: frame parsing, ID table keyed by (device, ID), trace queue, per-adapter clock mapping |
-| `src_inc/can_protocol_common.h` | Protocol independent definitions: `CanMessage`/`CanPayload`, `CanBittiming`, `CanProtocolType`, DLC helpers, bit-timing calculation, `kMaxDevices` |
-| `src_inc/can_protocol_gsusb.cpp/.h` | gs_usb (candleLight / CANable): control requests, structures, bulk frame parsing and building |
-| `src_inc/can_protocol_elmue.cpp/.h` | The ElmueSoft CANable 2.5 extension of gs_usb: message/blob parsing, frame building with echo markers, error decoding, board info, host filters, mode flags |
-| `src_inc/can_protocol_pcan.cpp/.h` | PEAK PCAN-USB FD (uCAN): packed command/record structures, command transfers (clock, options, bit timing, filter, bus on/off), record stream parsing with reassembly across transfers, frame building, bit-timing limits |
-| `src_inc/can_protocol_slcan.cpp/.h` | SLCAN (Lawicel / CANable slcan firmware): line stream parser (frames and command replies), frame lines, `V` answer parser, start/stop command sequences |
-| `src_inc/can_protocol.cpp/.h` | Umbrella header and the `CanProtocolHandler` facade: the single entry point the UI and the core use, forwards to the protocol backend |
-| `src_inc/can_wire.h` | Snapshot format shared by the page and the worker core |
-| `emscripten_webserial/` | Standalone Emscripten library: Web Serial ports as `/dev/ttyWeb0..7` device nodes (POSIX `read`/`write`/`poll`/termios), with its own test; not used by the monitor itself, see its README |
+| `apps/dearfdcan_web/main.cpp` | GLFW/ImGui setup, main loop, wiring of bridge callbacks |
+| `apps/dearfdcan_web/app_ui.cpp/.h` | All windows, adapter slots (`DeviceSlot`: the adapter's state and the user's settings, plus its driver), snapshot ingestion, URL parameters |
+| `libs/can-adapters/can_adapter.cpp/.h` | Adapter drivers (gs_usb with Elmue, PEAK, SLCAN) over the `ITransport` interface: capabilities, start / stop sequences and their acknowledgements, bit-timing limits, transmit frames, bus reports; no UI and no Emscripten code |
+| `apps/dearfdcan_web/url_params.h` | Parsing of the URL parameter values |
+| `apps/dearfdcan_web/webusb_bridge.cpp/.h` | Page side of the worker link (EM_JS): device slots, device events, snapshot validation, per-adapter statistics |
+| `apps/dearfdcan_web/usb_worker.js` | CAN worker: one context per adapter (`Device` is the common USB part: RX slots, control/TX queues, watchdog; `GsUsbDevice` (clock requests, Elmue echoes) and `PcanDevice` (firmware handshake, calibration statistics) are the protocol classes; `SerialDevice` stages the bytes from `serial_worker.js` and matches command acknowledgements), hosts the core, snapshot publishing |
+| `apps/dearfdcan_web/serial_worker.js` | Serial worker: Web Serial I/O only (ports, read loop, ordered writes), linked to the CAN worker by a `MessageChannel` |
+| `libs/can-engine/can_core.cpp` | Worker wasm module: frame parsing, ID table keyed by (device, ID), trace queue, per-adapter clock mapping |
+| `libs/can-core/can_protocol_common.h` | Protocol independent definitions: `CanMessage`/`CanPayload`, `CanBittiming`, `CanProtocolType`, DLC helpers, bit-timing calculation, `kMaxDevices` |
+| `libs/can-protocols/can_protocol_gsusb.cpp/.h` | gs_usb (candleLight / CANable): control requests, structures, bulk frame parsing and building |
+| `libs/can-protocols/can_protocol_elmue.cpp/.h` | The ElmueSoft CANable 2.5 extension of gs_usb: message/blob parsing, frame building with echo markers, error decoding, board info, host filters, mode flags |
+| `libs/can-protocols/can_protocol_pcan.cpp/.h` | PEAK PCAN-USB FD (uCAN): packed command/record structures, command transfers (clock, options, bit timing, filter, bus on/off), record stream parsing with reassembly across transfers, frame building, bit-timing limits |
+| `libs/can-protocols/can_protocol_slcan.cpp/.h` | SLCAN (Lawicel / CANable slcan firmware): line stream parser (frames and command replies), frame lines, `V` answer parser, start/stop command sequences |
+| `libs/can-protocols/can_protocol.cpp/.h` | Umbrella header and the `CanProtocolHandler` facade: the single entry point the UI and the core use, forwards to the protocol backend |
+| `libs/can-engine/can_wire.h` | Snapshot format shared by the page and the worker core |
+| `libs/emscripten-webserial/` | Standalone Emscripten library: Web Serial ports as `/dev/ttyWeb0..7` device nodes (POSIX `read`/`write`/`poll`/termios), with its own test; not used by the monitor itself, see its README |
 
 Tests (`tests/`, they need no adapter and no browser):
 
 | File | Role |
 |---|---|
-| `tests/test_app_ui.cpp`, `tests/run_native.sh` | Headless test of the adapter sequences driven by `AppUI` (open, capabilities, start, acknowledgements, stop, transmit, reports) for gs_usb (legacy and Elmue), PEAK and SLCAN, with the real Dear ImGui and a recording stand-in for the bridge, natively under ASan / UBSan: `sh tests/run_native.sh` |
-| `tests/test_workers.js`, `tests/worker_harness.js` | The real `usb_worker.js` and `can_core.wasm` in a Node `vm` against mock USB adapters (Elmue blobs and echoes, clock requests, PEAK records): `node tests/test_workers.js build/multi src_inc` after `make MODE=multi` |
+| `tests/test_elmue.cpp`, `tests/test_clock_sync.cpp`, `tests/test_pcan_records.cpp` | Unit tests of the protocol layer and the core (Elmue messages, blobs, echoes and a fuzzer; the clock fit against a simulated drifting clock; PEAK records and options), natively under ASan / UBSan |
+| `tests/test_app_ui.cpp` | Headless test of the adapter sequences driven by `AppUI` (open, capabilities, start, acknowledgements, stop, transmit, reports) for gs_usb (legacy and Elmue), PEAK and SLCAN, with the real Dear ImGui and a recording stand-in for the bridge, natively under ASan / UBSan |
+| `tests/test_workers.js`, `tests/worker_harness.js` | The real `usb_worker.js` and `can_core.wasm` in a Node `vm` against mock USB adapters (Elmue blobs and echoes, clock requests, PEAK records): `node tests/test_workers.js build/multi apps/dearfdcan_web` after `make MODE=multi` |
 
-The direction of the project (libraries for transport and CAN, and the utility) and the decisions taken are in `DECISIONS.md`.
+`make test` builds and runs the native tests with CTest (in `build/native`) and, when `build/multi` exists, the worker tests. The direction
+of the project (libraries for transport and CAN, and the utility) and the decisions taken are in `DECISIONS.md`.
 
 Build tooling in the repository root:
 
 | File | Role |
 |---|---|
-| `Makefile` | Build driver (modes, object cache, `serve`, `clean`) |
-| `compile_script.sh` | Wrapper around `make` for `single` / `multi` |
+| `CMakeLists.txt`, `libs/*/CMakeLists.txt`, `apps/dearfdcan_web/CMakeLists.txt`, `tests/CMakeLists.txt` | The description of the build (libraries, the Emscripten page and worker module, the native tests) |
+| `Makefile` | Front-end for it with the commands above (`make`, `MODE=multi`, `test`, `serve`, `clean`) |
 | `emsdk-exec.sh` | Sets up the Emscripten environment and runs a command (edit the SDK path for your machine) |
-| `pack_worker.py` | Packs the worker for the single-file build |
+| `apps/dearfdcan_web/pack_worker.py` | Packs the workers for the single-file build |
 
-Tunables: `RX_SLOTS`, `TX_INFLIGHT`, `PUBLISH_MS`, `BATCH_CREDITS` at the top of `src_inc/usb_worker.js`; table/trace limits at the top of `src_inc/can_core.cpp`.
+Tunables: `RX_SLOTS`, `TX_INFLIGHT`, `PUBLISH_MS`, `BATCH_CREDITS` at the top of `apps/dearfdcan_web/usb_worker.js`; table/trace limits at the top of `libs/can-engine/can_core.cpp`.
 
 ## Known limitations
 

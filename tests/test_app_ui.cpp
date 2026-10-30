@@ -1,7 +1,7 @@
 // Headless test of the adapter sequences driven by AppUI (open, capabilities, start, acknowledgements, stop, transmit,
 // reports) for gs_usb (legacy and Elmue), PEAK and SLCAN adapters. It uses the real Dear ImGui and a recording
 // replacement of WebUsbBridge, so what is checked is exactly what the page would send to the worker.
-// Build and run: tests/run_native.sh
+// Build and run: make test (CTest target test_app_ui, see tests/CMakeLists.txt)
 #include <cstdio>
 #include <cstring>
 #include <string>
