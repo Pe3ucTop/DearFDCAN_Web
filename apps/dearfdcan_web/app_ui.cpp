@@ -1,5 +1,6 @@
 #include "app_ui.h"
 #include "webusb_bridge.h"
+#include "clipboard.h"
 #include "imgui.h"
 #include "url_params.h"
 #include <GLFW/glfw3.h>
@@ -489,6 +490,15 @@ void AppUI::LoadLog() {
     while (log_.size() > kLogMaxLines) log_.pop_front();
 }
 
+// Next to a Copy button: "Copied", or what to do when the browser refused to write the clipboard
+void AppUI::ShowClipboardStatus() {
+    const std::string text = BrowserClipboard::StatusText();
+    if (text.empty()) return;
+    ImGui::SameLine();
+    if (BrowserClipboard::GetState() == BrowserClipboard::State::Blocked) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f), "%s", text.c_str());
+    else ImGui::TextDisabled("%s", text.c_str());
+}
+
 void AppUI::RenderLogWindow() {
     ImGui::SetNextWindowSize(ImVec2(760, 280), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowPos(ImVec2(60, 120), ImGuiCond_FirstUseEver);
@@ -501,6 +511,7 @@ void AppUI::RenderLogWindow() {
         for (const LogLine& l : log_) { all += l.text; all += '\n'; }
         ImGui::SetClipboardText(all.c_str());
     }
+    ShowClipboardStatus();
     ImGui::SameLine();
     if (ImGui::Button("Clear")) {
         log_.clear();
@@ -524,10 +535,260 @@ void AppUI::RenderLogWindow() {
     ImGui::End();
 }
 
+// ----------------------------------------------------------------------------
+// Benchmark: transmit stress test
+// ----------------------------------------------------------------------------
+
+BenchCounters AppUI::BenchNow() const {
+    BenchCounters c;
+    const BenchConfig& cfg = bench_.config();
+    auto entry = [&](int dev) -> const IdTableEntry* {
+        if (dev < 0 || dev >= kMaxDevices) return nullptr;
+        auto it = id_table_.find(MakeCanIdKey(static_cast<uint8_t>(dev), bench_.TestId(), cfg.extended));
+        return it == id_table_.end() ? nullptr : &it->second;
+    };
+    if (const IdTableEntry* e = entry(cfg.tx_dev)) c.echo = e->count;
+    if (const IdTableEntry* e = entry(cfg.rx_dev)) {
+        c.rx = e->count;
+        c.rx_max_gap_ms = e->max_cycle_ms;
+    }
+    if (cfg.tx_dev >= 0 && cfg.tx_dev < kMaxDevices) {
+        const UsbDeviceStats& ds = WebUsbBridge::GetInstance().GetDeviceStats(cfg.tx_dev);
+        c.tx_errors = ds.tx_errors;
+        c.tx_dropped = ds.tx_dropped;
+        c.tx_gate_ms = ds.tx_gate_ms;
+        c.tx_transfers = ds.tx_transfers;
+        c.tx_frames = ds.tx_frames;
+        c.bus_load_pct = devices_[cfg.tx_dev].bus_load;
+    }
+    return c;
+}
+
+void AppUI::StartBenchmark() {
+    bench_note_.clear();
+    if (!ValidDevice(bench_tx_) || !IsBusOn(bench_tx_)) { bench_note_ = "Choose a sender that is BUS ON."; return; }
+    const int rx = (ValidDevice(bench_rx_) && devices_[bench_rx_].used) ? bench_rx_ : -1;
+    if (rx == bench_tx_) { bench_note_ = "The receiver must be another adapter."; return; }
+    if (rx >= 0 && !IsBusOn(rx)) { bench_note_ = "The receiver is not BUS ON."; return; }
+
+    BenchConfig cfg;
+    cfg.tx_dev = bench_tx_;
+    cfg.rx_dev = rx;
+    cfg.fd = bench_fd_;
+    cfg.brs = bench_brs_;
+    cfg.extended = bench_ext_;
+    cfg.bytes = bench_bytes_;
+    cfg.rate_fps = bench_rate_;
+    cfg.window = bench_window_;
+    cfg.duration_s = bench_duration_;
+    cfg.id = static_cast<uint32_t>(bench_id_) + static_cast<uint32_t>(bench_runs_++ % 16) * 0x10;
+    if (cfg.fd && !devices_[cfg.tx_dev].enable_fd) cfg.fd = false;       // the channel was not started with CAN FD
+    const DeviceSlot& d = devices_[cfg.tx_dev];
+
+    // Fresh IDs: the counters of the table start at zero; the transport's error counters are cumulative, so they are remembered as the base
+    const UsbDeviceStats& ds = WebUsbBridge::GetInstance().GetDeviceStats(cfg.tx_dev);
+    BenchStart base;
+    base.tx_errors = ds.tx_errors;
+    base.tx_dropped = ds.tx_dropped;
+    base.tx_gate_ms = ds.tx_gate_ms;
+    base.tx_transfers = ds.tx_transfers;
+    base.tx_frames = ds.tx_frames;
+    bench_.Start(cfg, d.target_nom_kbps, d.target_data_kbps, GetNowMs(), base);
+    bench_run_fifo_ = bench_fifo_;
+    WebUsbBridge::GetInstance().SetTxFifoSlots(cfg.tx_dev, bench_run_fifo_);
+    bench_rate_ms_ = GetNowMs();
+    bench_rate_n_ = 0;
+    bench_rate_now_ = 0.0;
+    AddLog(0, cfg.tx_dev, "benchmark started: " + std::to_string(cfg.bytes) + " bytes " + (cfg.fd ? (cfg.brs ? "FD+BRS" : "FD") : "classic") +
+                          ", " + (cfg.rate_fps > 0 ? std::to_string(cfg.rate_fps) + " frames/s" : std::string("as fast as possible")) +
+                          ", ID 0x" + [&] { char b[16]; std::snprintf(b, sizeof(b), "%X", static_cast<unsigned>(bench_.TestId())); return std::string(b); }());
+}
+
+void AppUI::ProcessBenchmark(double now_ms) {
+    if (!bench_.Active()) return;
+    if (bench_.state() == TxBenchmark::State::Running && !IsBusOn(bench_.config().tx_dev)) bench_.Stop(now_ms, "aborted: the sender is not BUS ON any more");
+    const BenchCounters now = BenchNow();
+    const int n = bench_.Due(now_ms, now.echo, now.rx);
+    for (int i = 0; i < n; ++i) SendFrame(bench_.NextFrame(), bench_.config().tx_dev);
+    const bool was_active = bench_.Active();
+    bench_.Update(now_ms, now);
+    if (was_active && bench_.state() == TxBenchmark::State::Done) {
+        const BenchResult& r = bench_.result();
+        WebUsbBridge::GetInstance().SetTxFifoSlots(bench_.config().tx_dev, kElmueTxFifoSlots);
+        char b[240];
+        std::snprintf(b, sizeof(b), "benchmark %s: %llu sent, %llu echoed, %.0f frames/s (%.0f %% of the bit rate's maximum)%s%s",
+                      r.stop_reason.c_str(), static_cast<unsigned long long>(r.sent), static_cast<unsigned long long>(r.echoed), r.fps,
+                      r.efficiency_pct, r.has_receiver ? (r.lost == 0 ? ", nothing lost" : ", FRAMES LOST") : "",
+                      r.has_receiver && r.echoes_missing != 0 ? (", " + std::to_string(r.echoes_missing) + " echoes missing").c_str() : "");
+        AddLog(r.has_receiver && r.lost != 0 ? 2 : 0, bench_.config().tx_dev, b);
+    }
+}
+
+std::string AppUI::BenchReportText() const {
+    const BenchResult& r = bench_.result();
+    const BenchConfig& c = bench_.config();
+    char b[1024];
+    std::snprintf(b, sizeof(b),
+        "Benchmark (%s): sender %d, %s, %d bytes, %s, ID 0x%X\n"
+        "  time %.2f s, sent %llu, echoed %llu%s\n"
+        "  %.0f frames/s, payload %.0f kbit/s, bus time per frame %.1f us, at most %.0f frames/s -> %.0f %% of it, bus load %.0f %%\n"
+        "  tx errors %u, dropped %u%s\n",
+        r.stop_reason.c_str(), c.tx_dev + 1, c.fd ? (c.brs ? "CAN FD + BRS" : "CAN FD") : "classic CAN", c.bytes,
+        c.rate_fps > 0 ? (std::to_string(c.rate_fps) + " frames/s").c_str() : "as fast as possible", static_cast<unsigned>(bench_.TestId()),
+        r.seconds, static_cast<unsigned long long>(r.sent), static_cast<unsigned long long>(r.echoed),
+        r.has_receiver ? (", received by sender " + std::to_string(c.rx_dev + 1) + ": " + std::to_string(r.received) + ", lost " + std::to_string(r.lost) +
+                          ", longest gap " + std::to_string(static_cast<int>(r.rx_max_gap_ms)) + " ms").c_str() : "",
+        r.fps, r.data_kbps, r.bus_us_per_frame, r.max_fps, r.efficiency_pct, r.busload_pct,
+        r.tx_errors, r.tx_dropped, r.adapter_busload_pct >= 0 ? (", the adapter reports a bus load of " + std::to_string(r.adapter_busload_pct) + " %").c_str() : "");
+    std::string text = b;
+    char more[448];
+    std::snprintf(more, sizeof(more), "  page fed the sender %.0f times/s%s, %s: %lld\n"
+                  "  adapter FIFO (%d of %d slots used) without a free slot %.0f %% of the time, %u USB transfers with %.1f frames each\n", r.ui_fps,
+                  r.window > 0 ? (", window " + std::to_string(r.window) + ", " + std::to_string(static_cast<int>(r.avg_waiting)) + " waiting on average").c_str() : ", fixed rate",
+                  r.has_receiver ? "echoes missing (the frames arrived without one)" : "sent without an echo",
+                  static_cast<long long>(r.has_receiver ? r.echoes_missing : r.unechoed), bench_run_fifo_, kElmueTxFifoSlots, r.gate_closed_pct,
+                  static_cast<unsigned>(r.tx_transfers), r.frames_per_transfer);
+    return text + more;
+}
+
+void AppUI::RenderBenchmarkWindow() {
+    ImGui::SetNextWindowSize(ImVec2(560, 520), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(80, 100), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("7. Benchmark (transmit stress test)", &show_bench_window_)) {
+        ImGui::End();
+        return;
+    }
+    const bool active = bench_.Active();
+    ImGui::TextWrapped("One adapter sends numbered frames with an ID of its own; the tx echoes of that adapter say how many were put on the bus, a second "
+                       "adapter on the same bus (the receiver) says how many arrived. Every run uses new IDs, so the Receive Table gets rows of its own. "
+                       "Connect both adapters to the same bus with termination.");
+    ImGui::Separator();
+
+    ImGui::BeginDisabled(active);
+    DeviceCombo("Sender", bench_tx_, "(choose)", 260.0f);
+    DeviceCombo("Receiver", bench_rx_, "(none: count the echoes only)", 260.0f);
+    ImGui::Checkbox("CAN FD", &bench_fd_);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!bench_fd_);
+    ImGui::Checkbox("BRS", &bench_brs_);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::Checkbox("29 bit ID", &bench_ext_);
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::InputInt("Data bytes", &bench_bytes_, 1, 8);
+    bench_bytes_ = TxBenchmark::NormalizeBytes(bench_fd_, bench_bytes_);
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::InputInt("Duration (s)", &bench_duration_, 1, 10);
+    bench_duration_ = std::clamp(bench_duration_, 1, 600);
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::InputInt("Rate (frames/s, 0 = as fast as the echoes allow)", &bench_rate_, 100, 1000);
+    bench_rate_ = std::clamp(bench_rate_, 0, 100000);
+    ImGui::BeginDisabled(bench_rate_ > 0);
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::InputInt("Frames waiting for their echo", &bench_window_, 10, 50);
+    bench_window_ = std::clamp(bench_window_, 1, 200);
+    ImGui::EndDisabled();
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::InputInt("Adapter FIFO slots to fill (gs_usb / Elmue)", &bench_fifo_, 8, 16);
+    bench_fifo_ = std::clamp(bench_fifo_, 1, kElmueTxFifoSlots);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("The worker puts no more frames on the wire than the adapter's transmit FIFO (64 slots)\nhas free. A lower number tests whether the adapter drops frames because the FIFO is smaller in practice.");
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::InputInt("First ID", &bench_id_, 16, 256, ImGuiInputTextFlags_CharsHexadecimal);
+    bench_id_ = std::clamp(bench_id_, 1, 0x700);
+    ImGui::EndDisabled();
+
+    if (!active) {
+        if (ImGui::Button("Start")) StartBenchmark();
+    } else if (ImGui::Button("Stop")) {
+        bench_.Stop(GetNowMs(), "stopped");
+    }
+    if (!bench_note_.empty()) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.4f, 1.0f), "%s", bench_note_.c_str()); }
+    ImGui::Separator();
+
+    if (bench_.state() == TxBenchmark::State::Running || bench_.state() == TxBenchmark::State::Draining) {
+        const BenchCounters now = BenchNow();
+        const double now_ms = GetNowMs();
+        const double sec = std::max(bench_.elapsed_ms(now_ms) / 1000.0, 0.001);
+        // The same figure the result reports: frames on the bus (the receiver's count when there is one) over the time of the sending, so
+        // the average does not fall while the run drains; the rate of the last second is shown next to it
+        const bool by_receiver = bench_.config().rx_dev >= 0 && now.rx > 0;
+        const uint64_t on_bus = by_receiver ? now.rx : now.echo;
+        if (now_ms - bench_rate_ms_ >= 1000.0 || bench_rate_ms_ > now_ms) {
+            bench_rate_now_ = bench_rate_ms_ > now_ms || on_bus < bench_rate_n_ ? 0.0 : (on_bus - bench_rate_n_) * 1000.0 / (now_ms - bench_rate_ms_);
+            bench_rate_ms_ = now_ms;
+            bench_rate_n_ = on_bus;
+        }
+        ImGui::Text("%s %.1f s: sent %llu, echoed %llu%s",
+                    bench_.state() == TxBenchmark::State::Running ? "Running" : "Finishing", sec,
+                    static_cast<unsigned long long>(bench_.sent()), static_cast<unsigned long long>(now.echo),
+                    bench_.config().rx_dev >= 0 ? (", received " + std::to_string(now.rx)).c_str() : "");
+        ImGui::Text("Average %.0f frames/s (the last second: %.0f)", on_bus / sec, bench_rate_now_);
+        ImGui::ProgressBar(static_cast<float>(sec / bench_.config().duration_s), ImVec2(-1.0f, 0.0f));
+    } else if (bench_.state() == TxBenchmark::State::Done && bench_.result().valid) {
+        const BenchResult& r = bench_.result();
+        ImGui::Text("Result (%s)", r.stop_reason.c_str());
+        if (ImGui::BeginTable("##benchresult", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            auto row = [](const char* name, const std::string& value, bool bad = false) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(name);
+                ImGui::TableNextColumn();
+                if (bad) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.40f, 1.0f));
+                ImGui::TextUnformatted(value.c_str());
+                if (bad) ImGui::PopStyleColor();
+            };
+            auto num = [](double v, const char* fmt) { char b[48]; std::snprintf(b, sizeof(b), fmt, v); return std::string(b); };
+            row("Time", num(r.seconds, "%.2f s"));
+            row("Frames sent / echoed", std::to_string(r.sent) + " / " + std::to_string(r.echoed));
+            if (r.has_receiver) {
+                if (r.echoes_missing != 0) row("Echoes missing", std::to_string(r.echoes_missing) + " (the frames arrived, the sender reported no echo for them)", true);
+            } else if (r.unechoed != 0) {
+                row("Sent without an echo", std::to_string(r.unechoed) + " (a failed transfer loses every frame in it; choose a receiver to tell; see the Event log)", r.unechoed > 0);
+            }
+            row("Page feeds the sender", num(r.ui_fps, "%.0f times/s") + (r.window > 0 ? ", window " + std::to_string(r.window) + ", " + num(r.avg_waiting, "%.0f") + " waiting on average" : std::string(", fixed rate")));
+            row("Adapter FIFO had no free slot", num(r.gate_closed_pct, "%.0f %% of the time") + " (the echoes come back too late to keep it full)");
+            row("USB transfers carrying the frames", std::to_string(r.tx_transfers) + ", " + num(r.frames_per_transfer, "%.1f") + " frames each");
+            row("Rate", num(r.fps, "%.0f frames/s") + ", payload " + num(r.data_kbps, "%.0f kbit/s"));
+            row("What the bit rates allow", num(r.max_fps, "%.0f frames/s") + " (" + num(r.bus_us_per_frame, "%.1f us per frame, no stuff bits") + ")");
+            row("Reached", num(r.efficiency_pct, "%.0f %% of it"));
+            row("Computed bus load", num(r.busload_pct, "%.0f %%"));
+            if (r.adapter_busload_pct >= 0) row("Bus load reported by the adapter", std::to_string(r.adapter_busload_pct) + " %");
+            if (r.has_receiver) {
+                row("Received by the receiver", std::to_string(r.received));
+                row("Lost (never arrived)", std::to_string(r.lost), r.lost != 0);
+                row("Longest gap at the receiver", num(r.rx_max_gap_ms, "%.1f ms"));
+            }
+            row("Transmit errors / dropped", std::to_string(r.tx_errors) + " / " + std::to_string(r.tx_dropped), r.tx_errors != 0 || r.tx_dropped != 0);
+            ImGui::EndTable();
+        }
+        if (ImGui::Button("Copy result")) ImGui::SetClipboardText(BenchReportText().c_str());
+        ShowClipboardStatus();
+    } else {
+        ImGui::TextDisabled("No run yet.");
+    }
+    ImGui::End();
+}
+
 // Bus load / error / state / text lines of the worker core (Elmue protocol, PEAK)
 void AppUI::OnAdapterEvents(int dev, const std::string& lines) {
     if (!ValidDevice(dev) || !devices_[dev].used || !devices_[dev].adapter) return;
     devices_[dev].adapter->OnEvents(lines);
+
+    // The adapter's own error reports (TX buffer overflow, bus off, ...) go to the event log, at most one line a second per adapter
+    const DeviceSlot& d = devices_[dev];
+    if (d.error_reports < err_seen_[dev]) err_seen_[dev] = 0;          // the counter was reset (the adapter was opened again)
+    if (d.error_reports > err_seen_[dev]) {
+        const uint32_t n = d.error_reports - err_seen_[dev];
+        const double now = GetNowMs();
+        if (now - err_log_ms_[dev] >= 1000.0) {
+            err_log_ms_[dev] = now;
+            err_seen_[dev] = d.error_reports;
+            AddLog(1, dev, "adapter error report" + (n > 1 ? " (+" + std::to_string(n) + ")" : std::string()) + ": " +
+                           (d.last_error_text.empty() ? std::string("(no details)") : d.last_error_text));
+        }
+    }
 }
 
 void AppUI::OnNotice(const std::string& text) {
@@ -758,6 +1019,7 @@ float AppUI::RenderMenuBar() {
             ImGui::MenuItem("2. Receive Table by ID (Grouped Monitor)", nullptr, &show_id_table_window_);
             ImGui::MenuItem("3. Receive Trace (Chronological Stream)", nullptr, &show_trace_window_);
             ImGui::MenuItem("6. Event log (connections, losses, errors)", nullptr, &show_log_window_);
+            ImGui::MenuItem("7. Benchmark (transmit stress test)", nullptr, &show_bench_window_);
             ImGui::MenuItem("4. Transmit Frame & Periodic Jobs", nullptr, &show_tx_window_);
             ImGui::MenuItem("5. Sent Messages History", nullptr, &show_history_window_);
             ImGui::EndMenu();
@@ -1313,7 +1575,7 @@ void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float 
                 const ImGuiTableColumnSortSpecs& spec = sort_specs->Specs[0];
                 const bool ascending = (spec.SortDirection == ImGuiSortDirection_Ascending);
 
-                std::sort(sorted_rows.begin(), sorted_rows.end(), [&](const IdTableEntry* a, const IdTableEntry* b) {
+                SortUnlessSorted(sorted_rows.begin(), sorted_rows.end(), [&](const IdTableEntry* a, const IdTableEntry* b) {
                     int cmp = 0;
                     switch (spec.ColumnUserID) {
                         case ID_COL_DEV:
@@ -1353,8 +1615,13 @@ void AppUI::RenderIdTableWindow(double now_ms, float x, float y, float w, float 
             sort_specs->SpecsDirty = false;
         }
 
-        for (const IdTableEntry* entry_ptr : sorted_rows) {
-            const IdTableEntry& entry = *entry_ptr;
+        // Only the rows in view are built (ImGuiListClipper); every row has the same height
+        id_table_rows_built_ = 0;
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(sorted_rows.size()));
+        while (clipper.Step()) for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            const IdTableEntry& entry = *sorted_rows[static_cast<size_t>(row)];
+            ++id_table_rows_built_;
             const CanMessage& m = entry.last_msg;
 
             ImGui::TableNextRow();
@@ -1488,11 +1755,13 @@ void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
                 const ImGuiTableColumnSortSpecs& spec = sort_specs->Specs[0];
                 const bool ascending = (spec.SortDirection == ImGuiSortDirection_Ascending);
 
-                // Optimization:rx_trace_ is naturally sorted by timestamp ascending;
-                // only run std::sort if another column or descending order is requested
-                bool is_default_time_asc = (spec.ColumnUserID == TRACE_COL_TIME && ascending);
-                if (!is_default_time_asc) {
-                    std::sort(visible_trace.begin(), visible_trace.end(), [&](const TraceEntry* a, const TraceEntry* b) {
+                // rx_trace_ is in time order already: ascending time needs nothing and descending time is the same list backwards; for the
+                // other columns the view is sorted only when it is not in order already
+                const bool by_time = (spec.ColumnUserID == TRACE_COL_TIME);
+                if (by_time) {
+                    if (!ascending) std::reverse(visible_trace.begin(), visible_trace.end());
+                } else {
+                    SortUnlessSorted(visible_trace.begin(), visible_trace.end(), [&](const TraceEntry* a, const TraceEntry* b) {
                         int cmp = 0;
                         switch (spec.ColumnUserID) {
                             case TRACE_COL_TIME:
@@ -1529,8 +1798,13 @@ void AppUI::RenderTraceWindow(float x, float y, float w, float h) {
             sort_specs->SpecsDirty = false;
         }
 
-        for (const TraceEntry* item_ptr : visible_trace) {
-            const TraceEntry& item = *item_ptr;
+        // Only the rows in view are built (ImGuiListClipper): formatting 2000 rows every frame is what slowed the page down
+        trace_rows_built_ = 0;
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(visible_trace.size()));
+        while (clipper.Step()) for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            const TraceEntry& item = *visible_trace[static_cast<size_t>(row)];
+            ++trace_rows_built_;
             const CanMessage& m = item.msg;
 
             ImGui::TableNextRow();
@@ -1955,6 +2229,7 @@ void AppUI::Render() {
 
     // 1. Execute periodic CAN transmissions scheduled by user
     ProcessPeriodicJobs(now_ms);
+    ProcessBenchmark(now_ms);
 
     // 2. Render Top Menu Bar and get its height
     float menu_h = RenderMenuBar();
@@ -1984,5 +2259,6 @@ void AppUI::Render() {
     if (show_tx_window_)       RenderTransmitWindow(now_ms, x_left, y2, left_w, row2_h);
     if (show_trace_window_)    RenderTraceWindow(x_right, y2, right_w, row2_h);
     if (show_log_window_)      RenderLogWindow();
+    if (show_bench_window_)    RenderBenchmarkWindow();
     if (show_history_window_)  RenderSentHistoryWindow(x_left, y3, usable_w + pad, row3_h);
 }

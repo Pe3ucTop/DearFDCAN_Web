@@ -540,6 +540,21 @@ EMSCRIPTEN_KEEPALIVE void core_set_elmue(int dev, int with_timestamp) {
     g_elmue_ts[dev] = with_timestamp != 0;
 }
 
+// Elmue: how many transmitted frames wait for their echo (staged by the worker, not yet echoed). The adapter's transmit FIFO holds a
+// limited number of frames; the worker keeps the count of the frames it has put on the wire below that (staged minus still queued).
+EMSCRIPTEN_KEEPALIVE int core_tx_pending(int dev) {
+    if (dev < 0 || dev >= kMaxDevices) return 0;
+    int n = 0;
+    for (const CanMessage& e : g_echo[dev]) n += e.is_tx_echo ? 1 : 0;
+    return n;
+}
+
+// Elmue: forget the frames that wait for an echo (the echoes are overdue and are taken as lost)
+EMSCRIPTEN_KEEPALIVE void core_tx_forget(int dev) {
+    if (dev < 0 || dev >= kMaxDevices) return;
+    for (CanMessage& e : g_echo[dev]) e = CanMessage();
+}
+
 // One answer of GS_USB_BREQ_TIMESTAMP: the adapter clock (µs), the page time in the middle of the request
 // and the round trip of the request (both ms, on the page timeline)
 EMSCRIPTEN_KEEPALIVE void core_clock_sample(int dev, uint32_t hw_us, double host_mid_ms, double rtt_ms) {

@@ -90,6 +90,92 @@ async function testGsUsbElmue() {
     return h;
 }
 
+// Elmue transmit: queued frames go out as TX blobs, and no more frames than the adapter's FIFO has free slots are on the wire
+async function testElmueTxBlobs() {
+    const mock = createMockDevice(0x1D50, 0x606F, 'ELM2', () => null);
+    const h = createHarness(BUILD, SRC, mock, PACKED);
+    h.send({ type: 'init', timeOrigin: performance.timeOrigin });
+    h.send({ type: 'open', dev: 0, epoch: 1, vid: 0x1D50, pid: 0x606F, serial: 'ELM2' });
+    await h.waitFor(m => m.type === 'opened', 3000, 'opened', C);
+    h.send({ type: 'rx', dev: 0, enable: true, ep: 0, size: 2048, elmue: true, ts: false, blobs: true });
+    await sleep(50);
+
+    // the frames in the transfers written so far: [{marker, id}] in the order of the wire; blobs are checked for their format
+    let badBlob = 0, blobs = 0, singles = 0;
+    const wire = () => {
+        const frames = [];
+        badBlob = 0; blobs = 0; singles = 0;
+        for (const t of mock.txOut) {
+            const d = t.data;
+            if (d[1] === 10) { singles++; frames.push({ marker: d[7], id: d[3] | (d[4] << 8) }); continue; }
+            if (d[1] !== 16 || d.length > 2048) { badBlob++; continue; }
+            blobs++;
+            let off = 2, n = 0;
+            while (off < d.length) { const sz = d[off]; if (sz < 8 || d[off + 1] !== 10) { badBlob++; break; } frames.push({ marker: d[off + 7], id: d[off + 3] | (d[off + 4] << 8) }); off += sz; n++; }
+            if (off !== d.length || n !== d[0]) badBlob++;
+        }
+        return frames;
+    };
+    const frameMsg = i => new Uint8Array([9, 10, 0, i & 255, 0x01, 0, 0, i, 0xA0 + (i & 15)]).buffer;
+    const sendFrames = (from, to) => { for (let i = from; i <= to; i++) h.send({ type: 'tx', dev: 0, ep: 0, data: frameMsg(i) }); };
+    const echoes = (from, to) => { const m = [0, 17]; for (let i = from; i <= to; i++) m.push(7, 11, i, 0, 0, 0, 0); m[0] = to - from + 1; return m; };
+
+    // a burst: whatever queued up behind the first transfers is merged; every frame on the wire once, in order
+    sendFrames(1, 30);
+    await sleep(100);
+    let f = wire();
+    check(f.length === 30 && f.every((x, i) => x.marker === i + 1 && x.id === 0x100 + i + 1), 'txblob: 30 frames on the wire in order (' + f.length + ')');
+    check(blobs >= 1 && badBlob === 0, 'txblob: ' + blobs + ' blob(s) and ' + singles + ' single transfers, well formed (bad: ' + badBlob + ')');
+
+    // 100 frames while no echo comes back: the adapter's FIFO takes 64
+    mock.txOut.length = 0;
+    sendFrames(31, 130);
+    await sleep(200);
+    f = wire();
+    check(f.length === 34, 'txblob: only the free FIFO slots are used (' + f.length + ' more frames after 30 unechoed, 34 expected)');
+    check(badBlob === 0, 'txblob: blobs well formed while limited');
+
+    // the echoes of 1..30 free their slots: more frames go out (the rest stays out while 64 are unechoed)
+    mock.pushRx(echoes(1, 30));
+    await sleep(200);
+    f = wire();
+    check(f.length === 64, 'txblob: echoes free slots, 64 frames on the wire in total (' + f.length + ')');
+    check(f.every((x, i) => x.marker === i + 31) , 'txblob: order kept across the limit');
+
+    // no echoes at all: after the stall time the rest goes out and the worker says so
+    await sleep(1300);
+    f = wire();
+    check(f.length === 100, 'txblob: stalled echoes are given up, the remaining frames go out (' + f.length + ')');
+    check(h.posted.some(m => m.type === 'log' && /did not free/.test(m.text)), 'txblob: the stall is reported in the log');
+
+    // the statistics tell how the transmit path worked: transfers, frames in them, and the time the FIFO gate held the queue back
+    await sleep(1100);
+    const stats = h.posted.filter(m => m.type === 'stats');
+    const lastStats = stats[stats.length - 1];
+    check(lastStats && lastStats.txFrames >= 130 && lastStats.txXfers > 0 && lastStats.txXfers < lastStats.txFrames, 'txblob: statistics count transfers and the frames in them (' + JSON.stringify(lastStats) + ')');
+    check(lastStats && lastStats.txGateMs >= 900, 'txblob: statistics count the time the FIFO gate held the queue (' + (lastStats && lastStats.txGateMs) + ' ms)');
+
+    // a legacy-like channel (no blobs flag): one frame per transfer
+    h.send({ type: 'rx', dev: 0, enable: false });
+    await sleep(30);
+    h.send({ type: 'rx', dev: 0, enable: true, ep: 0, size: 2048, elmue: true, ts: false });
+    await sleep(30);
+    mock.txOut.length = 0;
+    sendFrames(200, 210);
+    await sleep(100);
+    wire();
+    check(blobs === 0 && singles === 11, 'txblob: without the blobs flag every frame is its own transfer (' + singles + ')');
+
+    // the page can lower the number of FIFO slots the worker fills (11 frames are unechoed now: 16 slots leave 5)
+    h.send({ type: 'tx_fifo', dev: 0, slots: 16 });
+    sendFrames(211, 230);
+    await sleep(200);
+    f = wire();
+    check(f.length === 16, 'tx_fifo: with 16 slots only 5 more frames go out (' + f.length + ' on the wire in all, 16 expected)');
+    h.send({ type: 'close', dev: 0 });
+    await sleep(50);
+}
+
 async function testPcan() {
     const mock = createMockDevice(0x0C72, 0x0012, 'PCAN1');
     const h = createHarness(BUILD, SRC, mock, PACKED);
@@ -120,6 +206,7 @@ async function testPcan() {
 
 (async () => {
     await testGsUsbElmue();
+    await testElmueTxBlobs();
     await testPcan();
     console.log(C.n + ' checks, ' + C.fails + ' failed');
     process.exit(C.fails ? 1 : 0);

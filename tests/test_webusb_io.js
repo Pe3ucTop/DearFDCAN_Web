@@ -394,7 +394,71 @@ async function testRecoveryWindow() {
     check(lines.length === 1 && lines[0] === 'error:control transfer failed: NetworkError: A transfer error has occurred.', 'warnings and errors go to onLog (' + lines + ')');
 }
 
+// planTx: the owner may merge the first queued items into one transfer, or hold the queue back until it calls pumpTx() again
+async function testPlanTx() {
+    const u = mockUsb(); u.configuration = null;
+    u.selectConfiguration = async () => { u.configuration = mockUsb().configuration; };
+    installUsb([]);
+    const p = new TestPort('plan', { autoReceive: false, txInflight: 1 });
+    await p.openDevice({ device: u, configuration: 1 }, handshake);
+    const done = [];
+    let hold = true;
+    p.planTx = (queue, head) => {
+        if (hold) return null;
+        const n = Math.min(queue.length - head, 3);
+        return n < 2 ? { count: 1 } : { count: n, data: new Uint8Array(n * 10).buffer };
+    };
+    for (let i = 1; i <= 7; i++) p.enqueueTx(new Uint8Array(i).buffer, 0, ok => done.push(i + (ok ? '+' : '-')));
+    await sleep(5);
+    check(u.outs.length === 0 && done.length === 0, 'planTx returning null holds the queue back');
+    hold = false;
+    p.pumpTx();
+    await sleep(10);
+    check(u.outs.map(o => o.n).join() === '30,30,7' && done.join() === '1+,2+,3+,4+,5+,6+,7+', 'merged items go out as one transfer of the given bytes, each callback gets the result (' + u.outs.map(o => o.n) + ' / ' + done + ')');
+    check(p.txQueue.length - p.txHead === 0, 'the queue is empty afterwards');
+    u.outBehavior = async () => ({ status: 'babble' });
+    done.length = 0;
+    const lines = [];
+    p.onLog = (level, text) => lines.push(level + ':' + text);
+    hold = true;
+    for (let i = 1; i <= 3; i++) p.enqueueTx(new Uint8Array(i).buffer, 0, ok => done.push(i + (ok ? '+' : '-')));
+    hold = false;
+    p.pumpTx();
+    await sleep(10);
+    check(done.join() === '1-,2-,3-' && p.st.txErrors === 1, 'a failed merged transfer fails all its items (' + done + ')');
+    check(lines.length === 1 && lines[0] === 'warn:transmit failed with status babble (30 bytes, 3 frames merged)', 'a failed transmit is logged with the status and the size (' + lines + ')');
+    await p.closeDevice();
+}
+
+// A transfer the device stalls is sent again (same bytes, same place in the queue) before its frames are given up
+async function testStallRetry() {
+    const u = mockUsb(); u.configuration = null;
+    u.selectConfiguration = async () => { u.configuration = mockUsb().configuration; };
+    installUsb([]);
+    const p = new TestPort('retry', { autoReceive: false, txInflight: 1, txStallRetries: 2, txRetryDelayMs: 1 });
+    p.onLog = () => {};
+    await p.openDevice({ device: u, configuration: 1 }, handshake);
+    const done = [];
+    let n = 0;
+    u.outBehavior = async () => (++n <= 2 ? { status: 'stall' } : { status: 'ok' });
+    for (let i = 1; i <= 3; i++) p.enqueueTx(new Uint8Array(i).buffer, 0, ok => done.push(i + (ok ? '+' : '-')));
+    await sleep(60);
+    check(u.outs.map(o => o.n).join() === '1,1,1,2,3' && done.join() === '1+,2+,3+', 'a stalled transfer is sent again and keeps its place (' + u.outs.map(o => o.n) + ' / ' + done + ')');
+    check(p.st.txRetries === 2 && p.st.txErrors === 0 && u.halts.length === 2, 'retries are counted, no error while they succeed (' + p.st.txRetries + ' / ' + p.st.txErrors + ')');
+
+    u.outBehavior = async () => ({ status: 'stall' });
+    done.length = 0;
+    u.outs.length = 0;
+    p.enqueueTx(new Uint8Array(4).buffer, 0, ok => done.push('4' + (ok ? '+' : '-')));
+    p.enqueueTx(new Uint8Array(5).buffer, 0, ok => done.push('5' + (ok ? '+' : '-')));
+    await sleep(60);
+    check(u.outs.map(o => o.n).join() === '4,4,4,5,5,5' && done.join() === '4-,5-' && p.st.txErrors === 2, 'after the retries the frames are given up and the queue goes on (' + u.outs.map(o => o.n) + ' / ' + done + ')');
+    await p.closeDevice();
+}
+
 (async () => {
+    await testStallRetry();
+    await testPlanTx();
     await testRecoveryWindow();
     await testDirectAndOnDemand();
     await testMatchingAndOpen();

@@ -33,6 +33,15 @@ available in Firefox/Safari) and talks to the adapter directly, no driver or nat
 - **Receive Table by ID**: one row per device and ID with count, cycle time (min/max kept internally), changed bytes highlighted,
   sortable columns, `Dev` column and a device filter.
 - **Receive Trace**: chronological list with `Dev` column, filter by ID and by device, pause, auto-scroll.
+- **Benchmark** (View menu, "7. Benchmark"): a transmit stress test. One adapter (the sender) sends numbered frames with IDs of their own, as fast as its
+  tx echoes allow (at most the chosen number of frames waiting for their echo) or at a fixed rate; an optional second adapter on the same bus (the
+  receiver) counts what arrives. The result: frames sent / echoed, frames per second, payload rate, the share of what the bit rates allow
+  (computed from the frame length, no stuff bits), frames lost, the longest gap at the receiver, transmit errors; **Copy result** puts it on the clipboard.
+  With one adapter only the echoes are counted (the adapter says the frame was on the bus, not that anyone acknowledged it).
+  With a receiver, "lost" means frames that never arrived and "echoes missing" frames that arrived without an echo (adapters drop echoes under load);
+  the as-fast-as-possible mode then also counts the receiver's frames as done. The as-fast-as-possible rate is limited by how often the page feeds the
+  sender (window x about 30 per second at 60 fps); a fixed rate does not depend on that. "Adapter FIFO slots" limits how much of the 64-slot transmit FIFO
+  of a gs_usb (Elmue) adapter the worker fills during the run.
 - **Event log** (View menu, "6. Event log"): connections, BUS ON/OFF, device losses with the reason, warnings and errors of the USB transport.
   It is kept in the browser's `localStorage` (600 lines), so the lines of the previous session can be read after a reload; **Copy all**
   puts the text on the clipboard.
@@ -172,6 +181,9 @@ unit-tested natively.
 | File | Role |
 |---|---|
 | `apps/dearfdcan_web/main.cpp` | GLFW/ImGui setup, main loop, wiring of bridge callbacks |
+| `libs/browser-clipboard/browser_clipboard.js` | The browser's clipboard for Dear ImGui (Emscripten's GLFW has none): the text of `paste` events, `writeText` with an `execCommand` fallback, a refused text waits for the next click / key press or `copy` event; test `tests/test_browser_clipboard.js` (mock browser) |
+| `apps/dearfdcan_web/clipboard.cpp/.h` | Gives ImGui that clipboard (`Platform_Set/GetClipboardTextFn`) and the text next to the Copy buttons ("Copied" / "click again") |
+| `apps/dearfdcan_web/benchmark.cpp/.h` | The logic of the Benchmark window (pacing by tx echoes or a fixed rate, bus time of a frame, evaluation); `tests/test_benchmark.cpp` |
 | `apps/dearfdcan_web/app_ui.cpp/.h` | All windows, adapter slots (`DeviceSlot`: the adapter's state and the user's settings, plus its driver), snapshot ingestion, URL parameters |
 | `libs/can-adapters/can_adapter.cpp/.h` | Adapter drivers (gs_usb with Elmue, PEAK, SLCAN) over the `ITransport` interface: capabilities, start / stop sequences and their acknowledgements, bit-timing limits, transmit frames, bus reports; no UI and no Emscripten code |
 | `apps/dearfdcan_web/url_params.h` | Parsing of the URL parameter values |
@@ -216,6 +228,31 @@ Build tooling in the repository root:
 | `apps/dearfdcan_web/pack_worker.py` | Packs the workers for the single-file build |
 
 Tunables: `RX_SLOTS`, `TX_INFLIGHT`, `PUBLISH_MS`, `BATCH_CREDITS` at the top of `apps/dearfdcan_web/usb_worker.js`; table/trace limits at the top of `libs/can-engine/can_core.cpp`.
+
+## Measured transmit throughput
+
+Benchmark window, CAN FD + BRS, 8 data bytes, 11 bit ID, CANable 2.5 (Elmue firmware, G0B1 = dev 1, G431 = dev 2), a PCAN-USB FD as receiver, receive windows
+closed, 10 s runs, 60 fps page, all three adapters BUS ON. The bit rates allow 19.3 kframes/s (51.8 us a frame, no stuff bits). "Received" is what the receiver counted.
+
+| Sender | Mode | Offered | Received | Lost | Notes |
+|---|---|---|---|---|---|
+| G0B1 | as fast as possible (echo paced), window 75 / 150 / 200 | - | 3.0 / 5.0-5.3 / 6.0 kframes/s | 0-42 | rate follows the window: the page feeds the sender once per frame |
+| PCAN-USB FD | as fast as possible, window 150 | - | 5.0 kframes/s | 0-1293 | one frame per USB transfer, the same rate: the limit is the page |
+| G0B1 | fixed rate | 7000 | 6.7 kframes/s | 4 % | |
+| G0B1 | fixed rate | 10000 / 15000 | 7.0 / 7.2 kframes/s | 30 % / 52 % | the adapter saturates at about 7-8 kframes/s |
+| G431 | fixed rate | 7000 | 7.0 kframes/s | 0.8 % | |
+| G431 | fixed rate | 10000 / 15000 | 9.1 / 11.9 kframes/s | 9 % / 21 % | up to 13.2 kframes/s with 32 FIFO slots |
+| G431, 64 bytes, 29 bit ID, no BRS | as fast as possible | - | 1.6 kframes/s | 0 | 95 % of what the bit rates allow: the bus is the limit |
+| G431, 64 bytes, BRS | as fast as possible | - | 4.6 kframes/s | 0 | 85 % of what the bit rates allow |
+
+What the runs showed:
+
+- Above the saturation rate the adapters refuse transfers ("transmit stalled", "adapter TX buffer full" in the event log); the worker sends a refused
+  transfer again up to 3 times, then the frames are given up. The number of FIFO slots the worker fills (64, 32, 16) changed the rate by 10 % at most and did not
+  stop the "TX buffer full" reports, so the overflow is not the 64-slot FIFO alone.
+- Under load the adapters drop tx echoes although the frames are on the bus (459 / 4891 / 11597 of 70 / 100 / 150 k frames for the G431 at 7 / 10 / 15 kframes/s).
+  The report therefore counts "lost" from the receiver and shows "echoes missing" apart.
+- The as-fast-as-possible mode is limited by the page (window x about 30 per second), the fixed rate by the adapter.
 
 ## Known limitations
 

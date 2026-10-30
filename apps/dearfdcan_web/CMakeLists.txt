@@ -22,7 +22,7 @@ add_library(imgui_objs OBJECT
 target_include_directories(imgui_objs PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
 
 # --- the page ---
-add_library(page_objs OBJECT main.cpp webusb_bridge.cpp app_ui.cpp)
+add_library(page_objs OBJECT main.cpp webusb_bridge.cpp app_ui.cpp benchmark.cpp clipboard.cpp)
 target_include_directories(page_objs PUBLIC ${APP_DIR})
 target_link_libraries(page_objs PUBLIC can_adapters can_engine imgui_objs PRIVATE dearfdcan_warnings)
 # (can_engine: only its header can_wire.h is needed here; its objects are linked into the worker module, not into the page)
@@ -34,13 +34,14 @@ list(JOIN PAGE_EXPORTS "," PAGE_EXPORTS_ARG)
 set(PAGE_LINK_OPTIONS
     -sUSE_GLFW=3 -sMIN_WEBGL_VERSION=2 -sMAX_WEBGL_VERSION=2
     -sEXPORTED_RUNTIME_METHODS=stringToUTF8,lengthBytesUTF8,UTF8ToString
-    -sEXPORTED_FUNCTIONS=${PAGE_EXPORTS_ARG})
+    -sEXPORTED_FUNCTIONS=${PAGE_EXPORTS_ARG}
+    "SHELL:--pre-js ${BROWSER_CLIPBOARD_JS}")       # the clipboard (clipboard.cpp); Emscripten's GLFW has none
 
 # --- the CAN worker module: can-engine + can-protocols as WebAssembly ---
 set(CORE_EXPORTS
     _core_stage_ptr _core_stage_cap _core_out_ptr _core_out_cap _core_process _core_publish _core_clear_table _core_clear_trace
     _core_set_trace_enabled _core_reset_clock _core_set_protocol _core_reset_stream _core_set_rx_enabled _core_take_replies
-    _core_reply_ptr _core_set_elmue _core_clock_sample _core_clock_stats _core_take_events)
+    _core_reply_ptr _core_set_elmue _core_clock_sample _core_clock_stats _core_take_events _core_tx_pending _core_tx_forget)
 list(JOIN CORE_EXPORTS "," CORE_EXPORTS_ARG)
 set(CORE_LINK_OPTIONS
     -sMODULARIZE=1 -sEXPORT_NAME=createCanCore -sENVIRONMENT=worker -sALLOW_MEMORY_GROWTH=1
@@ -73,7 +74,7 @@ add_custom_target(worker_bundle DEPENDS ${BUNDLE})
 dearfdcan_module(page_single index .html ${OUT_SINGLE} $<TARGET_OBJECTS:page_objs> $<TARGET_OBJECTS:imgui_objs>)
 target_link_libraries(page_single PRIVATE can_adapters)
 target_link_options(page_single PRIVATE ${PAGE_LINK_OPTIONS} -sSINGLE_FILE=1 "SHELL:--pre-js ${BUNDLE}")
-set_property(TARGET page_single APPEND PROPERTY LINK_DEPENDS ${BUNDLE})
+set_property(TARGET page_single APPEND PROPERTY LINK_DEPENDS ${BUNDLE} ${BROWSER_CLIPBOARD_JS})
 add_dependencies(page_single worker_bundle)
 
 # GitHub Pages: the single-file page is published as docs/index.html
@@ -99,6 +100,7 @@ target_link_options(core_multi PRIVATE ${CORE_LINK_OPTIONS})
 dearfdcan_module(page_multi index .html ${OUT_MULTI} $<TARGET_OBJECTS:page_objs> $<TARGET_OBJECTS:imgui_objs>)
 target_link_libraries(page_multi PRIVATE can_adapters)
 target_link_options(page_multi PRIVATE ${PAGE_LINK_OPTIONS})
+set_property(TARGET page_multi APPEND PROPERTY LINK_DEPENDS ${BROWSER_CLIPBOARD_JS})
 
 # the workers and the transport libraries they load with importScripts()
 foreach(file ${APP_DIR}/usb_worker.js ${APP_DIR}/serial_worker.js ${WEBUSB_IO_JS} ${WEBSERIAL_IO_JS})

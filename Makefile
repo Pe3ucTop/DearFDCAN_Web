@@ -59,6 +59,8 @@ test:
 	cmake -S . -B $(ABS_BUILD)/native -DCMAKE_BUILD_TYPE=Debug -DIMGUI_DIR=$(IMGUI_DIR)
 	cmake --build $(ABS_BUILD)/native -j$(JOBS)
 	ctest --test-dir $(ABS_BUILD)/native --output-on-failure
+	@# a multi-file build that exists is brought up to date first (a stale can_core.wasm would be tested against the new worker)
+	@if [ -f $(BUILD)/multi/can_core.wasm ] && [ -f $(ABS_BUILD)/em/CMakeCache.txt ]; then $(EMSDK_EXEC) cmake --build $(ABS_BUILD)/em --target multi -j$(JOBS); fi
 	@if [ -f $(BUILD)/multi/can_core.wasm ]; then node tests/test_workers.js $(BUILD)/multi apps/dearfdcan_web; \
 	 else echo "(worker tests skipped: run 'make MODE=multi' first)"; fi
 	@if [ -f $(ABS_BUILD)/em/CMakeCache.txt ]; then $(EMSDK_EXEC) cmake --build $(ABS_BUILD)/em --target run_test_webusb; \

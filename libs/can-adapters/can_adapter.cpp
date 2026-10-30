@@ -351,7 +351,8 @@ private:
 
         st_.elmue_active = true;
         // Messages of up to 2048 bytes (blobs); the worker resolves tx echoes and, with timestamps, keeps the adapter clock synchronised
-        tr_.StartRx(0, ELM_MAX_BLOB_SIZE, kRxFlagElmue | (st_.hw_timestamps_active ? kRxFlagTimestamps : 0));
+        tr_.StartRx(0, ELM_MAX_BLOB_SIZE, kRxFlagElmue | (st_.hw_timestamps_active ? kRxFlagTimestamps : 0) |
+                                          ((st_.bt_const.feature & ELM_FEATURE_USB_BLOBS) ? kRxFlagTxBlobs : 0));
         st_.channel_opening = true;
     }
 };

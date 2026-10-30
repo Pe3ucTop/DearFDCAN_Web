@@ -33,6 +33,12 @@ const GS_RX_SIZE = 2048;            // gs_usb receive transfers: room for an Elm
 const RX_SLOTS = 6;                 // concurrent transferIn requests kept pending per adapter
 const TX_INFLIGHT = 4;              // concurrent transferOut per adapter; set to 1 for strictly serialized TX
 const TX_QUEUE_MAX = 4096;
+const TX_STALL_RETRIES = 3;         // a transfer the adapter stalls is sent again this many times before its frames are given up
+const TX_BLOB_INFLIGHT = 1;         // with TX blobs one transfer at a time: frames queue up meanwhile and the next blob carries all of them
+const ELM_TX_FRAME = 10, ELM_TX_BLOB = 16;      // message types of the Elmue protocol (can_protocol_elmue.h)
+const ELM_MAX_BLOB = 2048;                      // biggest transfer of the protocol
+const ELM_TX_FIFO = 64;                         // transmit FIFO of the adapter (CAN_QUEUE_SIZE of the firmware): more frames overflow it
+const ELM_TX_STALL_MS = 1000;                   // echoes that stay away this long are taken as lost, so the queue cannot stay blocked
 const BATCH_CREDITS = 4;            // snapshots that may be unacknowledged by the page
 const PUBLISH_MS = 16;              // snapshot period (about one display frame)
 const STAGE_REC_HEADER = 12;        // u16 len | u8 dev | u8 ep_address | f64 host_time_ms
@@ -47,7 +53,7 @@ const GS_USB_BREQ_TIMESTAMP = 6;    // the adapter's microsecond clock, read per
 
 // The USB transport of every adapter (see webusb_io.js); device matching skips the devices other contexts hold
 const USB_OPTIONS = {
-    iface: IFACE, rxSlots: RX_SLOTS, txInflight: TX_INFLIGHT, txQueueMax: TX_QUEUE_MAX, ctrlTimeoutMs: CTRL_TIMEOUT_MS,
+    iface: IFACE, rxSlots: RX_SLOTS, txInflight: TX_INFLIGHT, txQueueMax: TX_QUEUE_MAX, txStallRetries: TX_STALL_RETRIES, ctrlTimeoutMs: CTRL_TIMEOUT_MS,
     idlePingMs: IDLE_PING_MS, pingTimeoutMs: PING_TIMEOUT_MS, pingFailsMax: PING_FAILS_MAX, rxErrorsBeforeRecover: RX_ERRORS_BEFORE_RECOVER,
     tag: 'usb_worker', inUse: () => devices.filter(x => x && x.usb).map(x => x.usb)
 };
@@ -346,7 +352,8 @@ class Device extends UsbPort {
         if (!this.usb) return;
         this.post('stats', {
             rxPerSec: this.st.rx - this.st.rxPrev, txDropped: this.st.txDropped,
-            recoveries: this.st.recoveries, rxErrors: this.st.rxErrors, txErrors: this.st.txErrors
+            recoveries: this.st.recoveries, rxErrors: this.st.rxErrors, txErrors: this.st.txErrors,
+            txGateMs: Math.round(this.st.txGateMs || 0), txXfers: this.st.txXfers, txFrames: this.st.txFrames     // cumulative
         });
         this.st.rxPrev = this.st.rx;
         this.watchdog();
@@ -362,6 +369,7 @@ class GsUsbDevice extends Device {
     constructor(dev) {
         super(dev);
         this.elmue = false;             // the channel runs in Elmue mode: the core needs the transmitted frames to resolve the tx echoes
+        this.txFifo = ELM_TX_FIFO;      // slots of the adapter's transmit FIFO the worker may fill (the page can lower it: message tx_fifo)
 
         // Clock synchronisation (GS_USB_BREQ_TIMESTAMP)
         this.syncOn = false;
@@ -386,20 +394,87 @@ class GsUsbDevice extends Device {
     // The page says whether the channel runs in Elmue mode (compact messages) and with timestamps
     onRxEnable(m) {
         this.elmue = !!m.elmue;
+        this.txBlobs = this.elmue && !!m.blobs;
+        this.opt.txInflight = this.txBlobs ? TX_BLOB_INFLIGHT : TX_INFLIGHT;
+        this.txBlockedSince = 0;
         if (this.elmue) core._core_set_elmue(this.dev, m.ts ? 1 : 0);
         else core._core_set_protocol(this.dev, PROTO_GS);
     }
 
     onRxStarted(m) { if (m.ts) this.startSync(); }
     onRxStopped() { this.stopSync(); }
-    onTeardown() { this.elmue = false; this.stopSync(); }
+    onTeardown() { this.elmue = false; this.txBlobs = false; this.txFifo = ELM_TX_FIFO; this.opt.txInflight = TX_INFLIGHT; this.stopSync(); }
 
     // Elmue echoes only carry a marker: the core keeps the frame until its echo arrives
     onTxQueued(data, ep) {
         if (this.elmue && this.rxEnabled && core) stageBytes(this.dev, ep ? (ep & 0x7F) : this.txEp, new Uint8Array(data), now());
     }
 
-    drainAux() { if (this.elmue) this.drainEvents(); }
+    drainAux() {
+        if (!this.elmue) return;
+        this.drainEvents();
+        if (this.txBlockedSince) this.pumpTx();         // echoes have freed slots of the adapter's transmit FIFO
+    }
+
+    // The time the FIFO gate kept the queue back is counted (st.txGateMs, in the statistics): a rate limited by it is limited by the
+    // echoes coming back too late, not by the page or the transfers
+    foldGateTime(t) {
+        if (!this.txBlockedSince) return;
+        this.st.txGateMs = (this.st.txGateMs || 0) + (t - this.txGateMark);
+        this.txGateMark = t;
+    }
+
+    tick() {
+        if (this.txBlockedSince) this.foldGateTime(now());
+        super.tick();
+    }
+
+    // Elmue: the adapter's transmit FIFO holds ELM_TX_FIFO frames and drops what does not fit, so no more frames are put on the wire than
+    // it has free slots (the core knows how many are waiting for their echo; the frames still in our queue are staged but not sent).
+    // With TX blobs the queued frames go out together, up to the free slots and the size of a blob.
+    planTx(queue, head) {
+        if (!this.elmue || !core || !this.rxEnabled) return { count: 1 };
+        const waiting = queue.length - head;
+        if (stageOff > 0) { core._core_process(stageOff); stageOff = 0; }    // the frames staged so far must be in the core's table
+        const onWire = Math.max(0, core._core_tx_pending(this.dev) - waiting);
+        let free = this.txFifo - onWire;
+        if (free < 1) {
+            const t = now();
+            if (!this.txBlockedSince) { this.txBlockedSince = t; this.txGateMark = t; }
+            this.foldGateTime(t);
+            if (t - this.txBlockedSince < ELM_TX_STALL_MS) {
+                if (!this.txRetryTimer) this.txRetryTimer = setTimeout(() => { this.txRetryTimer = 0; this.pumpTx(); }, 50);
+                return null;
+            }
+            this.warn('transmit FIFO of the adapter did not free for ' + ELM_TX_STALL_MS + ' ms (no bus partner or acknowledge?), echoes taken as lost');
+            core._core_tx_forget(this.dev);
+            free = this.txFifo;
+        }
+        this.foldGateTime(now());
+        this.txBlockedSince = 0;
+        if (!this.txBlobs) return { count: 1 };
+
+        let count = 0, size = 2;
+        const ep = queue[head].ep;
+        while (count < waiting && count < free && count < 255) {
+            const item = queue[head + count];
+            const b = item.data;
+            if (item.ep !== ep || b.byteLength < 2 || new Uint8Array(b)[1] !== ELM_TX_FRAME || size + b.byteLength > ELM_MAX_BLOB) break;
+            size += b.byteLength;
+            count++;
+        }
+        if (count < 2) return { count: 1 };
+        const out = new Uint8Array(size);
+        out[0] = count;
+        out[1] = ELM_TX_BLOB;
+        let off = 2;
+        for (let i = 0; i < count; i++) {
+            const part = new Uint8Array(queue[head + i].data);
+            out.set(part, off);
+            off += part.length;
+        }
+        return { count: count, data: out.buffer };
+    }
 
     // -----------------------------------------------------------------------------------------
     // Clock synchronisation: the adapter's timestamp is read with a control transfer; the round trip brackets the moment
@@ -823,6 +898,7 @@ self.onmessage = (ev) => {
         case 'cmd_out':  d.enqueue(() => d.cmdOut(m)); break;
         case 'tx':       d.enqueueTx(m.data, m.ep); break;
         case 'rx':       d.setRx(m); break;
+        case 'tx_fifo':  if (d.txFifo !== undefined) d.txFifo = Math.max(1, Math.min(ELM_TX_FIFO, m.slots | 0)); break;
     }
 };
 

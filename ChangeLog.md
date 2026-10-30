@@ -232,6 +232,72 @@ it, gone-errors in that window do not declare the device lost, and a failed reco
 `test_webusb_io` (65 checks; fails against the old behaviour). The transport's warnings and errors now travel to the page (`log` message,
 rate limited) and, with connections, BUS ON/OFF and losses with their reasons, go to a persistent **Event log** window. Not verified on hardware.
 
+**2026-10-30, Elmue TX blobs and transmit FIFO accounting** (`webusb_io.js`, `usb_worker.js`, `can_core.cpp`, `can_adapter.*`, bridge). Taken from the
+"100% bus load" demo of the ElmueSoft firmware. Before, every frame was its own USB transfer and nothing stopped the host from overrunning the
+adapter's 64-slot transmit FIFO. Now `UsbPort` has a `planTx` hook (hold the queue or merge the first items into one transfer); in Elmue mode the
+worker counts the frames on the wire (the core's `core_tx_pending`: staged and not yet echoed, minus the ones still queued), sends no more than the
+free slots, and, when the adapter has `ELM_FEATURE_USB_BLOBS` (new `kRxFlagTxBlobs` / `blobs` field of `rx`), sends the queued frames as one TX
+blob of up to 2048 bytes. Echoes that stay away for 1 s are given up (`core_tx_forget`, warning in the event log) so the queue cannot block for good.
+Tests: 4 checks of `planTx` in `test_webusb_io` (69), a mock-adapter test in `test_workers` (29 checks: merge, order, blob format, the FIFO limit,
+release by echoes, stall, no blobs without the flag). **Not measured on hardware; the throughput gain is not quantified yet.**
+
+**2026-10-30, Benchmark window** (`benchmark.*`, `app_ui.*`). View menu "7. Benchmark": the transmit stress test of the ElmueSoft demo, with a result. The
+sender hands out frames with a 32 bit sequence number; in the default mode it keeps at most N (default 150, max 200: the marker space is 255) frames
+waiting for their echo, so the worker's transmit blobs and FIFO accounting are what limits the rate; a fixed rate is possible too (and needed for an
+adapter without echoes: without any echo one second after the start the run is aborted). The counters are the exact ones of the Receive Table: the
+sender's echoes and the receiver's frames for the test ID; every run uses new IDs (`first ID + 16 * run + sender`), so they start at zero. Result:
+sent / echoed / received / lost, frames per second, payload kbit/s, the share of what the bit rates allow (bus time of a frame computed from the field
+lengths, without stuff bits), computed bus load against the one the adapter reports, longest gap at the receiver, transmit errors; the summary goes to
+the Event log. Tests: `test_benchmark` (136 checks: bus time, pacing, window, fixed rate, no-echo abort, evaluation) and a run through `AppUI` in
+`test_app_ui`. **Not run on hardware; the figures of a real run are the point of the window and are not known yet.**
+
+**2026-10-30, clipboard** (`libs/browser-clipboard`, `clipboard.*`, `main.cpp`, `app_ui.*`). Emscripten's GLFW 3.2.1 (`-sUSE_GLFW=3`) has stubs for
+`glfwSetClipboardString` / `glfwGetClipboardString`, so until now every copy was lost: the Copy buttons of the Event log and the Benchmark and Ctrl+C / Ctrl+V
+in text fields did nothing. Now `BrowserClipboard::Install()` (after the ImGui backend) replaces ImGui's clipboard functions. `browser_clipboard.js`
+(linked as `--pre-js`): paste = the text of the last `paste` event; copy = `navigator.clipboard.writeText`, then `execCommand('copy')`, and if both are
+refused the text waits and is written by the next click / key press or handed to the next `copy` event (the newest write wins; focus is restored
+after the fallback). The Copy buttons show "Copied" or "The browser refused: click again or press Ctrl+C". Compared with the header
+`emscripten-browser-clipboard` (checked in `to_merge/`): no stale text on Ctrl+C (its `copy` handler answers before ImGui has set the new text), a
+fallback and a visible result instead of an ignored promise, no start-up text, no `ccall`. Tests: 23 checks against a mock browser, `test_app_ui`.
+**Not tried in a real browser (Chrome, Firefox, Safari differ in how long after a click they allow `writeText`).**
+
+**2026-10-30, Benchmark diagnostics** (after the first runs on hardware: 2.3 kframes/s with 64 bytes, 4 kframes/s with 8 bytes, 2.1 kframes/s with the
+Receive Table and Trace open). The report now shows how often the page fed the sender, the window use, frames that never reached the bus, how long
+the adapter's FIFO gate held the queue back, and USB transfers with the frames in each (worker statistics `txGateMs`, `txXfers`, `txFrames`, bridge
+`UsbDeviceStats`); the drain time is 1.2 s so that one statistics message lands after the run. Failed transmit transfers are logged with their status
+and size (`webusb_io.js`). Tests: `test_benchmark`, `test_webusb_io`, `test_workers` (31 checks).
+
+**2026-10-30, TX batching, stall retry** (`webusb_io.js`, `usb_worker.js`, `app_ui.*`; after the second round of hardware runs: 4.6 kframes/s with 8 bytes,
+FIFO gate closed 3 % of the time, 15457 USB transfers carrying 3.0 frames each, about one "transmit stalled" a second). The rate was limited by the number
+of USB transfers (about 1500 a second, four in flight at 2.6 ms each), not by the bus or the FIFO: with TX blobs the worker now keeps one transfer in flight
+(`TX_BLOB_INFLIGHT`), so the frames that queue up meanwhile go out together in the next blob. A transfer the adapter stalls is sent again after 2 ms,
+up to 3 times, at the same place in the queue (`txStallRetries`), before its frames are given up (statistics `txRetries`). The adapter's own error
+reports (for example "TX buffer overflow") go to the Event log, one line a second per adapter. Tests: `test_webusb_io` (73), `test_app_ui`.
+**Not run on hardware.** Cause of the stalls is not known (the firmware drops what does not fit into its FIFO without a stall).
+
+**2026-10-30, Benchmark: lost frames and missing echoes** (`benchmark.*`, `app_ui.*`; hardware runs showed frames that reached the receiver without an echo from
+the sender, which the report counted as "never on the bus"). With a receiver, "lost" is now the frames that never arrived (sent, or echoed if more, minus
+received) and "echoes missing" the frames the receiver got without an echo; the rate is what the receiver counted (else the echoes, else the sent frames).
+Without a receiver the old "sent without an echo" stays. While a run is shown the window gives the average rate over the time of the sending (the time stands still
+during the drain, so the figure matches the report) and, next to it, the rate of the last second. Also measured: the "as fast as possible" rate follows the
+window (75 / 150 / 200 -> 3.0 / 5.0 / 6.0 kframes/s), i.e. it is limited by how often the page feeds the sender, for every adapter (PCAN with one frame per
+transfer reached the same 5 kframes/s); the fixed rate does not depend on the echoes. Tests: `test_benchmark` (lost / echoes missing, elapsed time).
+
+**2026-10-30, Benchmark: pacing by the receiver, FIFO slots** (`benchmark.*`, `app_ui.*`, `usb_worker.js`, `webusb_bridge.*`; fixed-rate runs on hardware: the
+G0B1 sender takes about 7 kframes/s of 8-byte FD+BRS frames and drops the rest, the G431 about 12 kframes/s and more; echoes go missing under load: 459 / 4891 / 11597
+of 70 / 100 / 150 k frames at 7 / 10 / 15 kframes/s, although the frames arrive, which clogged the window of the as-fast-as-possible mode). With a receiver chosen, the
+window is now freed by the larger of the echo count and the receiver's count. New field "Adapter FIFO slots to fill" (1..64, default 64): message `tx_fifo` to the worker
+(`GsUsbDevice.txFifo` replaces the constant in the FIFO gate); it is set at the start of a run and set back to 64 at its end; the report says "N of 64 slots used". It is meant
+to find out whether the losses above 7 kframes/s come from the adapter dropping blobs that do not fit its FIFO. Tests: `test_benchmark`, `test_app_ui`, `test_workers` (32).
+**Not run on hardware.**
+
+**2026-10-30, big tables: ListClipper, no repeated sorting** (`app_ui.*`; with the Receive Table and the Trace open the page ran at about 15 frames/s and the
+Benchmark was fed 15 times a second). Both tables built every row every frame (the trace up to 2000 rows x 7 cells with a formatted string per row); no
+`ImGuiListClipper` was used. Now both build only the rows in view (`id_table_rows_built_`, `trace_rows_built_` count them for the test). The sort of a view runs
+only when the view is not in order already (`SortUnlessSorted`: one pass over a growing sequence); the trace needs no sort for time ascending and is reversed for
+time descending. Measured throughput of the Benchmark was added to the README ("Measured transmit throughput"). Test: `test_app_ui` (`TestTableViews`).
+**The frame rate with the windows open was not measured.**
+
 ## Verified overall
 
 The CAN core, frame parser and URL parsing were unit-tested natively (ASan/UBSan) and the worker was exercised against mock devices with the

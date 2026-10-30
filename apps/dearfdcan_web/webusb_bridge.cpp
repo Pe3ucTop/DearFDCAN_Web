@@ -181,7 +181,7 @@ EM_JS(void, js_webusb_init, (), {
             _webusb_cb_ctrl_ack(m.dev, m.request, m.ok ? 1 : 0);
             break;
         case 'stats':
-            _webusb_cb_stats(m.dev, m.rxPerSec, m.txDropped, m.recoveries, m.rxErrors, m.txErrors);
+            _webusb_cb_stats(m.dev, m.rxPerSec, m.txDropped, m.recoveries, m.rxErrors, m.txErrors, m.txGateMs | 0, m.txXfers | 0, m.txFrames | 0);
             break;
         case 'log': {
             const text = usb.cstr(m.text);
@@ -330,7 +330,13 @@ EM_JS(void, js_webusb_set_rx_pump, (int dev, int enable, int ep, int max_len, in
     const usb = Module.usb;
     if (!usb || !usb.worker) return;
     usb.worker.postMessage({ type: 'rx', dev: dev, enable: !!enable, ep: ep & 0x7F, size: max_len,
-                             elmue: !!(flags & 1), ts: !!(flags & 2) });
+                             elmue: !!(flags & 1), ts: !!(flags & 2), blobs: !!(flags & 4) });
+});
+
+EM_JS(void, js_webusb_tx_fifo, (int dev, int slots), {
+    const usb = Module.usb;
+    if (!usb || !usb.worker) return;
+    usb.worker.postMessage({ type: 'tx_fifo', dev: dev, slots: slots });
 });
 
 // Commands for the CAN core in the worker: 1 = clear ID table, 2 = clear trace, 3 = trace on/off
@@ -437,10 +443,11 @@ extern "C" {
     }
 
     EMSCRIPTEN_KEEPALIVE void webusb_cb_stats(int dev, int rx_per_sec, int tx_dropped, int recoveries,
-                                              int rx_errors, int tx_errors) {
+                                              int rx_errors, int tx_errors, int tx_gate_ms, int tx_transfers, int tx_frames) {
         WebUsbBridge::GetInstance().InternalOnStats(dev, static_cast<uint32_t>(rx_per_sec), static_cast<uint32_t>(tx_dropped),
                                                     static_cast<uint32_t>(recoveries), static_cast<uint32_t>(rx_errors),
-                                                    static_cast<uint32_t>(tx_errors));
+                                                    static_cast<uint32_t>(tx_errors), static_cast<uint32_t>(tx_gate_ms),
+                                                    static_cast<uint32_t>(tx_transfers), static_cast<uint32_t>(tx_frames));
     }
 }
 
@@ -518,6 +525,10 @@ void WebUsbBridge::ClearIdTable() {
 void WebUsbBridge::ClearTrace() {
     ++trace_clear_sent_;
     js_webusb_core_cmd(2, 0);
+}
+
+void WebUsbBridge::SetTxFifoSlots(int dev, int slots) {
+    if (ValidDevice(dev)) js_webusb_tx_fifo(dev, slots);
 }
 
 void WebUsbBridge::SetTraceEnabled(bool enable) {
@@ -614,7 +625,8 @@ void WebUsbBridge::InternalOnEvents(int dev, const char* text) {
 }
 
 void WebUsbBridge::InternalOnStats(int dev, uint32_t rx_per_sec, uint32_t tx_dropped, uint32_t recoveries,
-                                   uint32_t rx_errors, uint32_t tx_errors) {
+                                   uint32_t rx_errors, uint32_t tx_errors, uint32_t tx_gate_ms, uint32_t tx_transfers,
+                                   uint32_t tx_frames) {
     if (!ValidDevice(dev)) return;
     UsbDeviceStats& s = dev_stats_[dev];
     s.rx_per_sec = rx_per_sec;
@@ -622,4 +634,7 @@ void WebUsbBridge::InternalOnStats(int dev, uint32_t rx_per_sec, uint32_t tx_dro
     s.recoveries = recoveries;
     s.rx_errors = rx_errors;
     s.tx_errors = tx_errors;
+    s.tx_gate_ms = tx_gate_ms;
+    s.tx_transfers = tx_transfers;
+    s.tx_frames = tx_frames;
 }

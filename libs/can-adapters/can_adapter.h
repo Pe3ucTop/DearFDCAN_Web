@@ -17,6 +17,7 @@
 // transport keeps the adapter clock synchronised with the page.
 constexpr int kRxFlagElmue = 1;
 constexpr int kRxFlagTimestamps = 2;
+constexpr int kRxFlagTxBlobs = 4;       // Elmue: the adapter takes several transmit messages in one transfer (a TX blob)
 
 // What the worker learned when it opened an adapter
 struct DeviceOpenInfo {

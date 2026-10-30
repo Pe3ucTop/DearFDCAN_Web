@@ -14,10 +14,16 @@ foreach(name test_elmue test_clock_sync test_pcan_records)
     add_test(NAME ${name} COMMAND ${name})
 endforeach()
 
+# The logic of the Benchmark window
+add_executable(test_benchmark test_benchmark.cpp ${CMAKE_SOURCE_DIR}/apps/dearfdcan_web/benchmark.cpp)
+target_include_directories(test_benchmark PRIVATE ${CMAKE_SOURCE_DIR}/apps/dearfdcan_web)
+target_link_libraries(test_benchmark PRIVATE can_protocols dearfdcan_sanitize dearfdcan_warnings)
+add_test(NAME test_benchmark COMMAND test_benchmark)
+
 # The JavaScript transport libraries against mock devices (Node, no build needed)
 find_program(NODE_EXECUTABLE node)
 if(NODE_EXECUTABLE)
-    foreach(name test_webusb_io test_webserial_io test_serial_worker)
+    foreach(name test_webusb_io test_webserial_io test_serial_worker test_browser_clipboard)
         add_test(NAME ${name} COMMAND ${NODE_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/${name}.js)
     endforeach()
 else()
@@ -33,7 +39,8 @@ if(EXISTS ${IMGUI_DIR}/imgui.cpp)
 
     # app_ui.cpp compiles natively against stand-ins for <emscripten.h> and <GLFW/glfw3.h> (tests/stub)
     add_executable(test_app_ui
-        test_app_ui.cpp ${CMAKE_SOURCE_DIR}/apps/dearfdcan_web/app_ui.cpp $<TARGET_OBJECTS:imgui_native>)
+        test_app_ui.cpp ${CMAKE_SOURCE_DIR}/apps/dearfdcan_web/app_ui.cpp ${CMAKE_SOURCE_DIR}/apps/dearfdcan_web/benchmark.cpp
+        ${CMAKE_SOURCE_DIR}/apps/dearfdcan_web/clipboard.cpp $<TARGET_OBJECTS:imgui_native>)
     # (can-engine: only the header can_wire.h, which the bridge header includes; the engine itself is not part of this program)
     target_include_directories(test_app_ui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/stub ${CMAKE_SOURCE_DIR}/apps/dearfdcan_web ${IMGUI_DIR}
                                                    $<TARGET_PROPERTY:can_engine,INTERFACE_INCLUDE_DIRECTORIES>)

@@ -10,6 +10,7 @@
 #include "imgui.h"
 #define private public
 #include "app_ui.h"
+#include "clipboard.h"
 #undef private
 
 struct Call {
@@ -41,8 +42,10 @@ void WebUsbBridge::CommandOut(int dev, int id, const uint8_t* d, int n) { Call c
 void WebUsbBridge::ClearIdTable() {}
 void WebUsbBridge::ClearTrace() {}
 void WebUsbBridge::SetTraceEnabled(bool) {}
+void WebUsbBridge::SetTxFifoSlots(int dev, int slots) { Call c; c.kind = "txfifo"; c.dev = dev; c.value = slots; g_calls.push_back(c); }
 const UsbDeviceStats& WebUsbBridge::GetDeviceStats(int) const { return g_stats; }
-double emscripten_get_now() { return 1000.0; }
+static double g_now_ms = 1000.0;
+double emscripten_get_now() { return g_now_ms; }
 
 static int g_fail = 0, g_n = 0;
 #define CHECK(c) do { ++g_n; if (!(c)) { ++g_fail; std::printf("FAIL line %d: %s\n", __LINE__, #c); } } while (0)
@@ -108,7 +111,7 @@ static void TestGsUsb(AppUI& app) {
     const uint32_t want = GS_CAN_FEATURE_FD | ELM_FEATURE_PROTOCOL | ELM_FEATURE_USB_BLOBS | GS_CAN_FEATURE_HW_TIMESTAMP;
     CHECK(u32at(outs[5].data, 4) == want);
     CHECK(ins.size() == 4 && ins[0].request == ELM_BREQ_GET_LAST_ERROR && ins[0].length == 1);
-    CHECK(rx.kind == "rx_start" && rx.b == 2048 && rx.c == (WebUsbBridge::kRxElmue | WebUsbBridge::kRxTimestamps));
+    CHECK(rx.kind == "rx_start" && rx.b == 2048 && rx.c == (WebUsbBridge::kRxElmue | WebUsbBridge::kRxTimestamps | WebUsbBridge::kRxTxBlobs));
     CHECK(d.channel_opening && d.elmue_active && d.hw_timestamps_active);
     for (auto& x : outs) app.OnControlOutDone(0, x.id, true);
     CHECK(d.channel_open && !d.channel_opening && app.IsBusOn(0));
@@ -314,6 +317,178 @@ static void TestEventLog(AppUI& app) {
     CHECK(!app.log_dirty_);
     app.show_log_window_ = false;
     app.RemoveDevice(4);
+
+    // the clipboard: ImGui's functions are replaced; the stand-ins of the browser calls return nothing (idle, empty)
+    BrowserClipboard::Install();
+    ImGui::SetClipboardText("text");
+    const char* pasted = ImGui::GetClipboardText();
+    CHECK(pasted && pasted[0] == 0);
+    CHECK(BrowserClipboard::GetState() == BrowserClipboard::State::Idle && BrowserClipboard::StatusText().empty());
+    app.show_log_window_ = true;
+    frame();
+    app.show_log_window_ = false;
+}
+
+// The adapter's own error reports reach the event log, at most one line a second
+static void TestAdapterErrorLog(AppUI& app) {
+    UsbDeviceInfo info; info.vid = 0x1D50; info.pid = 0x606F;
+    DeviceOpenInfo oi; oi.protocol = PROTOCOL_GS_USB_CANDLELIGHT;
+    app.OnDeviceAdded(7, info);
+    app.OnDeviceOpened(7, oi);
+    take();
+    app.log_.clear();
+    g_now_ms += 5000.0;
+    app.OnAdapterEvents(7, "E00000080:0002000000000000\n");
+    CHECK(app.devices_[7].error_reports == 1);
+    CHECK(app.log_.size() == 1 && app.log_[0].level == 1 && app.log_[0].text.find("dev 8: adapter error report: ") != std::string::npos &&
+          app.log_[0].text.find("TX buffer overflow") != std::string::npos);
+    app.OnAdapterEvents(7, "E00000080:0002000000000000\nE00000080:0002000000000000\n");
+    CHECK(app.log_.size() == 1);                       // within a second: not logged again
+    g_now_ms += 1500.0;
+    app.OnAdapterEvents(7, "E00000080:0002000000000000\n");
+    CHECK(app.log_.size() == 2 && app.log_[1].text.find("(+3)") != std::string::npos);      // the ones in between are counted
+    app.RemoveDevice(7);
+}
+
+// The Benchmark window: a sender and a receiver, the frames follow the echoes, the result is made from the Receive Table counters
+static void TestBenchmark(AppUI& app) {
+    UsbDeviceInfo info; info.vid = 0x1D50; info.pid = 0x606F;
+    DeviceOpenInfo oi; oi.protocol = PROTOCOL_GS_USB_CANDLELIGHT;
+    for (int dev : {5, 6}) {
+        app.OnDeviceAdded(dev, info);
+        app.OnDeviceOpened(dev, oi);
+        app.devices_[dev].connected = true;
+        app.devices_[dev].channel_open = true;
+    }
+    take();
+    app.log_.clear();
+
+    // refused starts
+    app.bench_tx_ = kTargetAllDevices;
+    app.StartBenchmark();
+    CHECK(!app.bench_.Active() && !app.bench_note_.empty());
+    app.bench_tx_ = 5; app.bench_rx_ = 5;
+    app.StartBenchmark();
+    CHECK(!app.bench_.Active() && app.bench_note_.find("another adapter") != std::string::npos);
+
+    app.bench_rx_ = 6; app.bench_duration_ = 2; app.bench_window_ = 50; app.bench_bytes_ = 8; app.bench_fd_ = false;
+    app.StartBenchmark();
+    CHECK(app.bench_.Active() && app.bench_note_.empty());
+    const uint32_t id = app.bench_.TestId();
+    {   // the FIFO limit of the run goes to the worker at the start (the default 64 here) and back to 64 at the end
+        int fifo_calls = 0;
+        for (const Call& c : g_calls) if (c.kind == "txfifo" && c.dev == 5 && c.value == 64) ++fifo_calls;
+        CHECK(fifo_calls == 1);
+    }
+    app.show_bench_window_ = true;
+    frame();
+
+    auto tx_count = [&] { size_t n = 0; for (const Call& c : take()) if (c.kind == "tx" && c.dev == 5) ++n; return n; };
+    g_now_ms += 16.0;
+    app.ProcessBenchmark(app.GetNowMs());
+    CHECK(tx_count() == 50);                                   // the window is filled
+    g_now_ms += 16.0;
+    app.ProcessBenchmark(app.GetNowMs());
+    CHECK(tx_count() == 0);                                    // no echo yet
+
+    IdTableEntry e;
+    e.count = 30;
+    app.id_table_[MakeCanIdKey(5, id, false)] = e;             // 30 echoes of the sender
+    g_now_ms += 16.0;
+    app.ProcessBenchmark(app.GetNowMs());
+    CHECK(tx_count() == 30);
+    frame();
+
+    e.count = 80;
+    app.id_table_[MakeCanIdKey(5, id, false)] = e;
+    IdTableEntry r;
+    r.count = 80;
+    r.max_cycle_ms = 4.0;
+    app.id_table_[MakeCanIdKey(6, id, false)] = r;
+    g_now_ms += 2100.0;
+    app.ProcessBenchmark(app.GetNowMs());                      // the time is over
+    CHECK(app.bench_.state() == TxBenchmark::State::Draining);
+    g_now_ms += 1300.0;
+    app.ProcessBenchmark(app.GetNowMs());
+    CHECK(app.bench_.state() == TxBenchmark::State::Done);
+    const BenchResult& res = app.bench_.result();
+    CHECK(res.sent == 80 && res.echoed == 80 && res.received == 80 && res.lost == 0 && res.has_receiver);
+    CHECK(!app.log_.empty() && app.log_.back().text.find("benchmark finished: 80 sent, 80 echoed") != std::string::npos && app.log_.back().level == 0);
+    CHECK(app.BenchReportText().find("lost 0") != std::string::npos);
+    frame();
+
+    // a lost frame is reported as an error
+    g_calls.clear();
+    app.bench_fifo_ = 32;
+    app.StartBenchmark();
+    CHECK(app.bench_run_fifo_ == 32);
+    {
+        bool lowered = false;
+        for (const Call& c : g_calls) if (c.kind == "txfifo" && c.dev == 5 && c.value == 32) lowered = true;
+        CHECK(lowered);
+    }
+    const uint32_t id2 = app.bench_.TestId();
+    CHECK(id2 != id);                                          // every run has IDs of its own
+    app.bench_.Stop(app.GetNowMs(), "stopped");
+    IdTableEntry e2; e2.count = 10;
+    app.id_table_[MakeCanIdKey(5, id2, false)] = e2;
+    IdTableEntry r2; r2.count = 9;
+    app.id_table_[MakeCanIdKey(6, id2, false)] = r2;
+    g_now_ms += 1300.0;
+    app.ProcessBenchmark(app.GetNowMs());
+    CHECK(app.bench_.state() == TxBenchmark::State::Done && app.bench_.result().lost == 1 && app.log_.back().level == 2);
+    {
+        bool restored = false;       // the full FIFO is given back when the run is over
+        for (const Call& c : g_calls) if (c.kind == "txfifo" && c.dev == 5 && c.value == 64) restored = true;
+        CHECK(restored);
+        CHECK(app.BenchReportText().find("32 of 64 slots") != std::string::npos);
+    }
+
+    app.show_bench_window_ = false;
+    app.RemoveDevice(5); app.RemoveDevice(6);
+}
+
+// The big tables build the rows in view only, and a view that is in order is not sorted again
+static void TestTableViews(AppUI& app) {
+    for (int i = 0; i < 2000; ++i) {
+        TraceEntry t;
+        t.timestamp_sec = 1.0 + i * 0.001;
+        t.msg.id = 0x100 + static_cast<uint32_t>(i);
+        t.msg.dev = 0;
+        t.msg.dlc = 8;
+        t.msg.payload.resize(8);
+        app.rx_trace_.push_back(t);
+    }
+    for (int i = 0; i < 1500; ++i) {
+        IdTableEntry e;
+        e.last_msg.id = 0x100 + static_cast<uint32_t>(i);
+        e.last_msg.dev = 0;
+        e.last_msg.dlc = 8;
+        e.last_msg.payload.resize(8);
+        e.count = 1;
+        app.id_table_[MakeCanIdKey(0, e.last_msg.id, false)] = e;
+    }
+    app.auto_tile_layout_ = true;
+    app.show_trace_window_ = true;
+    app.show_id_table_window_ = true;
+    frame(); frame();
+    CHECK(app.trace_rows_built_ > 0 && app.trace_rows_built_ < 200);        // not 2000
+    CHECK(app.id_table_rows_built_ > 0 && app.id_table_rows_built_ < 200);  // not 1500
+
+    // a growing sequence is checked in one pass: n - 1 comparisons, no sort
+    std::vector<int> v(1000);
+    for (int i = 0; i < 1000; ++i) v[i] = i;
+    int calls = 0;
+    SortUnlessSorted(v.begin(), v.end(), [&](int a, int b) { ++calls; return a < b; });
+    CHECK(calls == 999 && v.front() == 0 && v.back() == 999);
+    v[500] = -1;                                                            // out of order: sorted
+    SortUnlessSorted(v.begin(), v.end(), [](int a, int b) { return a < b; });
+    CHECK(std::is_sorted(v.begin(), v.end()) && v.front() == -1);
+
+    app.rx_trace_.clear();
+    app.id_table_.clear();
+    app.show_trace_window_ = false;
+    app.show_id_table_window_ = false;
 }
 
 int main() {
@@ -325,6 +500,9 @@ int main() {
     TestPcan(app);
     TestSlcan(app);
     TestEventLog(app);
+    TestAdapterErrorLog(app);
+    TestBenchmark(app);
+    TestTableViews(app);
     std::printf("%d checks, %d failed\n", g_n, g_fail);
     return g_fail != 0;
 }

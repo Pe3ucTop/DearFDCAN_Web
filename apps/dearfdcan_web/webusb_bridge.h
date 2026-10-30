@@ -43,6 +43,9 @@ struct UsbDeviceStats {
     uint32_t tx_dropped = 0;       // frames dropped because the TX queue was full or the adapter was closed, cumulative
     uint32_t recoveries = 0;       // interface re-claims performed by the worker watchdog, cumulative
     uint32_t frames = 0;           // CAN frames parsed for this adapter by the worker core
+    uint32_t tx_gate_ms = 0;       // Elmue: time the transmit queue was held back because the adapter's FIFO had no free slot, cumulative
+    uint32_t tx_transfers = 0;     // transmit transfers started (a TX blob is one), cumulative
+    uint32_t tx_frames = 0;        // frames in them, cumulative
 };
 
 // Counters that are not tied to one adapter (carried by the snapshots)
@@ -95,7 +98,8 @@ public:
     // Start/Stop only gate processing of received frames; endpoint 0 / size 0 keep the detected values.
     // flags (gs_usb): kRxElmue = the channel runs in Elmue mode, kRxTimestamps = it was started with adapter timestamps
     // (the worker then keeps reading the adapter clock to synchronise it)
-    static constexpr int kRxElmue = kRxFlagElmue, kRxTimestamps = kRxFlagTimestamps;
+    // kRxTxBlobs = the adapter takes several transmit messages in one transfer (the worker then merges queued frames)
+    static constexpr int kRxElmue = kRxFlagElmue, kRxTimestamps = kRxFlagTimestamps, kRxTxBlobs = kRxFlagTxBlobs;
     void StartRxPump(int dev, int endpoint, int max_packet_size, int flags = 0);
     void StopRxPump(int dev);
 
@@ -120,6 +124,8 @@ public:
     void ClearIdTable();
     void ClearTrace();
     void SetTraceEnabled(bool enable);
+    // How many of the 64 slots of a gs_usb (Elmue) adapter's transmit FIFO the worker may fill; the default (64) after every open
+    void SetTxFifoSlots(int dev, int slots);
 
     void SetOnDeviceAdded(DeviceAddedCallback cb) { on_device_added_ = cb; }
     void SetOnDeviceOpened(DeviceOpenedCallback cb) { on_device_opened_ = cb; }
@@ -143,7 +149,7 @@ public:
     void InternalOnControlIn(int dev, uint8_t request, const uint8_t* data, int length);
     void InternalOnControlOutDone(int dev, int request, bool ok);
     void InternalOnStats(int dev, uint32_t rx_per_sec, uint32_t tx_dropped, uint32_t recoveries,
-                         uint32_t rx_errors, uint32_t tx_errors);
+                         uint32_t rx_errors, uint32_t tx_errors, uint32_t tx_gate_ms, uint32_t tx_transfers, uint32_t tx_frames);
     void InternalOnClockSync(int dev, const ClockSyncStats& stats);
     void InternalOnEvents(int dev, const char* text);
     void InternalOnLog(int dev, int level, const char* text);

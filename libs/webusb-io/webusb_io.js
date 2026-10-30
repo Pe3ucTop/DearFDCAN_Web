@@ -21,6 +21,8 @@
 //   beforeTeardown() / afterTeardown()   around the end of a session (closed by the owner, or lost)
 //   onLost(reason)               the session ended because of the adapter (unplugged, failed recovery, ...), after the teardown
 //   onLog(level, text)           a warning or error the port logged ('warn' / 'error'); it also goes to the console
+//   planTx(queue, head)          what the next transfer is: null (hold the queue, call pumpTx() later), {count: 1}, or {count, data}
+//                                (the first `count` items merged into one transfer with the bytes `data`)
 //   probeRequest()               a harmless control read the adapter has to answer: [setup, length], or null for no probe
 //
 // Loaded as a classic script (importScripts or a <script>); the one global it defines is WebUsbIo.
@@ -35,6 +37,8 @@ const DEFAULTS = {
     rxSlots: 6,                 // concurrent transferIn requests per adapter
     txInflight: 4,              // concurrent transferOut per adapter; 1 = strictly serialized
     txQueueMax: 4096,
+    txStallRetries: 0,          // how many times a transfer the device stalled is sent again before it is given up
+    txRetryDelayMs: 2,
     ctrlTimeoutMs: 2000,
     idlePingMs: 2000,           // receive silence after which the adapter is probed
     pingTimeoutMs: 1500,
@@ -53,6 +57,12 @@ function withTimeout(promise, ms, what) {
 
 function errText(err) {
     return err && err.message ? err.message : String(err);
+}
+
+// "64 bytes" or "1200 bytes, 17 frames merged" for the log
+function describeTx(item) {
+    const n = item.data ? (item.data.byteLength !== undefined ? item.data.byteLength : item.data.length) : 0;
+    return n + ' bytes' + (item.parts ? ', ' + item.parts.length + ' frames merged' : '');
 }
 
 // The adapter was unplugged or its interface is not usable any more
@@ -137,7 +147,7 @@ class UsbPort {
         this.pingBusy = false;
         this.pingFails = 0;
 
-        this.st = { rx: 0, rxPrev: 0, rxErrors: 0, txDropped: 0, txErrors: 0, recoveries: 0 };
+        this.st = { rx: 0, rxPrev: 0, rxErrors: 0, txDropped: 0, txErrors: 0, recoveries: 0, txXfers: 0, txFrames: 0, txRetries: 0 };
     }
 
     // ---- hooks (see the top of the file) ----
@@ -440,8 +450,23 @@ class UsbPort {
     }
 
     finishTx(item, ok) {
+        if (item.parts) { for (const part of item.parts) this.finishTx(part, ok); return; }     // a merged transfer
         if (!item.done) return;
         try { item.done(ok); } catch (e) { this.error('transmit callback failed:', e); }
+    }
+
+    // Hook: decides what the next transfer is made of. `queue[head...]` are the waiting items. Returns null to send nothing now (the
+    // owner calls pumpTx() when that changes), {count: 1} for the first item as it is, or {count, data} for the first `count` items
+    // sent as one transfer with the bytes `data` (the owner has merged them; their `done` callbacks get the result of that transfer).
+    planTx(queue, head) { return { count: 1 }; }
+
+    takeTx() {
+        const plan = this.planTx(this.txQueue, this.txHead);
+        if (!plan) return null;
+        if (plan.count <= 1 || !plan.data) return this.txQueue[this.txHead++];
+        const parts = this.txQueue.slice(this.txHead, this.txHead + plan.count);
+        this.txHead += plan.count;
+        return { data: plan.data, ep: parts[0].ep, done: null, parts: parts };
     }
 
     pumpTx() {
@@ -449,24 +474,39 @@ class UsbPort {
         if (this.recovering) return;                // the browser refuses transfers meanwhile; recover() pumps again when it is done
         const d = this.usb;
         while (d && this.txInflight < this.opt.txInflight && this.txHead < this.txQueue.length) {
-            const item = this.txQueue[this.txHead++];
+            const item = this.takeTx();
+            if (!item) break;
             this.txInflight++;
-            let p, ok = true;
+            this.st.txXfers++;
+            this.st.txFrames += item.parts ? item.parts.length : 1;
+            let p, ok = true, again = false;
             try { p = d.transferOut(item.ep, item.data); } catch (e) { p = Promise.reject(e); }
             p.then(r => {
                 if (r.status === 'stall') {
-                    ok = false;
-                    this.st.txErrors++;
-                    return d.clearHalt('out', item.ep);
+                    // The adapter refused the transfer (its buffer was not ready). After a short pause the same bytes are sent again, up
+                    // to opt.txStallRetries times, before the frames in it are given up; the order of the queue is kept.
+                    const retry = (item.retries || 0) < this.opt.txStallRetries;
+                    if (retry) { item.retries = (item.retries || 0) + 1; this.st.txRetries++; }
+                    else { ok = false; this.st.txErrors++; }
+                    this.warn('transmit stalled (' + describeTx(item) + '): the adapter refused it' + (retry ? ', sending again' : ', given up'));
+                    return d.clearHalt('out', item.ep).then(() => {
+                        if (!retry) return;
+                        return new Promise(res => setTimeout(res, this.opt.txRetryDelayMs)).then(() => {
+                            if (this.usb !== d) { ok = false; return; }
+                            again = true;
+                            if (this.txHead > 0) this.txQueue[--this.txHead] = item; else this.txQueue.unshift(item);
+                        });
+                    });
                 }
-                if (r.status !== 'ok') { ok = false; this.st.txErrors++; }
+                if (r.status !== 'ok') { ok = false; this.st.txErrors++; this.warn('transmit failed with status ' + r.status + ' (' + describeTx(item) + ')'); }
             }).catch(err => {
                 ok = false;
                 this.st.txErrors++;
+                this.warn('transmit failed (' + describeTx(item) + '): ' + errText(err));
                 if (this.usb === d && isGone(err) && !this.recovering) this.lost(errText(err));
             }).finally(() => {
                 this.txInflight--;
-                this.finishTx(item, ok);
+                if (!again) this.finishTx(item, ok);
                 this.pumpTx();
             });
         }

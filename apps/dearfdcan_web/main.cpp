@@ -11,6 +11,7 @@
 #include "webusb_bridge.h"
 #include "can_protocol.h"
 #include "app_ui.h"
+#include "clipboard.h"
 
 // Global application instances
 GLFWwindow* g_Window = nullptr;
@@ -134,6 +135,7 @@ int main(int, char**) {
     ImGui::StyleColorsDark();
 
     ImGui_ImplGlfw_InitForOpenGL(g_Window, true);
+    BrowserClipboard::Install();        // after the backend: Emscripten's GLFW has no clipboard, this replaces its functions
 #if IMGUI_VERSION_NUM >= 19100
     // Required in newer Dear ImGui (1.91+ / 1.92+) for proper Emscripten wheel/canvas event binding
     ImGui_ImplGlfw_InstallEmscriptenCallbacks(g_Window, "#canvas");

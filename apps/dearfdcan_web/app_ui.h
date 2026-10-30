@@ -2,7 +2,9 @@
 #include "can_adapter.h"
 #include "can_protocol.h"
 #include "can_wire.h"
+#include "benchmark.h"
 #include "webusb_bridge.h"
+#include <algorithm>
 #include <array>
 #include <deque>
 #include <map>
@@ -12,6 +14,16 @@
 
 // Transmit target meaning "every adapter whose CAN channel is open"
 constexpr int kTargetAllDevices = -1;
+
+// Sorts a table view, but only when it is not in order already: rows that arrive in a growing sequence (the trace in time order, IDs
+// in ascending order) are checked in one pass instead of being sorted again every frame. `less` must be a strict weak order.
+template <typename It, typename Less>
+void SortUnlessSorted(It first, It last, Less less) {
+    if (!std::is_sorted(first, last, less)) std::sort(first, last, less);
+}
+
+// Slots of the transmit FIFO of an Elmue gs_usb adapter (CAN_QUEUE_SIZE of the firmware); the worker's limit, see usb_worker.js
+constexpr int kElmueTxFifoSlots = 64;
 
 // Sent History item for re-selection and quick re-transmission
 struct TxHistoryEntry {
@@ -137,6 +149,7 @@ private:
     void RenderIdTableWindow(double now_ms, float x, float y, float w, float h);
     void RenderTraceWindow(float x, float y, float w, float h);
     void RenderLogWindow();
+    void ShowClipboardStatus();
 
     // Event log: connections, losses and their reasons, the transport's warnings, user notices. It is kept in the browser's
     // localStorage, so what happened before a reload (or a crash of the page) can still be read.
@@ -148,8 +161,30 @@ private:
     bool log_loaded_ = false;
     bool log_dirty_ = false;
     double log_saved_ms_ = 0.0;
+    std::array<uint32_t, kMaxDevices> err_seen_ = {};      // error reports of the adapters that are in the log already
+    std::array<double, kMaxDevices> err_log_ms_ = {};
+    // Rows the Receive Table and the Trace built in the last frame (only the visible ones, see ImGuiListClipper); read by the tests
+    int id_table_rows_built_ = 0, trace_rows_built_ = 0;
     bool show_log_window_ = false;
     bool log_autoscroll_ = true;
+
+    // Benchmark window: transmit stress test of one adapter, evaluated from its tx echoes and the frames a second adapter receives
+    void RenderBenchmarkWindow();
+    void StartBenchmark();
+    void ProcessBenchmark(double now_ms);
+    BenchCounters BenchNow() const;
+    std::string BenchReportText() const;
+    TxBenchmark bench_;
+    bool show_bench_window_ = false;
+    int bench_tx_ = kTargetAllDevices, bench_rx_ = kTargetAllDevices;     // device numbers; kTargetAllDevices = not chosen / no receiver
+    bool bench_fd_ = true, bench_brs_ = true, bench_ext_ = false;
+    int bench_bytes_ = 8, bench_rate_ = 0, bench_window_ = 150, bench_duration_ = 10, bench_id_ = 0x500;
+    int bench_run_fifo_ = 64;      // the value of the run that was started last
+    int bench_fifo_ = 64;         // slots of the sender's transmit FIFO the worker may fill during the run (64 = all; gs_usb / Elmue only)
+    int bench_runs_ = 0;           // every run gets IDs of its own, so the counters of the table start at zero
+    std::string bench_note_;       // why a start was refused
+    double bench_rate_ms_ = 0.0, bench_rate_now_ = 0.0;    // the rate of the last second while a run is shown: time and count of the last sample
+    uint64_t bench_rate_n_ = 0;
 
     double start_time_ms_;
 
