@@ -193,6 +193,23 @@ transmit records), `test_clock_sync` (the clock fit against a simulated clock), 
 The first three are the tests that had been lost with the scratch directory. Checked on a copy after the move: 4 native tests, 20 worker checks,
 both Emscripten modes without warnings, `docs/index.html` published. The move is `tools/restructure.sh` (`git mv`), to be run once.
 
+**2026-10-30, step 2 of the split: the JavaScript transport libraries.** The transport half of `usb_worker.js` and the whole logic of
+`serial_worker.js` moved into two libraries that know nothing of CAN, WebAssembly or `postMessage`. `libs/webusb-io/webusb_io.js`: `UsbPort`
+(finding the permitted device that no other port holds, with an open lock; the open sequence with a handshake callback; `rxSlots` pending
+transfers with generations; recovery; ordered `controlTransfer` / `commandTransfer` with timeouts that never reject; the transmit queue with
+transfers in flight; the watchdog; loss) with hooks for the owner. `libs/webserial-io/webserial_io.js`: `SerialConnection` and
+`findPermittedPort` (open with DTR/RTS and a timeout, the read loop that survives recoverable stream errors, ordered writes with acknowledgements,
+close during open) with a hooks object. In `usb_worker.js` the classes are now `Device extends UsbPort` (the page's messages, the link to the
+core) with `GsUsbDevice` and `PcanDevice` on top; `serial_worker.js` is a shell that maps the link messages to a `SerialConnection`. The libraries
+are loaded with `importScripts` in the multi-file build and packed in front of the workers in the single-file build (`pack_worker.py` takes
+`--usb-lib` / `--serial-lib`); `build/multi/` has two more files. The messages between the page and the workers are specified in
+`apps/dearfdcan_web/WORKER_PROTOCOL.md`. Tests (all under Node, in CTest): `test_webusb_io` (47 checks: matching of identical adapters opened
+at once, hook order, slot re-arming, stall / babble, recovery and stale generations, loss, ordered control transfers, timeouts, the transmit
+queue and in-flight limit, the watchdog), `test_webserial_io` (31), `test_serial_worker` (9, also the packed worker); `test_workers` (20) passes
+unchanged against the refactored worker, multi-file and packed. Found by the tests, not changed: a failing write errors the whole Web Streams
+sink, so a serial port cannot write again until it is reopened (reading is not affected). Behaviour is otherwise as before; both Emscripten modes
+build without warnings.
+
 ## Verified overall
 
 The CAN core, frame parser and URL parsing were unit-tested natively (ASan/UBSan) and the worker was exercised against mock devices with the

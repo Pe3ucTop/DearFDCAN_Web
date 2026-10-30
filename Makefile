@@ -4,7 +4,8 @@
 #                                                  (docs/ is the GitHub Pages folder: commit it and publish it)
 #   make MODE=multi         multi-file build   -> build/multi/index.html index.js index.wasm
 #                                                  usb_worker.js serial_worker.js can_core.js can_core.wasm
-#   make test                native unit tests (build/native, sanitizers) and, if build/multi exists, the worker tests under Node
+#   make test                native unit tests and the Node tests of the transport libraries (build/native, sanitizers) and, if
+#                            build/multi / build/single exist, the tests of the workers (multi-file and packed) under Node
 #   make serve               serve the result of the selected MODE on http://localhost:8000/
 #   make clean               remove the whole build directory
 #   make help                this summary
@@ -59,6 +60,10 @@ test:
 	ctest --test-dir $(ABS_BUILD)/native --output-on-failure
 	@if [ -f $(BUILD)/multi/can_core.wasm ]; then node tests/test_workers.js $(BUILD)/multi apps/dearfdcan_web; \
 	 else echo "(worker tests skipped: run 'make MODE=multi' first)"; fi
+	@if [ -f $(BUILD)/tmp/single/usb_worker_bundle.js ]; then \
+	   node tests/test_workers.js $(BUILD)/multi apps/dearfdcan_web $(BUILD)/tmp/single/usb_worker_bundle.js && \
+	   node tests/test_serial_worker.js apps/dearfdcan_web libs/webserial-io $(BUILD)/tmp/single/usb_worker_bundle.js; \
+	 else echo "(packed worker tests skipped: run 'make' first)"; fi
 
 serve:
 	@echo "Serving $(BUILD)/$(MODE) on http://localhost:$(PORT)/ (Ctrl+C to stop)"

@@ -2,7 +2,8 @@
 #
 # Targets
 #   single   build/single/index.html   one self-contained page (workers packed into it), also copied to the GitHub Pages folder
-#   multi    build/multi/              index.html index.js index.wasm usb_worker.js serial_worker.js can_core.js can_core.wasm
+#   multi    build/multi/              index.html index.js index.wasm usb_worker.js serial_worker.js webusb_io.js webserial_io.js
+#                                      can_core.js can_core.wasm
 # Both are built from the same objects, so a build of the second mode only links.
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
@@ -62,8 +63,10 @@ target_link_options(core_single PRIVATE ${CORE_LINK_OPTIONS} -sSINGLE_FILE=1)
 
 set(BUNDLE ${TMP_SINGLE}/usb_worker_bundle.js)
 add_custom_command(OUTPUT ${BUNDLE}
-    COMMAND ${Python3_EXECUTABLE} ${APP_DIR}/pack_worker.py $<TARGET_FILE:core_single> ${APP_DIR}/usb_worker.js ${APP_DIR}/serial_worker.js ${BUNDLE}
-    DEPENDS core_single ${APP_DIR}/usb_worker.js ${APP_DIR}/serial_worker.js ${APP_DIR}/pack_worker.py
+    COMMAND ${Python3_EXECUTABLE} ${APP_DIR}/pack_worker.py $<TARGET_FILE:core_single> ${BUNDLE}
+            --usb-worker ${APP_DIR}/usb_worker.js --usb-lib ${WEBUSB_IO_JS}
+            --serial-worker ${APP_DIR}/serial_worker.js --serial-lib ${WEBSERIAL_IO_JS}
+    DEPENDS core_single ${APP_DIR}/usb_worker.js ${APP_DIR}/serial_worker.js ${WEBUSB_IO_JS} ${WEBSERIAL_IO_JS} ${APP_DIR}/pack_worker.py
     COMMENT "Packing the workers into the page" VERBATIM)
 add_custom_target(worker_bundle DEPENDS ${BUNDLE})
 
@@ -97,11 +100,13 @@ dearfdcan_module(page_multi index .html ${OUT_MULTI} $<TARGET_OBJECTS:page_objs>
 target_link_libraries(page_multi PRIVATE can_adapters)
 target_link_options(page_multi PRIVATE ${PAGE_LINK_OPTIONS})
 
-foreach(worker usb_worker.js serial_worker.js)
-    add_custom_command(OUTPUT ${OUT_MULTI}/${worker}
-        COMMAND ${CMAKE_COMMAND} -E copy ${APP_DIR}/${worker} ${OUT_MULTI}/${worker}
-        DEPENDS ${APP_DIR}/${worker} VERBATIM)
-    list(APPEND MULTI_WORKERS ${OUT_MULTI}/${worker})
+# the workers and the transport libraries they load with importScripts()
+foreach(file ${APP_DIR}/usb_worker.js ${APP_DIR}/serial_worker.js ${WEBUSB_IO_JS} ${WEBSERIAL_IO_JS})
+    get_filename_component(name ${file} NAME)
+    add_custom_command(OUTPUT ${OUT_MULTI}/${name}
+        COMMAND ${CMAKE_COMMAND} -E copy ${file} ${OUT_MULTI}/${name}
+        DEPENDS ${file} VERBATIM)
+    list(APPEND MULTI_WORKERS ${OUT_MULTI}/${name})
 endforeach()
 add_custom_target(workers_multi DEPENDS ${MULTI_WORKERS})
 add_custom_target(multi DEPENDS page_multi core_multi workers_multi)

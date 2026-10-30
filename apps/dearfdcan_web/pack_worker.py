@@ -1,50 +1,64 @@
 #!/usr/bin/env python3
 """Packs the workers into JavaScript strings for a single-file page.
 
-Usage: pack_worker.py <can_core.js (built with -sSINGLE_FILE=1)> <usb_worker.js> <serial_worker.js> <out.js>
+Usage: pack_worker.py <can_core.js (built with -sSINGLE_FILE=1)> <out.js>
+                      --usb-worker <usb_worker.js> [--usb-lib <library.js> ...]
+                      --serial-worker <serial_worker.js> [--serial-lib <library.js> ...]
 
 The output is a --pre-js file for the page build that defines
   Module['usbWorkerSource']     the core's Emscripten glue (wasm embedded in the glue, so the worker needs no
-                                network access) followed by usb_worker.js wrapped in a function to keep it
-                                strict and out of the glue's scope
-  Module['serialWorkerSource']  serial_worker.js (WebSerial I/O)
+                                network access), the --usb-lib files (e.g. webusb_io.js) in the order given, and
+                                usb_worker.js wrapped in a function to keep it strict and out of the glue's scope
+  Module['serialWorkerSource']  the --serial-lib files (webserial_io.js) and serial_worker.js wrapped the same way
+The libraries define one global each (WebUsbIo, WebSerialIo); the workers load them with importScripts() only when
+that global is missing, which is what makes the same worker file run packed and as separate files.
 The page starts the workers from these strings through Blob URLs (see js_webusb_init in webusb_bridge.cpp).
 """
+import argparse
 import json
 import os
 import sys
 
 
+def read(path):
+    with open(path, encoding='utf-8') as f:
+        return f.read()
+
+
+def wrapped(worker_source):
+    return ';(function () {\n' + worker_source + '\n})();\n'
+
+
 def main():
-    if len(sys.argv) != 5:
-        sys.exit(__doc__)
-    core_path, worker_path, serial_path, out_path = sys.argv[1:]
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('core_js')
+    ap.add_argument('out_js')
+    ap.add_argument('--usb-worker', required=True)
+    ap.add_argument('--usb-lib', action='append', default=[])
+    ap.add_argument('--serial-worker', required=True)
+    ap.add_argument('--serial-lib', action='append', default=[])
+    args = ap.parse_args()
 
-    with open(core_path, encoding='utf-8') as f:
-        core = f.read()
-    with open(worker_path, encoding='utf-8') as f:
-        worker = f.read()
-    with open(serial_path, encoding='utf-8') as f:
-        serial = f.read()
-
+    core = read(args.core_js)
     if 'createCanCore' not in core:
-        sys.exit(f'{core_path}: createCanCore factory not found (build with -sMODULARIZE=1 -sEXPORT_NAME=createCanCore)')
+        sys.exit(f'{args.core_js}: createCanCore factory not found (build with -sMODULARIZE=1 -sEXPORT_NAME=createCanCore)')
     # A non-embedded build fetches "<name>.wasm" relative to the script, which cannot work from a Blob URL
-    wasm_name = os.path.splitext(os.path.basename(core_path))[0] + '.wasm'
+    wasm_name = os.path.splitext(os.path.basename(args.core_js))[0] + '.wasm'
     if wasm_name in core:
-        sys.exit(f'{core_path}: wasm is not embedded (it refers to {wasm_name}); build with -sSINGLE_FILE=1')
+        sys.exit(f'{args.core_js}: wasm is not embedded (it refers to {wasm_name}); build with -sSINGLE_FILE=1')
 
-    bundle = core + '\n;(function () {\n' + worker + '\n})();\n'
+    usb = core + '\n' + ''.join(read(p) + '\n' for p in args.usb_lib) + wrapped(read(args.usb_worker))
+    serial = ''.join(read(p) + '\n' for p in args.serial_lib) + wrapped(read(args.serial_worker))
 
     def literal(text):
         s = json.dumps(text)  # ASCII-only, valid JavaScript string literal
         # The page JS is inlined into index.html: keep the HTML parser from seeing tags/comments in it
         return s.replace('</', '<\\/').replace('<!--', '<\\!--')
 
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write(f"Module['usbWorkerSource'] = {literal(bundle)};\n")
+    with open(args.out_js, 'w', encoding='utf-8') as f:
+        f.write(f"Module['usbWorkerSource'] = {literal(usb)};\n")
         f.write(f"Module['serialWorkerSource'] = {literal(serial)};\n")
-    print(f'pack_worker: {out_path} ({len(bundle)} bytes of CAN worker source, {len(serial)} bytes of serial worker source)')
+    print(f'pack_worker: {args.out_js} ({len(usb)} bytes of CAN worker source, {len(serial)} bytes of serial worker source)')
 
 
 if __name__ == '__main__':

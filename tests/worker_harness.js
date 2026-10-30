@@ -43,7 +43,9 @@ function createMockDevice(vendorId, productId, serialNumber, controlIn) {
     return state;
 }
 
-function createHarness(buildDir, srcDir, mock) {
+// buildDir/srcDir: the multi-file build and the directory of usb_worker.js. `packedBundle`: instead, the --pre-js file of the single-file
+// build (build/tmp/single/usb_worker_bundle.js), whose usbWorkerSource holds the core, the libraries and the worker in one script.
+function createHarness(buildDir, srcDir, mock, packedBundle) {
     const posted = [];
     const ctx = {
         console, setTimeout, clearTimeout, setInterval, clearInterval, performance, TextDecoder, TextEncoder, WebAssembly, Promise,
@@ -59,8 +61,14 @@ function createHarness(buildDir, srcDir, mock) {
     };
     ctx.self = ctx;
     vm.createContext(ctx);
-    vm.runInContext(fs.readFileSync(path.join(buildDir, 'can_core.js'), 'utf8'), ctx, { filename: 'can_core.js' });
-    vm.runInContext(fs.readFileSync(path.join(srcDir, 'usb_worker.js'), 'utf8'), ctx, { filename: 'usb_worker.js' });
+    if (packedBundle) {
+        const Module = {};
+        new Function('Module', fs.readFileSync(packedBundle, 'utf8'))(Module);
+        vm.runInContext(Module.usbWorkerSource, ctx, { filename: 'usbWorkerSource' });
+    } else {
+        vm.runInContext(fs.readFileSync(path.join(buildDir, 'can_core.js'), 'utf8'), ctx, { filename: 'can_core.js' });
+        vm.runInContext(fs.readFileSync(path.join(srcDir, 'usb_worker.js'), 'utf8'), ctx, { filename: 'usb_worker.js' });
+    }
     const send = (m) => ctx.onmessage({ data: m });
     const waitFor = async (pred, ms, what, checks) => {
         const end = Date.now() + ms;

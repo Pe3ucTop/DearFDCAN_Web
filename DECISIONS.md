@@ -29,7 +29,9 @@ Dependencies point downwards only. Layer 2 reaches the hardware through an inter
 
 ```
 libs/emscripten-webserial/   Web Serial ports as /dev/ttyWebN
-libs/emscripten-webusb/      webusb-io (JS) + library_webusb.js + webusb.h
+libs/webusb-io/              the WebUSB transport (JS)                                (step 2, done)
+libs/webserial-io/           the Web Serial transport (JS)                            (step 2, done)
+libs/emscripten-webusb/      library_webusb.js + webusb.h on top of webusb-io         (step 3, not yet)
 libs/can-core/               types, DLC, bit timing                  (can_protocol_common.h)
 libs/can-protocols/          gs_usb, Elmue, PEAK, SLCAN              (can_protocol_*.cpp/.h)
 libs/can-engine/             clock sync, ID table, trace, snapshots  (can_core.cpp, can_wire.h)
@@ -41,7 +43,8 @@ tests/                       per library, run natively / under Node
 ## Interfaces
 
 * **`ITransport`** (C++, per adapter): control out/in, command out, start/stop of the receive pump. Implemented by the page's bridge to the worker.
-* **Worker message protocol** (`usb_worker.js`: `open`, `ctrl_out`, `ctrl_in`, `cmd_out`, `tx`, `rx`, ...): the contract between the C++ side and layer 1. It will be written down as a specification when the JavaScript transport is extracted.
+* **Worker message protocol** (`usb_worker.js`: `open`, `ctrl_out`, `ctrl_in`, `cmd_out`, `tx`, `rx`, ...): the contract between the C++ side and the workers; specified in `apps/dearfdcan_web/WORKER_PROTOCOL.md`.
+* **`UsbPort` / `SerialConnection`** (JavaScript): the transport classes of layer 1, extended by subclassing (`UsbPort` hooks) or by a hooks object (`SerialConnection`); described in the READMEs of the two libraries.
 * **Engine C API** (`core_*`): to be given a prefix and a version before it is published.
 * **`AdapterDriver`** (new, step 0): everything that is protocol knowledge and today sits in `AppUI`.
 
@@ -53,7 +56,7 @@ The PEAK record layouts and option bits come from PEAK's Linux driver (GPL). Onl
 
 0. **Prepare without moving files** (done 2026-10-30): the protocol logic moved out of `AppUI` into drivers over `ITransport` (`can_adapter.*`); `usb_worker.js` split into one class per protocol; the headless tests of the start sequences are in the repository (`tests/`).
 1. **CAN libraries** (done 2026-10-30): moved to `libs/` (`can-core`, `can-protocols`, `can-engine`, `can-adapters`), the monitor to `apps/dearfdcan_web/`, `emscripten_webserial` to `libs/emscripten-webserial/`; CMake describes the build, the `Makefile` is its front-end; native unit tests under CTest (sanitizers on); `compile_script.sh` removed. The move itself is `tools/restructure.sh`, to be run once and deleted.
-2. JavaScript transport: `webusb-io` / `webserial-io` with mock-device tests; the worker becomes a thin shell.
+2. **JavaScript transport** (done 2026-10-30): `libs/webusb-io` (`UsbPort`) and `libs/webserial-io` (`SerialConnection`) with mock-device tests; `usb_worker.js` keeps what is specific to the CAN adapters (the page's messages, the link to the core, gs_usb clock requests, the PEAK handshake) on top of `UsbPort`, `serial_worker.js` is a shell around `SerialConnection`; the messages are specified in `apps/dearfdcan_web/WORKER_PROTOCOL.md`. The libraries are loaded with `importScripts` (multi-file) or packed in front of the worker (single-file, `pack_worker.py`).
 3. `library_webusb.js` + `webusb.h` (own API) with a test like the one of `emscripten-webserial`.
 4. The utility on the new libraries; check the single-file build (`pack_worker.py` with several modules). The layout already builds the single-file page from the CMake targets; what stays is to let the page depend on the JavaScript transport libraries once they exist.
 

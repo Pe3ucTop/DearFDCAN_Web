@@ -4,9 +4,11 @@
 //     event lines, the clock requests and their statistics, the switch back to the legacy protocol
 //   * a PEAK PCAN-USB FD: records with calibration, bus load, error and status; no clock request
 //   * a slot that changes from one adapter kind to another
-// Usage: node tests/test_workers.js <build/multi directory> <directory of usb_worker.js, apps/dearfdcan_web>
+// Usage: node tests/test_workers.js <build/multi directory> <directory of usb_worker.js, apps/dearfdcan_web> [build/tmp/single/usb_worker_bundle.js]
+// With the third argument the same checks run against the packed worker of the single-file build (core, libraries and worker in one script).
 const { sleep, createChecks, createMockDevice, createHarness, le32 } = require('./worker_harness');
 const BUILD = process.argv[2], SRC = process.argv[3];
+const PACKED = process.argv[4] || null;     // optional: the --pre-js file of the single-file build (build/tmp/single/usb_worker_bundle.js)
 const C = createChecks();
 const check = C.check;
 
@@ -18,7 +20,7 @@ async function testGsUsbElmue() {
         return dv;
     });
     const adapterUs = () => (adapterBase + Math.round((performance.now() - mock.t0) * 1000 * 1.00005)) >>> 0;
-    const h = createHarness(BUILD, SRC, mock);
+    const h = createHarness(BUILD, SRC, mock, PACKED);
     h.send({ type: 'init', timeOrigin: performance.timeOrigin });
     h.send({ type: 'open', dev: 0, epoch: 1, vid: 0x1D50, pid: 0x606F, serial: 'ELM1' });
     const opened = await h.waitFor(m => m.type === 'opened', 3000, 'opened', C);
@@ -90,7 +92,7 @@ async function testGsUsbElmue() {
 
 async function testPcan() {
     const mock = createMockDevice(0x0C72, 0x0012, 'PCAN1');
-    const h = createHarness(BUILD, SRC, mock);
+    const h = createHarness(BUILD, SRC, mock, PACKED);
     const rec = (type, ts, body, total = 16) => { const r = [total & 255, total >> 8, type & 255, type >> 8]; le32(r, ts); le32(r, 0); r.push(...body); while (r.length < total) r.push(0); return r; };
     h.send({ type: 'init', timeOrigin: performance.timeOrigin });
     h.send({ type: 'open', dev: 0, epoch: 1, vid: 0x0C72, pid: 0x0012, serial: 'PCAN1' });
